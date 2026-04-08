@@ -10,10 +10,40 @@ export interface AIQueryResult {
 const POSITIVE_WORDS = ["recommend", "great", "excellent", "top", "best", "quality", "trusted", "outstanding", "popular", "leading", "reliable", "impressive"];
 const NEGATIVE_WORDS = ["avoid", "poor", "issues", "complaints", "problems", "concerns", "disappointing", "unreliable", "worst", "negative"];
 
+// Phrases that indicate the model doesn't actually have information about the business.
+// If any of these appear, don't count the response as a real "mention" even if the
+// business name was echoed from the prompt itself.
+const NO_KNOWLEDGE_PHRASES = [
+  "i don't have",
+  "i do not have",
+  "i'm not aware",
+  "i am not aware",
+  "no information",
+  "not in my training",
+  "not familiar with",
+  "cannot find",
+  "can't find",
+  "no verified information",
+  "unable to find",
+  "don't have reliable",
+  "no reliable information",
+  "i'm not sure",
+  "i cannot confirm",
+  "no specific information",
+];
+
+// System instruction sent with every query to reduce hallucination.
+// Models are told to explicitly decline rather than fabricate business details.
+const SYSTEM_INSTRUCTION = "You are answering questions about real-world businesses. Base your answer only on verified, factual information. If you do not have reliable, specific information about a business being asked about, respond with 'No verified information available' and briefly explain what you do and don't know. Do not guess, fabricate details, or invent reviews, ratings, addresses, or services. It is better to say you don't know than to make something up.";
+
 function analyzeMention(responseText: string, businessName: string): { mentioned: boolean; position: number | null; sentiment: "positive" | "neutral" | "negative" } {
   const lowerResponse = responseText.toLowerCase();
   const lowerName = businessName.toLowerCase();
-  const mentioned = lowerResponse.includes(lowerName);
+
+  // If the response explicitly says the model has no knowledge, treat as not mentioned
+  // regardless of whether the business name appears (it was just echoed from the prompt).
+  const hasNoKnowledge = NO_KNOWLEDGE_PHRASES.some(phrase => lowerResponse.includes(phrase));
+  const mentioned = !hasNoKnowledge && lowerResponse.includes(lowerName);
 
   let position: number | null = null;
   if (mentioned) {
@@ -36,6 +66,9 @@ function analyzeMention(responseText: string, businessName: string): { mentioned
 }
 
 async function queryOpenAI(apiKey: string, query: string, businessName: string): Promise<AIQueryResult> {
+  // Note: gpt-5-mini on chat/completions does not include built-in web search.
+  // Live-web answers come from Claude/Gemini/Perplexity; here we rely on the
+  // system instruction to discourage hallucination.
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -45,7 +78,10 @@ async function queryOpenAI(apiKey: string, query: string, businessName: string):
     body: JSON.stringify({
       model: "gpt-5-mini",
       max_completion_tokens: 1024,
-      messages: [{ role: "user", content: query }],
+      messages: [
+        { role: "system", content: SYSTEM_INSTRUCTION },
+        { role: "user", content: query },
+      ],
     }),
   });
 
@@ -77,6 +113,16 @@ async function queryAnthropic(apiKey: string, query: string, businessName: strin
     body: JSON.stringify({
       model: "claude-haiku-4-5-20251001",
       max_tokens: 1024,
+      system: SYSTEM_INSTRUCTION,
+      // Enable Anthropic's native web search so Claude can look up live
+      // information instead of relying on training data only.
+      tools: [
+        {
+          type: "web_search_20250305",
+          name: "web_search",
+          max_uses: 3,
+        },
+      ],
       messages: [{ role: "user", content: query }],
     }),
   });
@@ -87,7 +133,11 @@ async function queryAnthropic(apiKey: string, query: string, businessName: strin
   }
 
   const data = await res.json();
-  const responseText = data.content?.[0]?.text ?? "";
+  // When tools are used, content is an array of blocks (text + tool_use).
+  // Concatenate all text blocks.
+  const responseText = Array.isArray(data.content)
+    ? data.content.filter((block: any) => block.type === "text").map((block: any) => block.text).join("\n")
+    : "";
   const analysis = analyzeMention(responseText, businessName);
 
   return {
@@ -105,6 +155,11 @@ async function queryGemini(apiKey: string, query: string, businessName: string):
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
+      // Enable Google Search grounding so Gemini pulls live web information.
+      tools: [{ google_search: {} }],
+      systemInstruction: {
+        parts: [{ text: SYSTEM_INSTRUCTION }],
+      },
       contents: [{ parts: [{ text: query }] }],
     }),
   });
@@ -136,7 +191,10 @@ async function queryPerplexity(apiKey: string, query: string, businessName: stri
     body: JSON.stringify({
       model: "sonar",
       max_tokens: 1024,
-      messages: [{ role: "user", content: query }],
+      messages: [
+        { role: "system", content: SYSTEM_INSTRUCTION },
+        { role: "user", content: query },
+      ],
     }),
   });
 
