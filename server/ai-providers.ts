@@ -212,20 +212,85 @@ export async function testApiKey(provider: string, apiKey: string): Promise<{ su
 }
 
 export function generateScanQueries(businessName: string, industry: string, location: string | null): string[] {
-  const queries: string[] = [
-    `What are the best ${industry.toLowerCase()} businesses${location ? ` in ${location}` : ""}?`,
-    `Can you recommend ${businessName}?`,
-    `${businessName} reviews and reputation`,
-    `Compare ${businessName} to other ${industry.toLowerCase()} options`,
-    `Is ${businessName} worth it?`,
+  const ind = industry.toLowerCase();
+  const loc = location ?? null;
+
+  // ── Discovery queries (intent: find options) ──────────────────────────────
+  const discovery: string[] = [
+    `What are the best ${ind} businesses${loc ? ` in ${loc}` : ""}?`,
+    `Top rated ${ind} companies to consider this year`,
+    `Which ${ind} provider should I choose?`,
+    `Best ${ind} services for small businesses`,
+    `Most recommended ${ind} options available right now`,
   ];
 
-  if (location) {
-    queries.push(`Best ${industry.toLowerCase()} near ${location}`);
-    queries.push(`Top rated ${industry.toLowerCase()} in ${location}`);
-  } else {
-    queries.push(`Top ${industry.toLowerCase()} companies to consider`);
+  // ── Comparison queries (intent: evaluate alternatives) ────────────────────
+  const comparison: string[] = [
+    `Compare ${businessName} to other ${ind} options`,
+    `${businessName} vs competitors — which is better?`,
+    `How does ${businessName} compare to alternatives in ${ind}?`,
+    `${ind} provider comparison: pros and cons`,
+  ];
+
+  // ── Review / reputation queries (intent: validate trust) ─────────────────
+  const review: string[] = [
+    `${businessName} reviews and reputation`,
+    `Is ${businessName} worth it?`,
+    `What do customers say about ${businessName}?`,
+    `${businessName} customer feedback and ratings`,
+    `Problems or complaints about ${businessName}`,
+  ];
+
+  // ── Local queries (intent: find nearby) ──────────────────────────────────
+  const local: string[] = loc
+    ? [
+        `Best ${ind} near ${loc}`,
+        `Top rated ${ind} in ${loc}`,
+        `${ind} businesses open now in ${loc}`,
+        `Highly reviewed ${ind} services in ${loc}`,
+      ]
+    : [
+        `${ind} businesses near me`,
+        `Local ${ind} providers with good reviews`,
+      ];
+
+  // ── Long-tail queries (3+ words, specific intent) ─────────────────────────
+  const longTail: string[] = [
+    `affordable ${ind} services with good customer support`,
+    `best value ${ind} provider for new customers`,
+    `how to choose a reliable ${ind} business`,
+    `what to look for when hiring a ${ind} company`,
+    `${ind} services that are worth the price`,
+  ];
+
+  // ── Seasonal / trending variations ───────────────────────────────────────
+  const currentYear = new Date().getFullYear();
+  const seasonal: string[] = [
+    `best ${ind} businesses in ${currentYear}`,
+    `top ${ind} trends and recommendations`,
+    `${businessName} — is it still a good choice in ${currentYear}?`,
+  ];
+
+  // Combine all categories, deduplicate, and cap at 20
+  const all = [
+    ...discovery,
+    ...comparison,
+    ...review,
+    ...local,
+    ...longTail,
+    ...seasonal,
+  ];
+
+  // Simple deduplication by normalized string
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const q of all) {
+    const key = q.toLowerCase().trim();
+    if (!seen.has(key)) {
+      seen.add(key);
+      unique.push(q);
+    }
   }
 
-  return queries;
+  return unique.slice(0, 20);
 }

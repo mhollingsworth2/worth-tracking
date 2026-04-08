@@ -18,6 +18,10 @@ import bcrypt from "bcryptjs";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import Database from "better-sqlite3";
 import { eq, sql, desc, and } from "drizzle-orm";
+import { validateSearchRecord, normalizeQuery, jaccardSimilarity } from "./data-validation";
+import type { ValidationResult } from "./data-validation";
+import { generateQualityReport, getDataFreshness } from "./data-quality";
+import type { QualityReport, FreshnessStats } from "./data-quality";
 
 import path from "path";
 const dataDir = process.env.DATA_DIR || ".";
@@ -91,6 +95,13 @@ export interface IStorage {
   getApiKey(provider: string): Promise<ApiKey | undefined>;
   upsertApiKey(provider: string, apiKey: string): Promise<ApiKey>;
   deleteApiKey(provider: string): Promise<void>;
+
+  // Data Quality & Validation
+  validateAndCreateSearchRecord(record: InsertSearchRecord): Promise<{ record?: SearchRecord; validation: ValidationResult }>;
+  getDataQualityMetrics(businessId: number): Promise<QualityReport>;
+  deduplicateSearchRecords(businessId: number): Promise<{ removed: number }>;
+  archiveOldData(daysOld: number, businessId?: number): Promise<{ archived: number }>;
+  getDataFreshness(businessId: number): Promise<FreshnessStats>;
 
   // Scan Jobs
   createScanJob(job: InsertScanJob): Promise<ScanJob>;
@@ -461,6 +472,76 @@ export class DatabaseStorage implements IStorage {
 
   async deleteApiKey(provider: string): Promise<void> {
     db.delete(apiKeys).where(eq(apiKeys.provider, provider)).run();
+  }
+
+  // === DATA QUALITY & VALIDATION ===
+
+  async validateAndCreateSearchRecord(
+    record: InsertSearchRecord
+  ): Promise<{ record?: SearchRecord; validation: ValidationResult }> {
+    const validation = validateSearchRecord(record);
+    if (!validation.valid) {
+      return { validation };
+    }
+    // Use normalized data if available
+    const normalized = validation.normalizedData
+      ? ({ ...record, query: validation.normalizedData.query as string })
+      : record;
+    const created = await this.createSearchRecord(normalized);
+    return { record: created, validation };
+  }
+
+  async getDataQualityMetrics(businessId: number): Promise<QualityReport> {
+    return generateQualityReport(businessId);
+  }
+
+  async deduplicateSearchRecords(businessId: number): Promise<{ removed: number }> {
+    // Fetch all records for this business, ordered by id ascending
+    const records = db
+      .select()
+      .from(searchRecords)
+      .where(eq(searchRecords.businessId, businessId))
+      .orderBy(searchRecords.id)
+      .all();
+
+    const toDelete: number[] = [];
+    const seen: Array<{ id: number; normalizedQuery: string; platformId: number; date: string }> = [];
+
+    for (const r of records) {
+      const nq = normalizeQuery(r.query);
+      const isDuplicate = seen.some(
+        (s) =>
+          s.platformId === r.platformId &&
+          s.date === r.date &&
+          jaccardSimilarity(s.normalizedQuery, nq) >= 0.9
+      );
+      if (isDuplicate) {
+        toDelete.push(r.id);
+      } else {
+        seen.push({ id: r.id, normalizedQuery: nq, platformId: r.platformId, date: r.date });
+      }
+    }
+
+    for (const id of toDelete) {
+      db.delete(searchRecords).where(eq(searchRecords.id, id)).run();
+    }
+
+    return { removed: toDelete.length };
+  }
+
+  async archiveOldData(daysOld: number, businessId?: number): Promise<{ archived: number }> {
+    // Lazy import to avoid circular dependency at module load time
+    const { archiveSearchRecords, archiveReferrals, archiveAiSnapshots } = await import(
+      "./data-archival"
+    );
+    const r1 = archiveSearchRecords(daysOld, businessId);
+    const r2 = archiveReferrals(daysOld, businessId);
+    const r3 = archiveAiSnapshots(daysOld, businessId);
+    return { archived: r1.archivedCount + r2.archivedCount + r3.archivedCount };
+  }
+
+  async getDataFreshness(businessId: number): Promise<FreshnessStats> {
+    return getDataFreshness(businessId);
   }
 
   // === SCAN JOBS ===
