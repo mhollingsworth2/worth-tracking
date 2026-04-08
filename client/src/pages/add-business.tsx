@@ -29,6 +29,7 @@ const industries = [
   "Automotive",
   "Construction",
   "Consulting",
+  "Cleaning Services",
   "Other",
 ];
 
