@@ -69,25 +69,25 @@ function AppRouter() {
 
 function AuthenticatedApp() {
   return (
-    <SidebarProvider>
-      <div className="flex h-screen w-full">
-        <AppSidebar />
-        <div className="flex flex-col flex-1 min-w-0">
-          <header className="flex items-center justify-between gap-2 p-2 border-b shrink-0">
-            <SidebarTrigger data-testid="button-sidebar-toggle" />
-            <div className="flex items-center gap-1">
-              <AlertBell />
-              <ThemeToggle />
-            </div>
-          </header>
-          <main className="flex-1 overflow-auto">
-            <Router hook={useHashLocation}>
+    <Router hook={useHashLocation}>
+      <SidebarProvider>
+        <div className="flex h-screen w-full">
+          <AppSidebar />
+          <div className="flex flex-col flex-1 min-w-0">
+            <header className="flex items-center justify-between gap-2 p-2 border-b shrink-0">
+              <SidebarTrigger data-testid="button-sidebar-toggle" />
+              <div className="flex items-center gap-1">
+                <AlertBell />
+                <ThemeToggle />
+              </div>
+            </header>
+            <main className="flex-1 overflow-auto">
               <AppRouter />
-            </Router>
-          </main>
+            </main>
+          </div>
         </div>
-      </div>
-    </SidebarProvider>
+      </SidebarProvider>
+    </Router>
   );
 }
 
