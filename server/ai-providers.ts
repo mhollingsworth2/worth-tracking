@@ -44,7 +44,7 @@ async function queryOpenAI(apiKey: string, query: string, businessName: string):
     },
     body: JSON.stringify({
       model: "gpt-5-mini",
-      max_tokens: 1024,
+      max_completion_tokens: 1024,
       messages: [{ role: "user", content: query }],
     }),
   });
