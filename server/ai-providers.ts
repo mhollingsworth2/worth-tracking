@@ -43,7 +43,7 @@ async function queryOpenAI(apiKey: string, query: string, businessName: string):
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "gpt-4o-mini",
+      model: "gpt-5-mini",
       max_tokens: 1024,
       messages: [{ role: "user", content: query }],
     }),
