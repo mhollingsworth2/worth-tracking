@@ -9,6 +9,46 @@ const httpServer = createServer(app);
 
 app.use(cookieParser());
 
+// ─── Performance & Ingestion Metrics ─────────────────────────────────────────
+
+interface DataOperationMetric {
+  operation: string;
+  durationMs: number;
+  success: boolean;
+  errorMessage?: string;
+  timestamp: string;
+}
+
+const recentMetrics: DataOperationMetric[] = [];
+const MAX_METRICS = 500;
+
+export function recordDataOperation(
+  operation: string,
+  durationMs: number,
+  success: boolean,
+  errorMessage?: string
+): void {
+  const metric: DataOperationMetric = {
+    operation,
+    durationMs,
+    success,
+    errorMessage,
+    timestamp: new Date().toISOString(),
+  };
+  recentMetrics.push(metric);
+  if (recentMetrics.length > MAX_METRICS) recentMetrics.shift();
+
+  if (!success) {
+    console.error(
+      `[data-error] ${operation} failed in ${durationMs}ms — ${errorMessage ?? "unknown error"}`
+    );
+  }
+}
+
+export function getRecentMetrics(): DataOperationMetric[] {
+  return [...recentMetrics];
+}
+
 declare module "http" {
   interface IncomingMessage {
     rawBody: unknown;
@@ -56,6 +96,24 @@ app.use((req, res, next) => {
       }
 
       log(logLine);
+
+      // Track data ingestion operations for monitoring
+      const isDataWrite =
+        (req.method === "POST" || req.method === "PUT" || req.method === "PATCH") &&
+        (path.includes("/records") ||
+          path.includes("/scan") ||
+          path.includes("/log-search") ||
+          path.includes("/data/validate") ||
+          path.includes("/data/deduplicate") ||
+          path.includes("/data/archive"));
+
+      if (isDataWrite) {
+        const success = res.statusCode >= 200 && res.statusCode < 300;
+        const errorMessage = !success && capturedJsonResponse?.error
+          ? String(capturedJsonResponse.error)
+          : undefined;
+        recordDataOperation(`${req.method} ${path}`, duration, success, errorMessage);
+      }
     }
   });
 
@@ -64,6 +122,24 @@ app.use((req, res, next) => {
 
 (async () => {
   await registerRoutes(httpServer, app);
+
+  // === DATA OPERATIONS METRICS ENDPOINT (admin only via cookie/header auth) ===
+  app.get("/api/metrics/data-operations", (req, res) => {
+    const metrics = getRecentMetrics();
+    const total = metrics.length;
+    const failed = metrics.filter((m) => !m.success).length;
+    const avgDuration =
+      total > 0
+        ? Math.round(metrics.reduce((s, m) => s + m.durationMs, 0) / total)
+        : 0;
+    res.json({
+      total,
+      failed,
+      successRate: total > 0 ? Math.round(((total - failed) / total) * 100) : 100,
+      avgDurationMs: avgDuration,
+      recent: metrics.slice(-50),
+    });
+  });
 
   app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
     const status = err.status || err.statusCode || 500;

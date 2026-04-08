@@ -13,6 +13,8 @@ import { sql } from "drizzle-orm";
 import { runScan, testApiKey, generateScanQueries, PROVIDER_COST_PER_CALL } from "./ai-providers";
 import { requireAuth, requireAdmin, createSession, deleteSession, getSession } from "./auth";
 import bcrypt from "bcryptjs";
+import { validateSearchRecord, validateReferral, validateAiSnapshot } from "./data-validation";
+import { ensureArchiveTables, runArchival } from "./data-archival";
 
 // Seed default AI platforms
 function seedPlatforms() {
@@ -500,6 +502,21 @@ export async function registerRoutes(
     user_id INTEGER NOT NULL,
     business_id INTEGER NOT NULL
   )`);
+
+  // === DATABASE INDEXES for query performance ===
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_search_records_business_date
+    ON search_records(business_id, date)`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_search_records_business_mentioned
+    ON search_records(business_id, mentioned)`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_referrals_business_date
+    ON referrals(business_id, date)`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_referrals_business_converted
+    ON referrals(business_id, converted)`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_ai_snapshots_business_date
+    ON ai_snapshots(business_id, date)`);
+
+  // Ensure archive tables exist
+  ensureArchiveTables();
 
   // Seed default budget settings if none exist
   const existingSettings = db.select().from(apiSettings).all();
@@ -1213,6 +1230,89 @@ export async function registerRoutes(
     }
     const updated = db.select().from(apiSettings).get();
     res.json(updated);
+  });
+
+  // === DATA QUALITY ENDPOINTS ===
+
+  // GET /api/data-quality/:businessId — full quality report
+  app.get("/api/data-quality/:businessId", async (req, res) => {
+    const businessId = parseInt(req.params.businessId);
+    if (isNaN(businessId)) return res.status(400).json({ error: "Invalid businessId" });
+    const business = await storage.getBusiness(businessId);
+    if (!business) return res.status(404).json({ error: "Business not found" });
+    if (req.user?.role !== "admin") {
+      const allowed = await storage.getUserBusinessIds(req.user!.userId);
+      if (!allowed.includes(businessId)) {
+        return res.status(403).json({ error: "Access denied to this business" });
+      }
+    }
+    const report = await storage.getDataQualityMetrics(businessId);
+    res.json(report);
+  });
+
+  // GET /api/data/freshness/:businessId — freshness stats only
+  app.get("/api/data/freshness/:businessId", async (req, res) => {
+    const businessId = parseInt(req.params.businessId);
+    if (isNaN(businessId)) return res.status(400).json({ error: "Invalid businessId" });
+    const business = await storage.getBusiness(businessId);
+    if (!business) return res.status(404).json({ error: "Business not found" });
+    if (req.user?.role !== "admin") {
+      const allowed = await storage.getUserBusinessIds(req.user!.userId);
+      if (!allowed.includes(businessId)) {
+        return res.status(403).json({ error: "Access denied to this business" });
+      }
+    }
+    const freshness = await storage.getDataFreshness(businessId);
+    res.json(freshness);
+  });
+
+  // POST /api/data/validate — validate incoming data without persisting
+  app.post("/api/data/validate", async (req, res) => {
+    const { type, data } = req.body;
+    if (!type || !data) {
+      return res.status(400).json({ error: "type and data are required" });
+    }
+    let result;
+    switch (type) {
+      case "searchRecord":
+        result = validateSearchRecord(data);
+        break;
+      case "referral":
+        result = validateReferral(data);
+        break;
+      case "aiSnapshot":
+        result = validateAiSnapshot(data);
+        break;
+      default:
+        return res.status(400).json({ error: `Unknown type: ${type}. Use searchRecord, referral, or aiSnapshot.` });
+    }
+    res.json(result);
+  });
+
+  // POST /api/data/deduplicate/:businessId — remove duplicate search records
+  app.post("/api/data/deduplicate/:businessId", requireAdmin, async (req, res) => {
+    const businessId = parseInt(req.params.businessId);
+    if (isNaN(businessId)) return res.status(400).json({ error: "Invalid businessId" });
+    const business = await storage.getBusiness(businessId);
+    if (!business) return res.status(404).json({ error: "Business not found" });
+    const result = await storage.deduplicateSearchRecords(businessId);
+    res.json({ success: true, ...result });
+  });
+
+  // POST /api/data/archive — archive old records (admin only)
+  app.post("/api/data/archive", requireAdmin, async (req, res) => {
+    const { daysOld = 90, businessId } = req.body;
+    if (typeof daysOld !== "number" || daysOld < 1) {
+      return res.status(400).json({ error: "daysOld must be a positive number" });
+    }
+    const result = await storage.archiveOldData(daysOld, businessId);
+    res.json({ success: true, ...result });
+  });
+
+  // POST /api/data/archival-run — run full archival pass (admin only)
+  app.post("/api/data/archival-run", requireAdmin, async (_req, res) => {
+    const result = runArchival();
+    res.json({ success: true, ...result });
   });
 
   return httpServer;
