@@ -350,7 +350,11 @@ export async function registerRoutes(
   httpServer: Server,
   app: Express
 ): Promise<Server> {
+  try {
+  console.log("[init] registerRoutes() started — beginning database initialization");
+
   // Create tables
+  console.log("[init] Creating core tables...");
   db.run(sql`CREATE TABLE IF NOT EXISTS businesses (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -503,7 +507,10 @@ export async function registerRoutes(
     business_id INTEGER NOT NULL
   )`);
 
+  console.log("[init] Core tables created successfully");
+
   // === DATABASE INDEXES for query performance ===
+  console.log("[init] Creating database indexes...");
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_search_records_business_date
     ON search_records(business_id, date)`);
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_search_records_business_mentioned
@@ -514,28 +521,57 @@ export async function registerRoutes(
     ON referrals(business_id, converted)`);
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_ai_snapshots_business_date
     ON ai_snapshots(business_id, date)`);
+  console.log("[init] Database indexes created successfully");
 
   // Ensure archive tables exist
-  ensureArchiveTables();
+  console.log("[init] Running ensureArchiveTables()...");
+  try {
+    ensureArchiveTables();
+    console.log("[init] ensureArchiveTables() completed successfully");
+  } catch (archiveErr) {
+    console.error("[init] ERROR in ensureArchiveTables():", archiveErr);
+    throw archiveErr;
+  }
 
   // Seed default budget settings if none exist
+  console.log("[init] Checking API settings...");
   const existingSettings = db.select().from(apiSettings).all();
   if (existingSettings.length === 0) {
     db.insert(apiSettings).values({ dailyBudget: "10.00", autoPauseEnabled: 1 }).run();
+    console.log("[init] Default API settings seeded");
+  } else {
+    console.log("[init] API settings already exist, skipping seed");
   }
 
   // Re-seed after table creation
-  seedPlatforms();
+  console.log("[init] Running seedPlatforms()...");
+  try {
+    seedPlatforms();
+    console.log("[init] seedPlatforms() completed successfully");
+  } catch (seedErr) {
+    console.error("[init] ERROR in seedPlatforms():", seedErr);
+    throw seedErr;
+  }
 
   // Seed admin user if no users exist
-  const existingUsers = db.select().from(users).all();
-  if (existingUsers.length === 0) {
-    await storage.createUser({
-      username: "admin",
-      password: "worthcreative2026",
-      displayName: "Worth Creative",
-      role: "admin",
-    });
+  console.log("[init] Checking for existing users...");
+  try {
+    const existingUsers = db.select().from(users).all();
+    if (existingUsers.length === 0) {
+      console.log("[init] No users found — creating default admin user...");
+      await storage.createUser({
+        username: "admin",
+        password: "worthcreative2026",
+        displayName: "Worth Creative",
+        role: "admin",
+      });
+      console.log("[init] Default admin user created successfully");
+    } else {
+      console.log(`[init] Found ${existingUsers.length} existing user(s), skipping admin seed`);
+    }
+  } catch (userErr) {
+    console.error("[init] ERROR creating admin user:", userErr);
+    throw userErr;
   }
 
   // === AUTH ROUTES (no auth required) ===
@@ -1315,5 +1351,15 @@ export async function registerRoutes(
     res.json({ success: true, ...result });
   });
 
+  console.log("[init] registerRoutes() completed successfully — all routes registered");
   return httpServer;
+  } catch (err) {
+    console.error("[init] FATAL ERROR in registerRoutes() — app cannot start:", err);
+    if (err instanceof Error) {
+      console.error("[init] Error name:", err.name);
+      console.error("[init] Error message:", err.message);
+      console.error("[init] Stack trace:", err.stack);
+    }
+    throw err;
+  }
 }

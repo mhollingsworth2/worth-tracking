@@ -121,7 +121,13 @@ app.use((req, res, next) => {
 });
 
 (async () => {
-  await registerRoutes(httpServer, app);
+  try {
+    await registerRoutes(httpServer, app);
+  } catch (err) {
+    console.error("[startup] registerRoutes() threw an unhandled error — process will exit:");
+    console.error(err);
+    process.exit(1);
+  }
 
   // === DATA OPERATIONS METRICS ENDPOINT (admin only via cookie/header auth) ===
   app.get("/api/metrics/data-operations", (req, res) => {
