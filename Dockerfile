@@ -7,9 +7,9 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 
-# Copy source and build
+# Copy source and build (bust cache)
 COPY . .
-RUN npm run build
+RUN echo "build-bust-1" && npm run build
 
 # ---------- Runtime stage ----------
 FROM node:20-slim
