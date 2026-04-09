@@ -1583,7 +1583,7 @@ Return ONLY valid JSON with this exact structure:
   "rationale": "Brief explanation of why this content will help rank for the query"
 }
 
-Include 3-6 sections in the outline, each with 2-4 bullet points. Include 5-10 keywords. Make the content brief specific and actionable.`;
+Include 3-6 sections in the outline, each with 2-4 bullet points. Include 5-10 keywords. Make the content brief specific and actionable.${business.location ? ` Focus on the LOCAL market in ${business.location} — include location-specific keywords, local landmarks, neighborhoods, and references that will help this business rank for local AI searches within a 25-mile radius.` : ""}`;
 
     // Try providers in cost order
     const priority = ["google", "openai", "anthropic", "perplexity"];
@@ -1949,7 +1949,7 @@ Include 3-6 sections in the outline, each with 2-4 bullet points. Include 5-10 k
   "keywords": "comma-separated search keywords relevant to this business",
   "targetAudience": "comma-separated target customer segments",
   "uniqueSellingPoints": "what makes this business unique/different",
-  "competitors": "comma-separated list of 3-5 real well-known competitors in the same industry and area"
+  "competitors": "comma-separated list of 3-5 real LOCAL competitors within a 25-mile radius — must be actual businesses operating in the same geographic area and industry, NOT national chains or businesses in other cities"
 }
 
 Website URL: ${fullUrl}
@@ -1958,7 +1958,7 @@ Website content:
 ${cleaned}
 """
 
-Extract real information from the content. If a field isn't clear from the website, use your best judgment or leave it empty. For industry, pick the closest match from the list provided. For competitors, list REAL businesses that compete with this company in the same area and industry — use well-known names, not made-up ones.`;
+Extract real information from the content. If a field isn't clear from the website, use your best judgment or leave it empty. For industry, pick the closest match from the list provided. For competitors, list REAL LOCAL businesses within 25 miles that compete with this company — they must physically operate in the same area. Do not list national chains unless they have a nearby location. Focus on the specific local market.`;
 
       // Try providers in cost order
       const priority = ["google", "openai", "anthropic", "perplexity"];

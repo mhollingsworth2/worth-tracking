@@ -532,8 +532,8 @@ export async function detectCompetitors(
   location: string | null,
   keys: { provider: string; apiKey: string }[]
 ): Promise<string[]> {
-  const locStr = location ? ` in ${location}` : "";
-  const prompt = `List the top 5 real, well-known competitors to "${businessName}" in the ${industry} industry${locStr}. Return ONLY a comma-separated list of business names, nothing else. If you don't know the specific business, list the top 5 well-known ${industry} businesses${locStr} instead. Example format: "Company A, Company B, Company C, Company D, Company E"`;
+  const locStr = location ? ` within 25 miles of ${location}` : "";
+  const prompt = `List the top 5 real, local competitors to "${businessName}" in the ${industry} industry${locStr}. These MUST be real businesses that physically operate${location ? ` within a 25-mile radius of ${location}` : " in the same local area"}. Do NOT list national chains or businesses from other cities/regions unless they have a location nearby. Return ONLY a comma-separated list of business names, nothing else. Example format: "Company A, Company B, Company C, Company D, Company E"`;
 
   // Try each provider until one works
   for (const key of keys) {
@@ -585,12 +585,19 @@ export function generateScanQueries(ctx: BusinessContext): string[] {
   const competitorsList = parseList(ctx.competitors);
 
   // ── Discovery queries (intent: find options) ──────────────────────────────
-  const discovery: string[] = [
-    `What are the best ${ind} businesses${loc ? ` in ${loc}` : ""}?`,
-    `Top rated ${ind} companies to consider this year`,
-    `Which ${ind} provider should I choose?`,
-    `Most recommended ${ind} options available right now`,
-  ];
+  const discovery: string[] = loc
+    ? [
+        `What are the best ${ind} businesses in ${loc}?`,
+        `Top rated ${ind} companies in ${loc} area`,
+        `Which ${ind} provider should I choose in ${loc}?`,
+        `Most recommended ${ind} options near ${loc}`,
+      ]
+    : [
+        `What are the best ${ind} businesses?`,
+        `Top rated ${ind} companies to consider this year`,
+        `Which ${ind} provider should I choose?`,
+        `Most recommended ${ind} options available right now`,
+      ];
 
   // ── Service-specific queries ──────────────────────────────────────────────
   const serviceQueries: string[] = [];
@@ -612,12 +619,17 @@ export function generateScanQueries(ctx: BusinessContext): string[] {
   }
 
   // ── Competitor comparison queries ─────────────────────────────────────────
-  const competitorQueries: string[] = [
-    `Compare ${name} to other ${ind} options`,
-    `${name} vs competitors — which is better?`,
-  ];
+  const competitorQueries: string[] = loc
+    ? [
+        `Compare ${name} to other ${ind} options in ${loc}`,
+        `${name} vs competitors in ${loc} — which is better?`,
+      ]
+    : [
+        `Compare ${name} to other ${ind} options`,
+        `${name} vs competitors — which is better?`,
+      ];
   for (const comp of competitorsList.slice(0, 3)) {
-    competitorQueries.push(`${name} vs ${comp} — which is better?`);
+    competitorQueries.push(`${name} vs ${comp}${loc ? ` in ${loc}` : ""} — which is better?`);
   }
 
   // ── Review / reputation queries (intent: validate trust) ─────────────────
@@ -641,18 +653,29 @@ export function generateScanQueries(ctx: BusinessContext): string[] {
       ];
 
   // ── Long-tail / intent queries ────────────────────────────────────────────
-  const longTail: string[] = [
-    `affordable ${ind} services with good customer support`,
-    `how to choose a reliable ${ind} business`,
-    `${ind} services that are worth the price`,
-  ];
+  const longTail: string[] = loc
+    ? [
+        `affordable ${ind} services in ${loc} with good customer support`,
+        `how to choose a reliable ${ind} business in ${loc}`,
+        `${ind} services in ${loc} that are worth the price`,
+      ]
+    : [
+        `affordable ${ind} services with good customer support`,
+        `how to choose a reliable ${ind} business`,
+        `${ind} services that are worth the price`,
+      ];
 
   // ── Seasonal / trending ───────────────────────────────────────────────────
   const currentYear = new Date().getFullYear();
-  const seasonal: string[] = [
-    `best ${ind} businesses in ${currentYear}`,
-    `${name} — is it still a good choice in ${currentYear}?`,
-  ];
+  const seasonal: string[] = loc
+    ? [
+        `best ${ind} businesses in ${loc} in ${currentYear}`,
+        `${name} — is it still a good choice in ${currentYear}?`,
+      ]
+    : [
+        `best ${ind} businesses in ${currentYear}`,
+        `${name} — is it still a good choice in ${currentYear}?`,
+      ];
 
   // ── Custom queries (user-provided, highest priority) ───────────────────────
   const custom: string[] = [];
