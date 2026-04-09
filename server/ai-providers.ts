@@ -41,11 +41,14 @@ async function fetchWithRetry(url: string, options: RequestInit, maxRetries = 2)
   throw new Error('Max retries exceeded');
 }
 
-// System instruction sent with every query to reduce hallucination.
-// Models are told to explicitly decline rather than fabricate business details.
-// System instruction: be helpful and natural — we WANT to see what AI actually says
-// about businesses. The hallucination detector catches fabrications after the fact.
-const SYSTEM_INSTRUCTION = "You are a knowledgeable local guide helping someone find and evaluate businesses in their area. Always give direct, specific answers with real business names. Never say you can't help, don't have access, or suggest the user search elsewhere — just answer the question with your best knowledge. Be concise and recommend specific businesses by name.";
+// Build a focused system instruction that constrains AI responses to the right industry
+function buildSystemInstruction(businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }): string {
+  const industry = businessContext?.industry;
+  const location = businessContext?.location;
+  const industryClause = industry ? ` Focus ONLY on ${industry} businesses and services.` : "";
+  const locationClause = location ? ` Focus on businesses in or near ${location}.` : "";
+  return `You are a knowledgeable local guide helping someone find and evaluate businesses.${industryClause}${locationClause} Always give direct, specific answers with real business names. Never say you can't help, don't have access, or suggest the user search elsewhere — just answer the question with your best knowledge. Be concise. Do NOT mention businesses from unrelated industries.`;
+}
 
 // ── AI-Powered Response Analysis ──────────────────────────────────────────
 // Instead of fragile string matching, we send a follow-up call to a cheap AI
@@ -435,7 +438,7 @@ export function setHealthCallback(cb: typeof healthCallback) {
   healthCallback = cb;
 }
 
-async function queryOpenAI(apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null }): Promise<AIQueryResult> {
+async function queryOpenAI(apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }): Promise<AIQueryResult> {
   const startTime = Date.now();
   try {
     const res = await fetchWithRetry("https://api.openai.com/v1/chat/completions", {
@@ -449,7 +452,7 @@ async function queryOpenAI(apiKey: string, query: string, businessName: string, 
         max_completion_tokens: 1024,
         temperature: 0,
         messages: [
-          { role: "system", content: SYSTEM_INSTRUCTION },
+          { role: "system", content: buildSystemInstruction(businessContext) },
           { role: "user", content: query },
         ],
       }),
@@ -472,7 +475,7 @@ async function queryOpenAI(apiKey: string, query: string, businessName: string, 
   }
 }
 
-async function queryAnthropic(apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null }): Promise<AIQueryResult> {
+async function queryAnthropic(apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }): Promise<AIQueryResult> {
   const startTime = Date.now();
   try {
     const res = await fetchWithRetry("https://api.anthropic.com/v1/messages", {
@@ -486,7 +489,7 @@ async function queryAnthropic(apiKey: string, query: string, businessName: strin
         model: "claude-haiku-4-5-20251001",
         max_tokens: 1024,
         temperature: 0,
-        system: SYSTEM_INSTRUCTION,
+        system: buildSystemInstruction(businessContext),
         messages: [{ role: "user", content: query }],
       }),
     });
@@ -510,14 +513,14 @@ async function queryAnthropic(apiKey: string, query: string, businessName: strin
   }
 }
 
-async function queryGemini(apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null }): Promise<AIQueryResult> {
+async function queryGemini(apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }): Promise<AIQueryResult> {
   const startTime = Date.now();
   try {
     const res = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
+        systemInstruction: { parts: [{ text: buildSystemInstruction(businessContext) }] },
         contents: [{ parts: [{ text: query }] }],
         generationConfig: { temperature: 0 },
       }),
@@ -540,7 +543,7 @@ async function queryGemini(apiKey: string, query: string, businessName: string, 
   }
 }
 
-async function queryPerplexity(apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null }): Promise<AIQueryResult> {
+async function queryPerplexity(apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }): Promise<AIQueryResult> {
   const startTime = Date.now();
   try {
     const res = await fetchWithRetry("https://api.perplexity.ai/chat/completions", {
@@ -554,7 +557,7 @@ async function queryPerplexity(apiKey: string, query: string, businessName: stri
         max_tokens: 1024,
         temperature: 0,
         messages: [
-          { role: "system", content: SYSTEM_INSTRUCTION },
+          { role: "system", content: buildSystemInstruction(businessContext) },
           { role: "user", content: query },
         ],
       }),
@@ -577,7 +580,7 @@ async function queryPerplexity(apiKey: string, query: string, businessName: stri
   }
 }
 
-const PROVIDER_FN: Record<string, (apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null }) => Promise<AIQueryResult>> = {
+const PROVIDER_FN: Record<string, (apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }) => Promise<AIQueryResult>> = {
   openai: queryOpenAI,
   anthropic: queryAnthropic,
   google: queryGemini,
@@ -644,7 +647,7 @@ export async function* runScan(
   queries: string[],
   keys: { provider: string; apiKey: string }[],
   extraTerms?: string[],
-  businessContext?: { location?: string | null; website?: string | null; services?: string | null }
+  businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }
 ): AsyncGenerator<AIQueryResult> {
   const RUNS_PER_QUERY = 2; // Run each query 2x per platform for stability
 

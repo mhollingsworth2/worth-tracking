@@ -446,7 +446,7 @@ async function autoScanBusiness(businessId: number) {
       db.insert(platformHealth).values({ provider, status, errorMessage: errorMessage ?? null, responseTimeMs, date: scanDateStr, timestamp: new Date().toISOString() }).run();
     });
 
-    for await (const result of runScan(biz.name, queries, keyInputs, extraTerms, { location: biz.location ?? null, website: biz.website ?? null, services: (biz as any).services ?? null })) {
+    for await (const result of runScan(biz.name, queries, keyInputs, extraTerms, { location: biz.location ?? null, website: biz.website ?? null, services: (biz as any).services ?? null, industry: biz.industry ?? null })) {
       completed++;
       const platformId = platformMap[result.platform] ?? 1;
       const dateStr = new Date().toISOString().split("T")[0];
@@ -552,7 +552,7 @@ async function autoScanBusiness(businessId: number) {
     for (const comp of compSubset) {
       console.log(`[Auto-Scan] Scanning competitor "${comp.name}" for "${biz.name}"`);
       try {
-        for await (const result of runScan(comp.name, compQueries, keyInputs, [])) {
+        for await (const result of runScan(comp.name, compQueries, keyInputs, [], { industry: biz.industry ?? null, location: biz.location ?? null, website: null, services: null })) {
           const platformId = platformMap[result.platform] ?? 1;
           const dateStr = new Date().toISOString().split("T")[0];
 
@@ -2392,7 +2392,7 @@ Extract real information from the content. If a field isn't clear from the websi
       setHealthCallback((provider, status, responseTimeMs, errorMessage) => {
         db.insert(platformHealth).values({ provider, status, errorMessage: errorMessage ?? null, responseTimeMs, date: manualScanDate, timestamp: new Date().toISOString() }).run();
       });
-      for await (const result of runScan(business.name, queries, keyInputs, extraTerms, { location: business.location ?? null, website: (business as any).website ?? null, services: (business as any).services ?? null })) {
+      for await (const result of runScan(business.name, queries, keyInputs, extraTerms, { location: business.location ?? null, website: (business as any).website ?? null, services: (business as any).services ?? null, industry: business.industry ?? null })) {
         completed++;
         const platformId = platformMap[result.platform] ?? 1;
         const dateStr = new Date().toISOString().split("T")[0];
@@ -2495,7 +2495,7 @@ Extract real information from the content. If a field isn't clear from the websi
       for (const comp of compSubset) {
         console.log(`[Scan] Scanning competitor "${comp.name}" for "${business.name}"`);
         try {
-          for await (const result of runScan(comp.name, compQueries, keyInputs, [])) {
+          for await (const result of runScan(comp.name, compQueries, keyInputs, [], { industry: business.industry ?? null, location: business.location ?? null, website: null, services: null })) {
             const platId = platformMap[result.platform] ?? 1;
             const dateStr = new Date().toISOString().split("T")[0];
             await storage.createSearchRecord({
