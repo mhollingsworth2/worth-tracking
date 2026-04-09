@@ -1,6 +1,6 @@
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { useRoute, Link, useLocation } from "wouter";
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -221,6 +221,25 @@ export default function BusinessDetail() {
     queryFn: async () => { const res = await fetch(`/api/businesses/${id}/visibility-scores`); return res.json(); },
   });
 
+  // Poll scan jobs to detect background scans (e.g. auto-scan on creation)
+  const { data: scanJobs } = useQuery<any[]>({
+    queryKey: ["/api/businesses", id, "scan-jobs"],
+    queryFn: async () => { const res = await fetch(`/api/businesses/${id}/scan-jobs`); return res.json(); },
+    refetchInterval: 5000, // poll every 5s while visible
+  });
+  const activeScan = scanJobs?.find((j: any) => j.status === "running");
+
+  // Auto-refresh all data once a background scan completes
+  const prevScanStatus = useRef<string>("");
+  const latestStatus = scanJobs?.[0]?.status ?? "";
+  useEffect(() => {
+    if (prevScanStatus.current === "running" && latestStatus === "completed") {
+      // Scan just finished — refresh everything
+      queryClient.invalidateQueries({ queryKey: ["/api/businesses", id] });
+    }
+    prevScanStatus.current = latestStatus;
+  }, [latestStatus, id]);
+
   const deleteMutation = useMutation({
     mutationFn: async () => { await apiRequest("DELETE", `/api/businesses/${id}`); },
     onSuccess: () => {
@@ -369,6 +388,30 @@ export default function BusinessDetail() {
             </Button>
           </div>
         </div>
+
+        {/* Scan-in-progress banner */}
+        {activeScan && (
+          <div className="flex items-center gap-3 px-4 py-3 rounded-lg border border-primary/30 bg-primary/5">
+            <Loader2 className="w-4 h-4 animate-spin text-primary" />
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-medium">AI scan in progress...</p>
+              <p className="text-xs text-muted-foreground">
+                {activeScan.completedQueries} / {activeScan.totalQueries} queries completed — data updates live
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* Empty state when no data yet and no scan running */}
+        {!activeScan && stats?.totalSearches === 0 && (
+          <div className="flex flex-col items-center justify-center py-12 text-center border rounded-lg">
+            <Search className="w-10 h-10 text-muted-foreground mb-3" />
+            <h3 className="font-semibold mb-1">No search data yet</h3>
+            <p className="text-sm text-muted-foreground mb-4 max-w-md">
+              Click "Run AI Scan" to query AI platforms and see how your business appears in real search results.
+            </p>
+          </div>
+        )}
 
         {/* KPIs */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">

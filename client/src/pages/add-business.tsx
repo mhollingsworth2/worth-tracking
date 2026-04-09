@@ -55,7 +55,7 @@ export default function AddBusiness() {
     },
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ["/api/businesses"] });
-      toast({ title: "Business added", description: "Demo tracking data has been generated." });
+      toast({ title: "Business added", description: "An AI scan is running in the background — real data will appear shortly." });
       navigate(`/business/${data.id}`);
     },
     onError: (err: Error) => {

@@ -34,315 +34,89 @@ function seedPlatforms() {
   }
 }
 
-// Generate realistic demo data for a business
-function generateDemoData(businessId: number, businessName: string, industry: string) {
-  const allPlatforms = db.select().from(platforms).all();
+// Auto-scan runs in the background after business creation (fire-and-forget).
+// It uses the same logic as the /scan endpoint but doesn't block the response.
+async function autoScanBusiness(businessId: number, businessName: string, industry: string, location: string | null) {
+  try {
+    const keys = await storage.getApiKeys();
+    const activeKeys = keys.filter((k) => k.isActive);
+    if (activeKeys.length === 0) {
+      console.log(`[Auto-Scan] No API keys configured — skipping initial scan for "${businessName}"`);
+      return;
+    }
 
-  const industryQueries: Record<string, string[]> = {
-    "Restaurant": [
-      `best ${industry.toLowerCase()} restaurants near me`,
-      `top rated dining options in my area`,
-      `where should I eat tonight`,
-      `${businessName} reviews`,
-      `restaurants with good ambiance`,
-      `affordable fine dining`,
-      `best brunch spots`,
-      `${businessName} menu prices`,
-      `restaurants open late`,
-      `healthy restaurant options`,
-    ],
-    "Technology": [
-      `best ${industry.toLowerCase()} companies`,
-      `top software solutions for business`,
-      `${businessName} alternatives`,
-      `${businessName} pricing`,
-      `enterprise software comparison`,
-      `cloud service providers ranking`,
-      `${businessName} vs competitors`,
-      `tech companies to watch`,
-      `best SaaS tools 2026`,
-      `${businessName} customer reviews`,
-    ],
-    "default": [
-      `best ${industry.toLowerCase()} businesses`,
-      `top ${industry.toLowerCase()} services near me`,
-      `${businessName} reviews`,
-      `${businessName} alternatives`,
-      `recommended ${industry.toLowerCase()} providers`,
-      `${industry.toLowerCase()} companies comparison`,
-      `affordable ${industry.toLowerCase()} services`,
-      `${businessName} pricing`,
-      `is ${businessName} worth it`,
-      `${industry.toLowerCase()} industry leaders`,
-    ],
-  };
+    const queries = generateScanQueries(businessName, industry, location);
+    const allPlatforms = await storage.getPlatforms();
+    const platformMap = Object.fromEntries(allPlatforms.map((p) => [p.name, p.id]));
 
-  const queries = industryQueries[industry] || industryQueries["default"];
+    const job = await storage.createScanJob({
+      businessId,
+      status: "running",
+      totalQueries: queries.length * activeKeys.length,
+      completedQueries: 0,
+      startedAt: new Date().toISOString(),
+    });
 
-  // Generate 30 days of data
-  const now = new Date();
-  for (let d = 29; d >= 0; d--) {
-    const date = new Date(now);
-    date.setDate(date.getDate() - d);
-    const dateStr = date.toISOString().split("T")[0];
+    let completed = 0;
+    let mentionCount = 0;
+    const keyInputs = activeKeys.map((k) => ({ provider: k.provider, apiKey: k.apiKey }));
 
-    // 2-5 searches per day
-    const searchCount = Math.floor(Math.random() * 4) + 2;
-    for (let s = 0; s < searchCount; s++) {
-      const platform = allPlatforms[Math.floor(Math.random() * allPlatforms.length)];
-      const query = queries[Math.floor(Math.random() * queries.length)];
-      const mentioned = Math.random() > 0.35 ? 1 : 0;
-      const position = mentioned ? Math.floor(Math.random() * 5) + 1 : null;
+    for await (const result of runScan(businessName, queries, keyInputs)) {
+      completed++;
+      const platformId = platformMap[result.platform] ?? 1;
+      const dateStr = new Date().toISOString().split("T")[0];
 
-      db.insert(searchRecords).values({
+      await storage.createSearchRecord({
         businessId,
-        platformId: platform.id,
-        query,
-        mentioned,
-        position,
+        platformId,
+        query: result.query,
+        mentioned: result.mentioned ? 1 : 0,
+        position: result.position,
         date: dateStr,
-      }).run();
-    }
-  }
+      });
 
-  // Generate optimized prompts with SEO tips
-  const promptTemplates = [
-    {
-      category: "discovery",
-      prompt: `What are the best ${industry.toLowerCase()} options available right now?`,
-      score: Math.floor(Math.random() * 20) + 75,
-      tip: `Ensure your business description includes specific, unique value propositions. AI models rank businesses higher when they find distinctive attributes in indexed content.`,
-    },
-    {
-      category: "comparison",
-      prompt: `Compare ${businessName} with other ${industry.toLowerCase()} providers`,
-      score: Math.floor(Math.random() * 20) + 70,
-      tip: `Publish detailed comparison pages on your site. AI models frequently pull from structured comparison content when answering "vs" or "compare" queries.`,
-    },
-    {
-      category: "recommendation",
-      prompt: `Can you recommend a great ${industry.toLowerCase()} business for someone new?`,
-      score: Math.floor(Math.random() * 20) + 65,
-      tip: `Customer reviews and testimonials are heavily weighted by AI. Encourage verified reviews across platforms — AI models synthesize these into recommendations.`,
-    },
-    {
-      category: "local",
-      prompt: `What ${industry.toLowerCase()} businesses are popular in my area?`,
-      score: Math.floor(Math.random() * 20) + 60,
-      tip: `Optimize your Google Business Profile and ensure NAP (Name, Address, Phone) consistency across directories. AI models pull location data from these sources.`,
-    },
-    {
-      category: "review",
-      prompt: `What do people say about ${businessName}?`,
-      score: Math.floor(Math.random() * 20) + 55,
-      tip: `Respond to all reviews — positive and negative. Active engagement signals credibility to AI systems that analyze sentiment patterns.`,
-    },
-    {
-      category: "discovery",
-      prompt: `What's the best value in the ${industry.toLowerCase()} industry?`,
-      score: Math.floor(Math.random() * 20) + 68,
-      tip: `Publish transparent pricing information. AI models favor businesses with clear, accessible pricing when answering value-oriented queries.`,
-    },
-  ];
+      // Track API cost
+      const providerKey = keyInputs.find(k => {
+        const pMap: Record<string, string> = { openai: "ChatGPT", anthropic: "Claude", google: "Google Gemini", perplexity: "Perplexity" };
+        return pMap[k.provider] === result.platform;
+      });
+      if (providerKey) {
+        const cost = PROVIDER_COST_PER_CALL[providerKey.provider] ?? 0.005;
+        db.insert(apiUsage).values({
+          provider: providerKey.provider,
+          estimatedCost: cost.toFixed(6),
+          date: dateStr,
+          timestamp: new Date().toISOString(),
+        }).run();
+      }
 
-  for (const t of promptTemplates) {
-    db.insert(optimizedPrompts).values({ businessId, ...t }).run();
-  }
+      if (result.mentioned) mentionCount++;
 
-  // Generate referral/click-through data
-  const mentionedRecords = db.select().from(searchRecords)
-    .where(sql`business_id = ${businessId} AND mentioned = 1`)
-    .all();
+      if (result.responseText) {
+        await storage.createAiSnapshot({
+          businessId,
+          platformId,
+          query: result.query,
+          responseText: result.responseText,
+          sentiment: result.sentiment,
+          mentionedAccurate: result.mentioned ? 1 : 0,
+          flaggedIssues: null,
+          date: dateStr,
+        });
+      }
 
-  const landingPages = ["/", "/about", "/services", "/pricing", "/contact", "/menu", "/products", "/reviews"];
-  const conversionTypes = ["contact_form", "purchase", "signup", "phone_call", "booking"];
-  const devices: Array<"desktop" | "mobile" | "tablet"> = ["desktop", "mobile", "tablet"];
-  const deviceWeights = [0.45, 0.45, 0.1];
-
-  for (const record of mentionedRecords) {
-    if (Math.random() > 0.30) continue;
-
-    const platform = allPlatforms.find(p => p.id === record.platformId);
-    const platformSlug = (platform?.name ?? "ai").toLowerCase().replace(/\s+/g, "-");
-
-    const rand = Math.random();
-    let deviceIdx = 0;
-    let cumulative = 0;
-    for (let i = 0; i < deviceWeights.length; i++) {
-      cumulative += deviceWeights[i];
-      if (rand < cumulative) { deviceIdx = i; break; }
+      await storage.updateScanJob(job.id, { completedQueries: completed });
     }
 
-    const sessionDuration = Math.floor(Math.random() * 300) + 15;
-    const pagesViewed = Math.floor(Math.random() * 6) + 1;
-    const converted = Math.random() < 0.20 ? 1 : 0;
-    const conversionType = converted ? conversionTypes[Math.floor(Math.random() * conversionTypes.length)] : null;
+    await storage.updateScanJob(job.id, {
+      status: "completed",
+      completedQueries: completed,
+      completedAt: new Date().toISOString(),
+    });
 
-    const hour = Math.floor(Math.random() * 14) + 8;
-    const minute = Math.floor(Math.random() * 60);
-    const timestamp = `${record.date}T${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:00`;
-
-    db.insert(referrals).values({
-      businessId,
-      platformId: record.platformId,
-      searchRecordId: record.id,
-      query: record.query,
-      landingPage: landingPages[Math.floor(Math.random() * landingPages.length)],
-      utmSource: platformSlug,
-      utmMedium: "ai-search",
-      utmCampaign: null,
-      converted,
-      conversionType,
-      sessionDuration,
-      pagesViewed,
-      deviceType: devices[deviceIdx],
-      date: record.date,
-      timestamp,
-    }).run();
-  }
-
-  // === SEED COMPETITORS ===
-  const competitorNames = [
-    { name: `${industry} Elite`, website: `https://${industry.toLowerCase()}-elite.com` },
-    { name: `Prime ${industry}`, website: `https://prime${industry.toLowerCase()}.com` },
-    { name: `${industry} Hub`, website: `https://${industry.toLowerCase()}hub.io` },
-  ];
-  const numCompetitors = Math.floor(Math.random() * 2) + 2; // 2-3
-
-  for (let c = 0; c < numCompetitors; c++) {
-    const comp = competitorNames[c];
-    db.insert(competitors).values({
-      businessId,
-      name: comp.name,
-      website: comp.website,
-      notes: `Key competitor in the ${industry.toLowerCase()} space`,
-    }).run();
-  }
-
-  // === SEED AI SNAPSHOTS ===
-  const snapshotTemplates = [
-    {
-      query: `What is ${businessName}?`,
-      responseText: `${businessName} is a well-regarded ${industry.toLowerCase()} business known for its quality service and customer-first approach. They have been operating for several years and have built a strong reputation in the local market. Customers frequently praise their attention to detail and competitive pricing.`,
-      sentiment: "positive",
-      mentionedAccurate: 1,
-      flaggedIssues: null,
-    },
-    {
-      query: `Is ${businessName} still open?`,
-      responseText: `Based on my information, ${businessName} appears to be actively operating. However, I should note that my information may not reflect the most current hours. Their listed hours show Monday-Friday 9am-6pm, but I'd recommend checking their website or calling directly for the most up-to-date information.`,
-      sentiment: "neutral",
-      mentionedAccurate: 0,
-      flaggedIssues: JSON.stringify(["Hours may be outdated", "Recommends verification"]),
-    },
-    {
-      query: `${businessName} vs competitors`,
-      responseText: `When comparing ${businessName} to alternatives in the ${industry.toLowerCase()} space, several factors stand out. ${businessName} tends to offer competitive pricing with strong customer service. However, some competitors may offer a wider range of services. Overall, ${businessName} is a solid choice for value-conscious customers.`,
-      sentiment: "positive",
-      mentionedAccurate: 1,
-      flaggedIssues: null,
-    },
-    {
-      query: `Problems with ${businessName}`,
-      responseText: `I found some mixed feedback about ${businessName}. While most reviews are positive, a few customers have mentioned occasional wait times and limited availability during peak hours. The business has responded to most concerns and appears to be actively improving their service delivery.`,
-      sentiment: "negative",
-      mentionedAccurate: 1,
-      flaggedIssues: JSON.stringify(["Mentions negative reviews"]),
-    },
-    {
-      query: `Best ${industry.toLowerCase()} recommendations`,
-      responseText: `Here are my top recommendations for ${industry.toLowerCase()} services in your area: 1) ${businessName} - Great reviews and competitive pricing. 2) ${industry} Elite - Known for premium offerings. 3) Prime ${industry} - Good budget option. Each has its strengths depending on your specific needs.`,
-      sentiment: "positive",
-      mentionedAccurate: 1,
-      flaggedIssues: null,
-    },
-    {
-      query: `${businessName} contact information`,
-      responseText: `${businessName} can be reached through their website. They are located in the downtown area and offer both in-person and online services. Note: I don't have their current phone number in my training data, so please check their website for the latest contact details.`,
-      sentiment: "neutral",
-      mentionedAccurate: 0,
-      flaggedIssues: JSON.stringify(["Missing phone number", "Location may be inaccurate"]),
-    },
-  ];
-
-  const numSnapshots = Math.floor(Math.random() * 3) + 4; // 4-6
-  for (let s = 0; s < numSnapshots; s++) {
-    const template = snapshotTemplates[s % snapshotTemplates.length];
-    const daysAgo = Math.floor(Math.random() * 14);
-    const snapshotDate = new Date(now);
-    snapshotDate.setDate(snapshotDate.getDate() - daysAgo);
-    const platform = allPlatforms[Math.floor(Math.random() * allPlatforms.length)];
-
-    db.insert(aiSnapshots).values({
-      businessId,
-      platformId: platform.id,
-      query: template.query,
-      responseText: template.responseText,
-      sentiment: template.sentiment,
-      mentionedAccurate: template.mentionedAccurate,
-      flaggedIssues: template.flaggedIssues,
-      date: snapshotDate.toISOString().split("T")[0],
-    }).run();
-  }
-
-  // === SEED ALERTS ===
-  const alertTemplates = [
-    { type: "mention_drop", message: `${businessName} mention rate dropped 15% on ChatGPT this week`, severity: "warning" },
-    { type: "competitor_outrank", message: `${industry} Elite now appears before ${businessName} in "best ${industry.toLowerCase()}" queries on Perplexity`, severity: "warning" },
-    { type: "platform_missing", message: `${businessName} was not mentioned in any Meta AI queries this week`, severity: "critical" },
-    { type: "accuracy_issue", message: `AI snapshot flagged outdated business hours being reported by Google Gemini`, severity: "critical" },
-    { type: "mention_drop", message: `Weekly mention rate across all platforms is down 8% compared to last week`, severity: "info" },
-    { type: "competitor_outrank", message: `Prime ${industry} gained 3 new mention positions on Claude this month`, severity: "info" },
-    { type: "accuracy_issue", message: `Perplexity is reporting an old address for ${businessName}`, severity: "warning" },
-    { type: "platform_missing", message: `${businessName} has no mentions on Copilot — consider optimizing for this platform`, severity: "info" },
-  ];
-
-  const numAlerts = Math.floor(Math.random() * 4) + 5; // 5-8
-  for (let a = 0; a < numAlerts; a++) {
-    const template = alertTemplates[a % alertTemplates.length];
-    const daysAgo = Math.floor(Math.random() * 10);
-    const alertDate = new Date(now);
-    alertDate.setDate(alertDate.getDate() - daysAgo);
-    const isRead = Math.random() > 0.5 ? 1 : 0;
-
-    db.insert(alerts).values({
-      businessId,
-      type: template.type,
-      message: template.message,
-      severity: template.severity,
-      isRead,
-      date: alertDate.toISOString().split("T")[0],
-    }).run();
-  }
-
-  // === SEED CONTENT GAPS ===
-  const gapTemplates = [
-    { query: `best ${industry.toLowerCase()} for beginners`, category: "discovery", currentlyRanking: 0, recommendedContent: `Create a beginner's guide blog post targeting first-time ${industry.toLowerCase()} customers. Include FAQs, pricing breakdowns, and what to expect.`, contentType: "blog_post", priority: "high" },
-    { query: `${industry.toLowerCase()} pricing comparison`, category: "pricing", currentlyRanking: 0, recommendedContent: `Add a transparent pricing page with comparison tables. AI models heavily favor structured pricing data.`, contentType: "landing_page", priority: "high" },
-    { query: `${businessName} hours and location`, category: "local", currentlyRanking: 1, recommendedContent: `Add schema markup (LocalBusiness) to your website with accurate hours, address, and phone number.`, contentType: "schema_markup", priority: "high" },
-    { query: `${industry.toLowerCase()} frequently asked questions`, category: "information", currentlyRanking: 0, recommendedContent: `Build a comprehensive FAQ page covering the top 15-20 questions customers ask about ${industry.toLowerCase()} services.`, contentType: "faq", priority: "medium" },
-    { query: `${businessName} customer reviews summary`, category: "reputation", currentlyRanking: 1, recommendedContent: `Create a testimonials page featuring verified customer reviews. Respond to all reviews on Google and Yelp.`, contentType: "review_response", priority: "medium" },
-    { query: `eco-friendly ${industry.toLowerCase()} options`, category: "trending", currentlyRanking: 0, recommendedContent: `Write a blog post about your sustainability practices and eco-friendly initiatives.`, contentType: "blog_post", priority: "medium" },
-    { query: `${industry.toLowerCase()} near me open now`, category: "local", currentlyRanking: 0, recommendedContent: `Ensure Google Business Profile has accurate real-time hours. Add structured data for opening hours.`, contentType: "schema_markup", priority: "low" },
-    { query: `${businessName} alternatives`, category: "comparison", currentlyRanking: 1, recommendedContent: `Create a comparison page positioning ${businessName} against alternatives, highlighting unique strengths.`, contentType: "landing_page", priority: "medium" },
-    { query: `how to choose a ${industry.toLowerCase()} provider`, category: "educational", currentlyRanking: 0, recommendedContent: `Publish a guide on what to look for when choosing a ${industry.toLowerCase()} provider. Position ${businessName} as the expert.`, contentType: "blog_post", priority: "low" },
-    { query: `${industry.toLowerCase()} deals and promotions`, category: "pricing", currentlyRanking: 0, recommendedContent: `Add a promotions page and keep it updated. AI models look for current offers when answering deal-related queries.`, contentType: "landing_page", priority: "low" },
-  ];
-
-  const numGaps = Math.floor(Math.random() * 5) + 6; // 6-10
-  for (let g = 0; g < numGaps; g++) {
-    const template = gapTemplates[g % gapTemplates.length];
-    db.insert(contentGaps).values({ businessId, ...template }).run();
-  }
-
-  // === SEED LOCATIONS ===
-  const locationTemplates = [
-    { name: "Main Office", address: "123 Main Street, Downtown, NY 10001" },
-    { name: "Satellite Location", address: "456 Oak Avenue, Midtown, NY 10019" },
-  ];
-  const numLocations = Math.floor(Math.random() * 2) + 1; // 1-2
-  for (let l = 0; l < numLocations; l++) {
-    db.insert(locations).values({ businessId, ...locationTemplates[l] }).run();
+    console.log(`[Auto-Scan] Finished "${businessName}": ${completed} queries, ${mentionCount} mentions`);
+  } catch (err: any) {
+    console.error(`[Auto-Scan] Error for "${businessName}":`, err.message);
   }
 }
 
@@ -721,7 +495,11 @@ export async function registerRoutes(
     const parsed = insertBusinessSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: parsed.error.message });
     const business = await storage.createBusiness(parsed.data);
-    generateDemoData(business.id, business.name, business.industry);
+
+    // Fire-and-forget: run an initial AI scan in the background so the user
+    // gets real data instead of simulated data. The response returns immediately.
+    autoScanBusiness(business.id, business.name, business.industry, business.location ?? null);
+
     res.json(business);
   });
 
