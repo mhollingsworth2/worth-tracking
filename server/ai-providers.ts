@@ -4,99 +4,176 @@ export interface AIQueryResult {
   responseText: string;
   mentioned: boolean;
   sentiment: "positive" | "neutral" | "negative";
+  confidence: "high" | "medium" | "low";
   position: number | null;
 }
-
-const POSITIVE_WORDS = ["recommend", "great", "excellent", "top", "best", "quality", "trusted", "outstanding", "popular", "leading", "reliable", "impressive"];
-const NEGATIVE_WORDS = ["avoid", "poor", "issues", "complaints", "problems", "concerns", "disappointing", "unreliable", "worst", "negative"];
-
-// Phrases that indicate the model doesn't actually have information about the business.
-// If any of these appear, don't count the response as a real "mention" even if the
-// business name was echoed from the prompt itself.
-const NO_KNOWLEDGE_PHRASES = [
-  "i don't have",
-  "i do not have",
-  "i'm not aware",
-  "i am not aware",
-  "no information",
-  "not in my training",
-  "not familiar with",
-  "cannot find",
-  "can't find",
-  "no verified information",
-  "unable to find",
-  "don't have reliable",
-  "no reliable information",
-  "i'm not sure",
-  "i cannot confirm",
-  "no specific information",
-];
 
 // System instruction sent with every query to reduce hallucination.
 // Models are told to explicitly decline rather than fabricate business details.
 const SYSTEM_INSTRUCTION = "You are answering questions about real-world businesses. Base your answer only on verified, factual information. If you do not have reliable, specific information about a business being asked about, respond with 'No verified information available' and briefly explain what you do and don't know. Do not guess, fabricate details, or invent reviews, ratings, addresses, or services. It is better to say you don't know than to make something up.";
 
-function analyzeMention(responseText: string, businessName: string, extraTerms?: string[]): { mentioned: boolean; position: number | null; sentiment: "positive" | "neutral" | "negative" } {
-  const lowerResponse = responseText.toLowerCase();
-  const lowerName = businessName.toLowerCase();
+// ── AI-Powered Response Analysis ──────────────────────────────────────────
+// Instead of fragile string matching, we send a follow-up call to a cheap AI
+// model asking it to analyze whether the response genuinely mentions the
+// business. This catches echoed names, wrong-business matches, and gives
+// accurate sentiment + confidence ratings.
 
-  // If the response explicitly says the model has no knowledge, treat as not mentioned
-  // regardless of whether the business name appears (it was just echoed from the prompt).
-  const hasNoKnowledge = NO_KNOWLEDGE_PHRASES.some(phrase => lowerResponse.includes(phrase));
+interface AnalysisResult {
+  mentioned: boolean;
+  sentiment: "positive" | "neutral" | "negative";
+  confidence: "high" | "medium" | "low";
+  position: number | null;
+}
 
-  // Primary match: business name. Secondary: services/keywords with 2+ word overlap.
-  let nameMentioned = !hasNoKnowledge && lowerResponse.includes(lowerName);
+const ANALYSIS_PROMPT = (businessName: string, query: string, responseText: string) => `You are analyzing an AI response to determine if it genuinely mentions and recommends a specific business.
 
-  // Also check extra terms (services, keywords) — but only multi-word ones to avoid
-  // false positives from generic single words like "cleaning".
-  if (!nameMentioned && !hasNoKnowledge && extraTerms) {
-    for (const term of extraTerms) {
-      const lower = term.toLowerCase().trim();
-      if (lower.split(/\s+/).length >= 2 && lowerResponse.includes(lower)) {
-        nameMentioned = true;
-        break;
+Business name: "${businessName}"
+Original query: "${query}"
+
+AI Response to analyze:
+"""
+${responseText.slice(0, 2000)}
+"""
+
+Answer these questions about the response above:
+1. Does the response genuinely mention "${businessName}" as a real recommendation (not just echoing the question, saying "I don't know about them", or confusing it with a different business)?
+2. If mentioned, what position in a list does it appear? (1 = first mentioned, 2 = second, etc. null if not in a list)
+3. What is the overall sentiment toward "${businessName}"? (positive = recommended/praised, neutral = just mentioned factually, negative = warned against/criticized)
+4. How confident are you in this analysis? (high = clearly mentioned or clearly not, medium = somewhat ambiguous, low = very unclear)
+
+Respond with ONLY valid JSON, no other text:
+{"mentioned": true/false, "position": number or null, "sentiment": "positive"/"neutral"/"negative", "confidence": "high"/"medium"/"low"}`;
+
+// Keys available for analysis calls (populated from active API keys)
+let analysisKeys: { provider: string; apiKey: string }[] = [];
+
+export function setAnalysisKeys(keys: { provider: string; apiKey: string }[]) {
+  analysisKeys = keys;
+}
+
+async function analyzeWithAI(businessName: string, query: string, responseText: string): Promise<AnalysisResult> {
+  // Try to use the cheapest available model for analysis
+  // Priority: Google (cheapest) > OpenAI > Anthropic > Perplexity
+  const priority = ["google", "openai", "anthropic", "perplexity"];
+  const sortedKeys = [...analysisKeys].sort((a, b) => {
+    return priority.indexOf(a.provider) - priority.indexOf(b.provider);
+  });
+
+  const prompt = ANALYSIS_PROMPT(businessName, query, responseText);
+
+  for (const key of sortedKeys) {
+    try {
+      let analysisText = "";
+
+      if (key.provider === "google") {
+        const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key.apiKey}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: "You are a precise JSON-only analysis tool. Respond with valid JSON only, no markdown, no explanation." }] },
+            contents: [{ parts: [{ text: prompt }] }],
+          }),
+        });
+        if (!res.ok) continue;
+        const data = await res.json();
+        analysisText = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+      } else if (key.provider === "openai") {
+        const res = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: { "Authorization": `Bearer ${key.apiKey}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: "gpt-4o-mini",
+            max_completion_tokens: 256,
+            messages: [
+              { role: "system", content: "You are a precise JSON-only analysis tool. Respond with valid JSON only, no markdown, no explanation." },
+              { role: "user", content: prompt },
+            ],
+          }),
+        });
+        if (!res.ok) continue;
+        const data = await res.json();
+        analysisText = data.choices?.[0]?.message?.content ?? "";
+      } else if (key.provider === "anthropic") {
+        const res = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: { "x-api-key": key.apiKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: "claude-haiku-4-5-20251001",
+            max_tokens: 256,
+            system: "You are a precise JSON-only analysis tool. Respond with valid JSON only, no markdown, no explanation.",
+            messages: [{ role: "user", content: prompt }],
+          }),
+        });
+        if (!res.ok) continue;
+        const data = await res.json();
+        analysisText = Array.isArray(data.content)
+          ? data.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("")
+          : "";
+      } else if (key.provider === "perplexity") {
+        const res = await fetch("https://api.perplexity.ai/chat/completions", {
+          method: "POST",
+          headers: { "Authorization": `Bearer ${key.apiKey}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: "sonar",
+            max_tokens: 256,
+            messages: [
+              { role: "system", content: "You are a precise JSON-only analysis tool. Respond with valid JSON only, no markdown, no explanation." },
+              { role: "user", content: prompt },
+            ],
+          }),
+        });
+        if (!res.ok) continue;
+        const data = await res.json();
+        analysisText = data.choices?.[0]?.message?.content ?? "";
       }
+
+      // Parse JSON from response (strip markdown code fences if present)
+      const cleaned = analysisText.replace(/```json?\s*/gi, "").replace(/```/g, "").trim();
+      const parsed = JSON.parse(cleaned);
+
+      return {
+        mentioned: !!parsed.mentioned,
+        sentiment: ["positive", "neutral", "negative"].includes(parsed.sentiment) ? parsed.sentiment : "neutral",
+        confidence: ["high", "medium", "low"].includes(parsed.confidence) ? parsed.confidence : "medium",
+        position: typeof parsed.position === "number" ? parsed.position : null,
+      };
+    } catch (err: any) {
+      console.error(`[AI Analysis] ${key.provider} failed:`, err.message);
+      continue;
     }
   }
 
-  const mentioned = nameMentioned;
+  // Fallback: if all AI analysis calls fail, use basic heuristic
+  console.warn("[AI Analysis] All providers failed — using basic fallback");
+  return fallbackAnalysis(businessName, responseText);
+}
+
+// Minimal fallback if no AI provider is available for analysis
+function fallbackAnalysis(businessName: string, responseText: string): AnalysisResult {
+  const lower = responseText.toLowerCase();
+  const nameLower = businessName.toLowerCase();
+
+  const noKnowledge = ["i don't have", "i do not have", "no verified information", "not familiar with", "no information"].some(p => lower.includes(p));
+  const mentioned = !noKnowledge && lower.includes(nameLower);
 
   let position: number | null = null;
   if (mentioned) {
-    const sentences = responseText.split(/[.!?]+/).filter(s => s.trim().length > 0);
+    const sentences = responseText.split(/[.!?\n]+/).filter(s => s.trim().length > 0);
     for (let i = 0; i < sentences.length; i++) {
-      const s = sentences[i].toLowerCase();
-      if (s.includes(lowerName)) {
-        position = i + 1;
-        break;
-      }
-      // Check multi-word extra terms for position too
-      if (extraTerms) {
-        for (const term of extraTerms) {
-          const lower = term.toLowerCase().trim();
-          if (lower.split(/\s+/).length >= 2 && s.includes(lower)) {
-            position = i + 1;
-            break;
-          }
-        }
-        if (position !== null) break;
-      }
+      if (sentences[i].toLowerCase().includes(nameLower)) { position = i + 1; break; }
     }
   }
 
-  const positiveCount = POSITIVE_WORDS.filter(w => lowerResponse.includes(w)).length;
-  const negativeCount = NEGATIVE_WORDS.filter(w => lowerResponse.includes(w)).length;
-  let sentiment: "positive" | "neutral" | "negative" = "neutral";
-  if (positiveCount > negativeCount) sentiment = "positive";
-  else if (negativeCount > positiveCount) sentiment = "negative";
+  const posWords = ["recommend", "great", "excellent", "best", "quality", "trusted", "leading", "reliable"];
+  const negWords = ["avoid", "poor", "issues", "complaints", "problems", "disappointing", "unreliable"];
+  const pos = posWords.filter(w => lower.includes(w)).length;
+  const neg = negWords.filter(w => lower.includes(w)).length;
+  const sentiment = pos > neg ? "positive" : neg > pos ? "negative" : "neutral";
 
-  return { mentioned, position, sentiment };
+  return { mentioned, sentiment, confidence: "low", position };
 }
 
 async function queryOpenAI(apiKey: string, query: string, businessName: string, extraTerms?: string[]): Promise<AIQueryResult> {
-  // Note: gpt-5-mini on chat/completions does not include built-in web search.
-  // Live-web answers come from Claude/Gemini/Perplexity; here we rely on the
-  // system instruction to discourage hallucination.
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -104,7 +181,7 @@ async function queryOpenAI(apiKey: string, query: string, businessName: string, 
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "gpt-5-mini",
+      model: "gpt-4o-mini",
       max_completion_tokens: 1024,
       messages: [
         { role: "system", content: SYSTEM_INSTRUCTION },
@@ -120,14 +197,9 @@ async function queryOpenAI(apiKey: string, query: string, businessName: string, 
 
   const data = await res.json();
   const responseText = data.choices?.[0]?.message?.content ?? "";
-  const analysis = analyzeMention(responseText, businessName, extraTerms);
+  const analysis = await analyzeWithAI(businessName, query, responseText);
 
-  return {
-    platform: "ChatGPT",
-    query,
-    responseText,
-    ...analysis,
-  };
+  return { platform: "ChatGPT", query, responseText, ...analysis };
 }
 
 async function queryAnthropic(apiKey: string, query: string, businessName: string, extraTerms?: string[]): Promise<AIQueryResult> {
@@ -152,30 +224,20 @@ async function queryAnthropic(apiKey: string, query: string, businessName: strin
   }
 
   const data = await res.json();
-  // Concatenate all text blocks (content is an array).
   const responseText = Array.isArray(data.content)
     ? data.content.filter((block: any) => block.type === "text").map((block: any) => block.text).join("\n")
     : "";
-  const analysis = analyzeMention(responseText, businessName, extraTerms);
+  const analysis = await analyzeWithAI(businessName, query, responseText);
 
-  return {
-    platform: "Claude",
-    query,
-    responseText,
-    ...analysis,
-  };
+  return { platform: "Claude", query, responseText, ...analysis };
 }
 
 async function queryGemini(apiKey: string, query: string, businessName: string, extraTerms?: string[]): Promise<AIQueryResult> {
   const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      systemInstruction: {
-        parts: [{ text: SYSTEM_INSTRUCTION }],
-      },
+      systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
       contents: [{ parts: [{ text: query }] }],
     }),
   });
@@ -187,14 +249,9 @@ async function queryGemini(apiKey: string, query: string, businessName: string, 
 
   const data = await res.json();
   const responseText = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-  const analysis = analyzeMention(responseText, businessName, extraTerms);
+  const analysis = await analyzeWithAI(businessName, query, responseText);
 
-  return {
-    platform: "Google Gemini",
-    query,
-    responseText,
-    ...analysis,
-  };
+  return { platform: "Google Gemini", query, responseText, ...analysis };
 }
 
 async function queryPerplexity(apiKey: string, query: string, businessName: string, extraTerms?: string[]): Promise<AIQueryResult> {
@@ -221,14 +278,9 @@ async function queryPerplexity(apiKey: string, query: string, businessName: stri
 
   const data = await res.json();
   const responseText = data.choices?.[0]?.message?.content ?? "";
-  const analysis = analyzeMention(responseText, businessName, extraTerms);
+  const analysis = await analyzeWithAI(businessName, query, responseText);
 
-  return {
-    platform: "Perplexity",
-    query,
-    responseText,
-    ...analysis,
-  };
+  return { platform: "Perplexity", query, responseText, ...analysis };
 }
 
 const PROVIDER_FN: Record<string, (apiKey: string, query: string, businessName: string, extraTerms?: string[]) => Promise<AIQueryResult>> = {

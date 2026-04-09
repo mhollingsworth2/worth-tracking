@@ -333,6 +333,11 @@ export class DatabaseStorage implements IStorage {
       mentions: sql<number>`sum(case when ${searchRecords.mentioned} = 1 then 1 else 0 end)`,
       avgPosition: sql<number>`avg(case when ${searchRecords.mentioned} = 1 then ${searchRecords.position} end)`,
       platformsCovered: sql<number>`count(distinct ${searchRecords.platformId})`,
+      highConfidence: sql<number>`sum(case when ${searchRecords.confidence} = 'high' then 1 else 0 end)`,
+      mediumConfidence: sql<number>`sum(case when ${searchRecords.confidence} = 'medium' then 1 else 0 end)`,
+      lowConfidence: sql<number>`sum(case when ${searchRecords.confidence} = 'low' then 1 else 0 end)`,
+      positiveSentiment: sql<number>`sum(case when ${searchRecords.sentiment} = 'positive' then 1 else 0 end)`,
+      negativeSentiment: sql<number>`sum(case when ${searchRecords.sentiment} = 'negative' then 1 else 0 end)`,
     })
       .from(searchRecords)
       .where(eq(searchRecords.businessId, businessId))
@@ -346,6 +351,11 @@ export class DatabaseStorage implements IStorage {
       mentionRate: r.runs > 0 ? Math.round((r.mentions / r.runs) * 100) : 0,
       avgPosition: r.avgPosition ? Math.round(r.avgPosition * 10) / 10 : null,
       platformsCovered: r.platformsCovered,
+      highConfidence: r.highConfidence ?? 0,
+      mediumConfidence: r.mediumConfidence ?? 0,
+      lowConfidence: r.lowConfidence ?? 0,
+      positiveSentiment: r.positiveSentiment ?? 0,
+      negativeSentiment: r.negativeSentiment ?? 0,
     })).sort((a: any, b: any) => b.mentions - a.mentions || b.mentionRate - a.mentionRate);
   }
 

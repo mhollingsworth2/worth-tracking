@@ -44,6 +44,8 @@ export const searchRecords = sqliteTable("search_records", {
   query: text("query").notNull(),
   mentioned: integer("mentioned").notNull().default(0),
   position: integer("position"),
+  sentiment: text("sentiment"),         // "positive" | "neutral" | "negative"
+  confidence: text("confidence"),       // "high" | "medium" | "low"
   date: text("date").notNull(),
 });
 

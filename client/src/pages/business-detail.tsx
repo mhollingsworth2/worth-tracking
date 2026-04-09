@@ -595,6 +595,8 @@ export default function BusinessDetail() {
                         <th className="pb-2 pr-4 font-medium text-center">Mentions</th>
                         <th className="pb-2 pr-4 font-medium text-center">Rate</th>
                         <th className="pb-2 pr-4 font-medium text-center">Avg Pos</th>
+                        <th className="pb-2 pr-4 font-medium text-center">Sentiment</th>
+                        <th className="pb-2 pr-4 font-medium text-center">Confidence</th>
                         <th className="pb-2 font-medium text-center">Platforms</th>
                       </tr>
                     </thead>
@@ -614,6 +616,47 @@ export default function BusinessDetail() {
                             </span>
                           </td>
                           <td className="py-2 pr-4 text-center tabular-nums">{q.avgPosition ?? "—"}</td>
+                          <td className="py-2 pr-4 text-center">
+                            {q.positiveSentiment > 0 || q.negativeSentiment > 0 ? (
+                              <div className="flex items-center justify-center gap-1">
+                                {q.positiveSentiment > 0 && (
+                                  <span className="text-xs px-1.5 py-0.5 rounded-full bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400">
+                                    +{q.positiveSentiment}
+                                  </span>
+                                )}
+                                {q.negativeSentiment > 0 && (
+                                  <span className="text-xs px-1.5 py-0.5 rounded-full bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400">
+                                    -{q.negativeSentiment}
+                                  </span>
+                                )}
+                              </div>
+                            ) : (
+                              <span className="text-xs text-muted-foreground">—</span>
+                            )}
+                          </td>
+                          <td className="py-2 pr-4 text-center">
+                            {q.highConfidence > 0 || q.mediumConfidence > 0 || q.lowConfidence > 0 ? (
+                              <div className="flex items-center justify-center gap-1">
+                                {q.highConfidence > 0 && (
+                                  <span className="text-xs px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400" title="High confidence">
+                                    {q.highConfidence}H
+                                  </span>
+                                )}
+                                {q.mediumConfidence > 0 && (
+                                  <span className="text-xs px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400" title="Medium confidence">
+                                    {q.mediumConfidence}M
+                                  </span>
+                                )}
+                                {q.lowConfidence > 0 && (
+                                  <span className="text-xs px-1.5 py-0.5 rounded-full bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400" title="Low confidence">
+                                    {q.lowConfidence}L
+                                  </span>
+                                )}
+                              </div>
+                            ) : (
+                              <span className="text-xs text-muted-foreground">—</span>
+                            )}
+                          </td>
                           <td className="py-2 text-center tabular-nums">{q.platformsCovered}</td>
                         </tr>
                       ))}

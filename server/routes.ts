@@ -10,7 +10,7 @@ import {
   insertCompetitorSchema, insertAlertSchema, insertLocationSchema,
 } from "@shared/schema";
 import { sql } from "drizzle-orm";
-import { runScan, testApiKey, generateScanQueries, detectCompetitors, PROVIDER_COST_PER_CALL, type BusinessContext } from "./ai-providers";
+import { runScan, testApiKey, generateScanQueries, detectCompetitors, setAnalysisKeys, PROVIDER_COST_PER_CALL, type BusinessContext } from "./ai-providers";
 import { requireAuth, requireAdmin, createSession, deleteSession, getSession } from "./auth";
 import bcrypt from "bcryptjs";
 import { validateSearchRecord, validateReferral, validateAiSnapshot } from "./data-validation";
@@ -106,6 +106,7 @@ async function autoScanBusiness(businessId: number) {
     let completed = 0;
     let mentionCount = 0;
     const keyInputs = activeKeys.map((k) => ({ provider: k.provider, apiKey: k.apiKey }));
+    setAnalysisKeys(keyInputs);
 
     for await (const result of runScan(biz.name, queries, keyInputs, extraTerms)) {
       completed++;
@@ -118,16 +119,20 @@ async function autoScanBusiness(businessId: number) {
         query: result.query,
         mentioned: result.mentioned ? 1 : 0,
         position: result.position,
+        sentiment: result.sentiment,
+        confidence: result.confidence,
         date: dateStr,
       });
 
-      // Track API cost
+      // Track API cost (original query + analysis follow-up)
       const providerKey = keyInputs.find(k => {
         const pMap: Record<string, string> = { openai: "ChatGPT", anthropic: "Claude", google: "Google Gemini", perplexity: "Perplexity" };
         return pMap[k.provider] === result.platform;
       });
       if (providerKey) {
-        const cost = PROVIDER_COST_PER_CALL[providerKey.provider] ?? 0.005;
+        const baseCost = PROVIDER_COST_PER_CALL[providerKey.provider] ?? 0.005;
+        const analysisCost = 0.001; // follow-up analysis call is cheap (~256 tokens)
+        const cost = baseCost + analysisCost;
         db.insert(apiUsage).values({
           provider: providerKey.provider,
           estimatedCost: cost.toFixed(6),
@@ -146,7 +151,7 @@ async function autoScanBusiness(businessId: number) {
           responseText: result.responseText,
           sentiment: result.sentiment,
           mentionedAccurate: result.mentioned ? 1 : 0,
-          flaggedIssues: null,
+          flaggedIssues: result.confidence === "low" ? "Low confidence analysis" : null,
           date: dateStr,
         });
       }
@@ -284,6 +289,10 @@ export async function registerRoutes(
     position INTEGER,
     date TEXT NOT NULL
   )`);
+
+  // Add sentiment + confidence columns (safe for existing DBs)
+  try { db.run(sql`ALTER TABLE search_records ADD COLUMN sentiment TEXT`); } catch (_e) { /* exists */ }
+  try { db.run(sql`ALTER TABLE search_records ADD COLUMN confidence TEXT`); } catch (_e) { /* exists */ }
 
   db.run(sql`CREATE TABLE IF NOT EXISTS optimized_prompts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1055,6 +1064,7 @@ export async function registerRoutes(
 
     try {
       const keyInputs = activeKeys.map((k) => ({ provider: k.provider, apiKey: k.apiKey }));
+      setAnalysisKeys(keyInputs);
       for await (const result of runScan(business.name, queries, keyInputs, extraTerms)) {
         completed++;
         const platformId = platformMap[result.platform] ?? 1;
@@ -1066,16 +1076,20 @@ export async function registerRoutes(
           query: result.query,
           mentioned: result.mentioned ? 1 : 0,
           position: result.position,
+          sentiment: result.sentiment,
+          confidence: result.confidence,
           date: dateStr,
         });
 
-        // Track API cost
+        // Track API cost (original query + analysis follow-up)
         const providerKey = keyInputs.find(k => {
           const pMap: Record<string, string> = { openai: "ChatGPT", anthropic: "Claude", google: "Google Gemini", perplexity: "Perplexity" };
           return pMap[k.provider] === result.platform;
         });
         if (providerKey) {
-          const cost = PROVIDER_COST_PER_CALL[providerKey.provider] ?? 0.005;
+          const baseCost = PROVIDER_COST_PER_CALL[providerKey.provider] ?? 0.005;
+          const analysisCost = 0.001;
+          const cost = baseCost + analysisCost;
           db.insert(apiUsage).values({
             provider: providerKey.provider,
             estimatedCost: cost.toFixed(6),
@@ -1094,7 +1108,7 @@ export async function registerRoutes(
             responseText: result.responseText,
             sentiment: result.sentiment,
             mentionedAccurate: result.mentioned ? 1 : 0,
-            flaggedIssues: null,
+            flaggedIssues: result.confidence === "low" ? "Low confidence analysis" : null,
             date: dateStr,
           });
         }
