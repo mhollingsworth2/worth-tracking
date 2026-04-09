@@ -392,17 +392,30 @@ async function autoScanBusiness(businessId: number) {
       return;
     }
 
-    // Auto-detect competitors if none are set
-    const existingCompetitors = (biz as any).competitors ?? (biz as any).known_competitors ?? "";
-    if (!existingCompetitors) {
+    // Auto-detect competitors if none exist in the competitors table
+    const existingComps = await storage.getCompetitors(businessId);
+    if (existingComps.length === 0) {
       try {
         const keyInputs = activeKeys.map((k) => ({ provider: k.provider, apiKey: k.apiKey }));
-        const detected = await detectCompetitors(biz.name, biz.industry, biz.location ?? null, keyInputs);
-        if (detected.length > 0) {
-          const csv = detected.join(", ");
+        // Check known_competitors field first
+        const knownCsv = (biz as any).known_competitors ?? "";
+        let compNames: string[] = [];
+        if (knownCsv) {
+          compNames = knownCsv.split(",").map((s: string) => s.trim()).filter((s: string) => s.length > 1);
+        }
+        if (compNames.length === 0) {
+          compNames = await detectCompetitors(biz.name, biz.industry, biz.location ?? null, keyInputs);
+        }
+        if (compNames.length > 0) {
+          const csv = compNames.join(", ");
           console.log(`[Auto-Scan] Detected competitors for "${biz.name}": ${csv}`);
           db.run(sql`UPDATE businesses SET known_competitors = ${csv} WHERE id = ${businessId}`);
-          // Re-fetch so the scan uses the new competitors
+          // Insert into competitors table so they appear in the tab and get scanned
+          for (const name of compNames) {
+            try {
+              await storage.createCompetitor({ businessId, name, industry: biz.industry });
+            } catch (_e) { /* duplicate or error, skip */ }
+          }
           biz = (await storage.getBusiness(businessId))!;
         }
       } catch (err: any) {
@@ -2313,7 +2326,35 @@ Extract real information from the content. If a field isn't clear from the websi
       .from(apiUsage).where(sql`date = ${today}`).get();
     const currentSpend = parseFloat(todayUsage?.total ?? "0");
 
-    const ctx = toBizContext(business);
+    // Auto-detect competitors if none exist
+    const existingComps = await storage.getCompetitors(businessId);
+    if (existingComps.length === 0) {
+      try {
+        const keyInputs = activeKeys.map((k) => ({ provider: k.provider, apiKey: k.apiKey }));
+        const knownCsv = (business as any).known_competitors ?? "";
+        let compNames: string[] = [];
+        if (knownCsv) {
+          compNames = knownCsv.split(",").map((s: string) => s.trim()).filter((s: string) => s.length > 1);
+        }
+        if (compNames.length === 0) {
+          compNames = await detectCompetitors(business.name, business.industry, business.location ?? null, keyInputs);
+        }
+        if (compNames.length > 0) {
+          const csv = compNames.join(", ");
+          db.run(sql`UPDATE businesses SET known_competitors = ${csv} WHERE id = ${businessId}`);
+          for (const name of compNames) {
+            try {
+              await storage.createCompetitor({ businessId, name, industry: business.industry });
+            } catch (_e) { /* duplicate */ }
+          }
+          console.log(`[Scan] Detected competitors for "${business.name}": ${csv}`);
+        }
+      } catch (err: any) {
+        console.error(`[Scan] Competitor detection failed:`, err.message);
+      }
+    }
+
+    const ctx = toBizContext(await storage.getBusiness(businessId) ?? business);
     const queries = generateScanQueries(ctx);
     const extraTerms = buildExtraTerms(business);
     const totalQueries = queries.length * activeKeys.length;
