@@ -11,10 +11,15 @@ export interface AIQueryResult {
 }
 
 // Retry wrapper for transient failures (rate limits & server errors)
+const API_TIMEOUT_MS = 30_000; // 30s per API call — prevents hanging forever
+
 async function fetchWithRetry(url: string, options: RequestInit, maxRetries = 2): Promise<Response> {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      const res = await fetch(url, options);
+      const res = await fetch(url, {
+        ...options,
+        signal: options.signal ?? AbortSignal.timeout(API_TIMEOUT_MS),
+      });
       // Retry on rate limit (429) or server errors (500+)
       if ((res.status === 429 || res.status >= 500) && attempt < maxRetries) {
         const delay = Math.pow(2, attempt) * 1000; // 1s, 2s, 4s
@@ -24,9 +29,9 @@ async function fetchWithRetry(url: string, options: RequestInit, maxRetries = 2)
       }
       return res;
     } catch (err: any) {
-      if (attempt < maxRetries && (err.name === 'TypeError' || err.message?.includes('fetch'))) {
+      if (attempt < maxRetries && (err.name === 'TypeError' || err.name === 'TimeoutError' || err.name === 'AbortError' || err.message?.includes('fetch'))) {
         const delay = Math.pow(2, attempt) * 1000;
-        console.warn(`[Retry] Network error on attempt ${attempt + 1}, waiting ${delay}ms...`);
+        console.warn(`[Retry] ${err.name || 'Network error'} on attempt ${attempt + 1}, waiting ${delay}ms...`);
         await new Promise(r => setTimeout(r, delay));
         continue;
       }

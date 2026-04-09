@@ -382,33 +382,36 @@ async function autoScanBusiness(businessId: number) {
       if (result.confidence === "low") issues.push("Low confidence analysis");
       if (result.crossValidated === false) issues.push("Outlier: disagrees with other platforms");
 
-      // Hallucination detection — only when business is mentioned
+      // Run hallucination + citation checks in parallel (not sequentially)
       let hallucinationCount = 0;
+      const checks: Promise<void>[] = [];
+
       if (result.mentioned && result.responseText) {
-        try {
-          const halCheck = await detectHallucinations(
+        checks.push(
+          detectHallucinations(
             { name: biz.name, location: biz.location ?? null, website: biz.website ?? null, services: (biz as any).services ?? null },
             result.responseText,
             result.platform
-          );
-          if (halCheck.hasHallucinations) {
-            hallucinationCount = halCheck.issues.length;
-            issues.push(...halCheck.issues.map(i => `Hallucination: ${i}`));
-          }
-        } catch (err: any) {
-          console.error(`[Auto-Scan] Hallucination check failed:`, err.message);
-        }
+          ).then(halCheck => {
+            if (halCheck.hasHallucinations) {
+              hallucinationCount = halCheck.issues.length;
+              issues.push(...halCheck.issues.map(i => `Hallucination: ${i}`));
+            }
+          }).catch(err => console.error(`[Auto-Scan] Hallucination check failed:`, err.message))
+        );
       }
 
-      // Citation verification for grounded sources
       if (result.sourceType === "grounded" && result.mentioned) {
-        try {
-          const citations = await verifyCitations(result.responseText, biz.name);
-          if (citations.failed > 0) {
-            issues.push(`Citation: ${citations.failed} of ${citations.verified + citations.failed} cited URLs are broken/invalid`);
-          }
-        } catch {}
+        checks.push(
+          verifyCitations(result.responseText, biz.name).then(citations => {
+            if (citations.failed > 0) {
+              issues.push(`Citation: ${citations.failed} of ${citations.verified + citations.failed} cited URLs are broken/invalid`);
+            }
+          }).catch(() => {})
+        );
       }
+
+      await Promise.all(checks);
 
       if (result.responseText) {
         await storage.createAiSnapshot({
@@ -2281,33 +2284,36 @@ Extract real information from the content. If a field isn't clear from the websi
         if (result.confidence === "low") issues.push("Low confidence analysis");
         if (result.crossValidated === false) issues.push("Outlier: disagrees with other platforms");
 
-        // Hallucination detection — only when business is mentioned
+        // Run hallucination + citation checks in parallel
         let hallucinationCount = 0;
+        const checks: Promise<void>[] = [];
+
         if (result.mentioned && result.responseText) {
-          try {
-            const halCheck = await detectHallucinations(
+          checks.push(
+            detectHallucinations(
               { name: business.name, location: business.location ?? null, website: business.website ?? null, services: (business as any).services ?? null },
               result.responseText,
               result.platform
-            );
-            if (halCheck.hasHallucinations) {
-              hallucinationCount = halCheck.issues.length;
-              issues.push(...halCheck.issues.map(i => `Hallucination: ${i}`));
-            }
-          } catch (err: any) {
-            console.error(`[Scan] Hallucination check failed:`, err.message);
-          }
+            ).then(halCheck => {
+              if (halCheck.hasHallucinations) {
+                hallucinationCount = halCheck.issues.length;
+                issues.push(...halCheck.issues.map(i => `Hallucination: ${i}`));
+              }
+            }).catch(err => console.error(`[Scan] Hallucination check failed:`, err.message))
+          );
         }
 
-        // Citation verification for grounded sources
         if (result.sourceType === "grounded" && result.mentioned) {
-          try {
-            const citations = await verifyCitations(result.responseText, business.name);
-            if (citations.failed > 0) {
-              issues.push(`Citation: ${citations.failed} of ${citations.verified + citations.failed} cited URLs are broken/invalid`);
-            }
-          } catch {}
+          checks.push(
+            verifyCitations(result.responseText, business.name).then(citations => {
+              if (citations.failed > 0) {
+                issues.push(`Citation: ${citations.failed} of ${citations.verified + citations.failed} cited URLs are broken/invalid`);
+              }
+            }).catch(() => {})
+          );
         }
+
+        await Promise.all(checks);
 
         if (result.responseText) {
           await storage.createAiSnapshot({
