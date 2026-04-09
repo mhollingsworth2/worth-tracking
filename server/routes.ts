@@ -121,6 +121,8 @@ async function autoScanBusiness(businessId: number) {
         position: result.position,
         sentiment: result.sentiment,
         confidence: result.confidence,
+        sourceType: result.sourceType,
+        crossValidated: result.crossValidated === null ? null : result.crossValidated ? 1 : 0,
         date: dateStr,
       });
 
@@ -143,6 +145,11 @@ async function autoScanBusiness(businessId: number) {
 
       if (result.mentioned) mentionCount++;
 
+      // Flag issues for outliers or low confidence
+      const issues: string[] = [];
+      if (result.confidence === "low") issues.push("Low confidence analysis");
+      if (result.crossValidated === false) issues.push("Outlier: disagrees with other platforms");
+
       if (result.responseText) {
         await storage.createAiSnapshot({
           businessId,
@@ -151,7 +158,7 @@ async function autoScanBusiness(businessId: number) {
           responseText: result.responseText,
           sentiment: result.sentiment,
           mentionedAccurate: result.mentioned ? 1 : 0,
-          flaggedIssues: result.confidence === "low" ? "Low confidence analysis" : null,
+          flaggedIssues: issues.length > 0 ? issues.join("; ") : null,
           date: dateStr,
         });
       }
@@ -293,6 +300,8 @@ export async function registerRoutes(
   // Add sentiment + confidence columns (safe for existing DBs)
   try { db.run(sql`ALTER TABLE search_records ADD COLUMN sentiment TEXT`); } catch (_e) { /* exists */ }
   try { db.run(sql`ALTER TABLE search_records ADD COLUMN confidence TEXT`); } catch (_e) { /* exists */ }
+  try { db.run(sql`ALTER TABLE search_records ADD COLUMN source_type TEXT`); } catch (_e) { /* exists */ }
+  try { db.run(sql`ALTER TABLE search_records ADD COLUMN cross_validated INTEGER`); } catch (_e) { /* exists */ }
 
   db.run(sql`CREATE TABLE IF NOT EXISTS optimized_prompts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1078,6 +1087,8 @@ export async function registerRoutes(
           position: result.position,
           sentiment: result.sentiment,
           confidence: result.confidence,
+          sourceType: result.sourceType,
+          crossValidated: result.crossValidated === null ? null : result.crossValidated ? 1 : 0,
           date: dateStr,
         });
 
@@ -1100,6 +1111,10 @@ export async function registerRoutes(
 
         if (result.mentioned) mentionCount++;
 
+        const issues: string[] = [];
+        if (result.confidence === "low") issues.push("Low confidence analysis");
+        if (result.crossValidated === false) issues.push("Outlier: disagrees with other platforms");
+
         if (result.responseText) {
           await storage.createAiSnapshot({
             businessId,
@@ -1108,7 +1123,7 @@ export async function registerRoutes(
             responseText: result.responseText,
             sentiment: result.sentiment,
             mentionedAccurate: result.mentioned ? 1 : 0,
-            flaggedIssues: result.confidence === "low" ? "Low confidence analysis" : null,
+            flaggedIssues: issues.length > 0 ? issues.join("; ") : null,
             date: dateStr,
           });
         }

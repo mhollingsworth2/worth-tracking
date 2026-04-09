@@ -46,6 +46,8 @@ export const searchRecords = sqliteTable("search_records", {
   position: integer("position"),
   sentiment: text("sentiment"),         // "positive" | "neutral" | "negative"
   confidence: text("confidence"),       // "high" | "medium" | "low"
+  sourceType: text("source_type"),      // "grounded" (web search) | "knowledge" (training data only)
+  crossValidated: integer("cross_validated"), // 1 = agreed with majority, 0 = outlier, null = not validated
   date: text("date").notNull(),
 });
 

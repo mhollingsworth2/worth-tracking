@@ -6,6 +6,8 @@ export interface AIQueryResult {
   sentiment: "positive" | "neutral" | "negative";
   confidence: "high" | "medium" | "low";
   position: number | null;
+  sourceType: "grounded" | "knowledge";
+  crossValidated: boolean | null; // null = not yet validated (single-platform)
 }
 
 // System instruction sent with every query to reduce hallucination.
@@ -199,7 +201,7 @@ async function queryOpenAI(apiKey: string, query: string, businessName: string, 
   const responseText = data.choices?.[0]?.message?.content ?? "";
   const analysis = await analyzeWithAI(businessName, query, responseText);
 
-  return { platform: "ChatGPT", query, responseText, ...analysis };
+  return { platform: "ChatGPT", query, responseText, ...analysis, sourceType: "knowledge" as const, crossValidated: null };
 }
 
 async function queryAnthropic(apiKey: string, query: string, businessName: string, extraTerms?: string[]): Promise<AIQueryResult> {
@@ -229,7 +231,7 @@ async function queryAnthropic(apiKey: string, query: string, businessName: strin
     : "";
   const analysis = await analyzeWithAI(businessName, query, responseText);
 
-  return { platform: "Claude", query, responseText, ...analysis };
+  return { platform: "Claude", query, responseText, ...analysis, sourceType: "knowledge" as const, crossValidated: null };
 }
 
 async function queryGemini(apiKey: string, query: string, businessName: string, extraTerms?: string[]): Promise<AIQueryResult> {
@@ -251,7 +253,8 @@ async function queryGemini(apiKey: string, query: string, businessName: string, 
   const responseText = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
   const analysis = await analyzeWithAI(businessName, query, responseText);
 
-  return { platform: "Google Gemini", query, responseText, ...analysis };
+  // Gemini has access to web search / grounding by default
+  return { platform: "Google Gemini", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null };
 }
 
 async function queryPerplexity(apiKey: string, query: string, businessName: string, extraTerms?: string[]): Promise<AIQueryResult> {
@@ -280,7 +283,8 @@ async function queryPerplexity(apiKey: string, query: string, businessName: stri
   const responseText = data.choices?.[0]?.message?.content ?? "";
   const analysis = await analyzeWithAI(businessName, query, responseText);
 
-  return { platform: "Perplexity", query, responseText, ...analysis };
+  // Perplexity always searches the web in real-time
+  return { platform: "Perplexity", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null };
 }
 
 const PROVIDER_FN: Record<string, (apiKey: string, query: string, businessName: string, extraTerms?: string[]) => Promise<AIQueryResult>> = {
@@ -306,6 +310,45 @@ export const PROVIDER_COST_PER_CALL: Record<string, number> = {
   perplexity: 0.005,  // sonar: ~$1/1M input + $1/1M output
 };
 
+// ── Cross-Platform Validation ──────────────────────────────────────────────
+// After collecting results for a single query across all platforms, compare
+// them. If the majority agree on mention/no-mention, results that align get
+// crossValidated = true (boosted confidence). Outliers get crossValidated = false
+// and their confidence is downgraded.
+function crossValidateResults(results: AIQueryResult[]): AIQueryResult[] {
+  if (results.length < 2) return results; // can't validate with <2 platforms
+
+  const mentionCount = results.filter(r => r.mentioned).length;
+  const noMentionCount = results.length - mentionCount;
+  const majorityMentioned = mentionCount > noMentionCount;
+
+  // Strong consensus = supermajority (>= 75% agree)
+  const majoritySize = Math.max(mentionCount, noMentionCount);
+  const consensusStrength = majoritySize / results.length;
+  const strongConsensus = consensusStrength >= 0.75;
+
+  return results.map(r => {
+    const agreesWithMajority = r.mentioned === majorityMentioned;
+
+    let adjustedConfidence = r.confidence;
+    if (strongConsensus && agreesWithMajority) {
+      // Strong consensus + agrees → boost confidence
+      if (r.confidence === "low") adjustedConfidence = "medium";
+      else if (r.confidence === "medium") adjustedConfidence = "high";
+    } else if (strongConsensus && !agreesWithMajority) {
+      // Strong consensus + disagrees → downgrade confidence
+      if (r.confidence === "high") adjustedConfidence = "medium";
+      else if (r.confidence === "medium") adjustedConfidence = "low";
+    }
+
+    return {
+      ...r,
+      crossValidated: agreesWithMajority,
+      confidence: adjustedConfidence,
+    };
+  });
+}
+
 export async function* runScan(
   businessName: string,
   queries: string[],
@@ -313,15 +356,24 @@ export async function* runScan(
   extraTerms?: string[]
 ): AsyncGenerator<AIQueryResult> {
   for (const query of queries) {
+    // Collect all platform results for this query before yielding
+    const batchResults: AIQueryResult[] = [];
+
     for (const key of keys) {
       const fn = PROVIDER_FN[key.provider];
       if (!fn) continue;
       try {
         const result = await fn(key.apiKey, query, businessName, extraTerms);
-        yield result;
+        batchResults.push(result);
       } catch (err: any) {
         console.error(`[AI Scan] ${key.provider} failed for query "${query}":`, err.message);
       }
+    }
+
+    // Cross-validate the batch, then yield each validated result
+    const validated = crossValidateResults(batchResults);
+    for (const result of validated) {
+      yield result;
     }
   }
 }

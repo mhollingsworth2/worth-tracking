@@ -338,6 +338,10 @@ export class DatabaseStorage implements IStorage {
       lowConfidence: sql<number>`sum(case when ${searchRecords.confidence} = 'low' then 1 else 0 end)`,
       positiveSentiment: sql<number>`sum(case when ${searchRecords.sentiment} = 'positive' then 1 else 0 end)`,
       negativeSentiment: sql<number>`sum(case when ${searchRecords.sentiment} = 'negative' then 1 else 0 end)`,
+      groundedRuns: sql<number>`sum(case when ${searchRecords.sourceType} = 'grounded' then 1 else 0 end)`,
+      knowledgeRuns: sql<number>`sum(case when ${searchRecords.sourceType} = 'knowledge' then 1 else 0 end)`,
+      crossValidated: sql<number>`sum(case when ${searchRecords.crossValidated} = 1 then 1 else 0 end)`,
+      outliers: sql<number>`sum(case when ${searchRecords.crossValidated} = 0 then 1 else 0 end)`,
     })
       .from(searchRecords)
       .where(eq(searchRecords.businessId, businessId))
@@ -356,10 +360,16 @@ export class DatabaseStorage implements IStorage {
       lowConfidence: r.lowConfidence ?? 0,
       positiveSentiment: r.positiveSentiment ?? 0,
       negativeSentiment: r.negativeSentiment ?? 0,
+      groundedRuns: r.groundedRuns ?? 0,
+      knowledgeRuns: r.knowledgeRuns ?? 0,
+      crossValidated: r.crossValidated ?? 0,
+      outliers: r.outliers ?? 0,
     })).sort((a: any, b: any) => b.mentions - a.mentions || b.mentionRate - a.mentionRate);
   }
 
   // === VISIBILITY SCORES (per-platform 0-100) ===
+  // Grounded results (web search) are weighted higher than knowledge-only results
+  // because they reflect real-time web presence, not just training data.
   async getVisibilityScores(businessId: number): Promise<any[]> {
     const rows = db.select({
       platformId: searchRecords.platformId,
@@ -368,6 +378,11 @@ export class DatabaseStorage implements IStorage {
       total: sql<number>`count(*)`,
       mentions: sql<number>`sum(case when ${searchRecords.mentioned} = 1 then 1 else 0 end)`,
       avgPosition: sql<number>`avg(case when ${searchRecords.mentioned} = 1 then ${searchRecords.position} end)`,
+      groundedTotal: sql<number>`sum(case when ${searchRecords.sourceType} = 'grounded' then 1 else 0 end)`,
+      groundedMentions: sql<number>`sum(case when ${searchRecords.sourceType} = 'grounded' and ${searchRecords.mentioned} = 1 then 1 else 0 end)`,
+      validatedMentions: sql<number>`sum(case when ${searchRecords.crossValidated} = 1 and ${searchRecords.mentioned} = 1 then 1 else 0 end)`,
+      outlierMentions: sql<number>`sum(case when ${searchRecords.crossValidated} = 0 and ${searchRecords.mentioned} = 1 then 1 else 0 end)`,
+      highConfMentions: sql<number>`sum(case when ${searchRecords.confidence} = 'high' and ${searchRecords.mentioned} = 1 then 1 else 0 end)`,
     })
       .from(searchRecords)
       .innerJoin(platforms, eq(searchRecords.platformId, platforms.id))
@@ -379,7 +394,28 @@ export class DatabaseStorage implements IStorage {
       const mentionRate = r.total > 0 ? (r.mentions / r.total) * 100 : 0;
       // Position bonus: pos 1 = 100, pos 6+ = 0 (linear falloff, each position costs 20 pts)
       const posBonus = r.avgPosition ? Math.max(0, 100 - (r.avgPosition - 1) * 20) : 0;
-      const score = Math.round(mentionRate * 0.7 + posBonus * 0.3);
+
+      // Source type bonus: grounded platforms with mentions get a reliability boost
+      const isGrounded = (r.groundedTotal ?? 0) > 0;
+      const groundedRate = r.groundedTotal > 0 ? (r.groundedMentions / r.groundedTotal) * 100 : 0;
+
+      // Validation bonus: cross-validated mentions count more, outliers are penalized
+      const validatedRatio = r.mentions > 0 ? ((r.validatedMentions ?? 0) / r.mentions) : 0;
+      const outlierRatio = r.mentions > 0 ? ((r.outlierMentions ?? 0) / r.mentions) : 0;
+
+      // Composite score:
+      //   50% mention rate, 20% position bonus, 15% validation bonus, 15% source reliability
+      const validationBonus = validatedRatio * 100 - outlierRatio * 50; // -50 to +100
+      const sourceBonus = isGrounded ? groundedRate * 0.5 : 0; // 0-50
+      const score = Math.round(
+        Math.min(100, Math.max(0,
+          mentionRate * 0.50 +
+          posBonus * 0.20 +
+          Math.max(0, validationBonus) * 0.15 +
+          sourceBonus * 0.15
+        ))
+      );
+
       return {
         platformId: r.platformId,
         platformName: r.platformName,
@@ -389,6 +425,11 @@ export class DatabaseStorage implements IStorage {
         mentionRate: Math.round(mentionRate),
         avgPosition: r.avgPosition ? Math.round(r.avgPosition * 10) / 10 : null,
         score,
+        isGrounded,
+        groundedMentions: r.groundedMentions ?? 0,
+        validatedMentions: r.validatedMentions ?? 0,
+        outlierMentions: r.outlierMentions ?? 0,
+        highConfMentions: r.highConfMentions ?? 0,
       };
     }).sort((a: any, b: any) => b.score - a.score);
   }

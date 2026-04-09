@@ -544,7 +544,7 @@ export default function BusinessDetail() {
                 <CardHeader className="pb-2">
                   <CardTitle className="text-sm font-medium">
                     Platform Visibility Scores
-                    <InfoTip text="A 0-100 composite score per platform (70% mention rate + 30% position bonus). Higher = more visible on that AI engine." />
+                    <InfoTip text="Composite score: 50% mention rate + 20% position + 15% cross-validation + 15% source reliability. Grounded (web search) platforms are weighted higher than knowledge-only." />
                   </CardTitle>
                 </CardHeader>
                 <CardContent>
@@ -558,7 +558,14 @@ export default function BusinessDetail() {
                           </div>
                           <div className="flex-1 min-w-0">
                             <div className="flex items-center justify-between mb-1">
-                              <span className="text-sm font-medium">{v.platformName}</span>
+                              <div className="flex items-center gap-1.5">
+                                <span className="text-sm font-medium">{v.platformName}</span>
+                                {v.isGrounded ? (
+                                  <span className="text-[9px] px-1 py-0.5 rounded bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400 font-medium">LIVE WEB</span>
+                                ) : (
+                                  <span className="text-[9px] px-1 py-0.5 rounded bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400 font-medium">KNOWLEDGE</span>
+                                )}
+                              </div>
                               <span className="text-lg font-bold tabular-nums" style={{ color: v.color }}>{v.score}</span>
                             </div>
                             <div className="h-2 rounded-full bg-muted overflow-hidden">
@@ -567,6 +574,17 @@ export default function BusinessDetail() {
                             <div className="flex items-center justify-between mt-1 text-[10px] text-muted-foreground">
                               <span>{v.mentionRate}% mention rate</span>
                               <span>{v.avgPosition ? `Pos ${v.avgPosition}` : "—"}</span>
+                            </div>
+                            <div className="flex items-center gap-2 mt-0.5 text-[10px] text-muted-foreground">
+                              {v.validatedMentions > 0 && (
+                                <span className="text-emerald-600 dark:text-emerald-400">{v.validatedMentions} verified</span>
+                              )}
+                              {v.outlierMentions > 0 && (
+                                <span className="text-amber-600 dark:text-amber-400">{v.outlierMentions} outlier</span>
+                              )}
+                              {v.highConfMentions > 0 && (
+                                <span>{v.highConfMentions} high-conf</span>
+                              )}
                             </div>
                           </div>
                         </div>
@@ -597,6 +615,7 @@ export default function BusinessDetail() {
                         <th className="pb-2 pr-4 font-medium text-center">Avg Pos</th>
                         <th className="pb-2 pr-4 font-medium text-center">Sentiment</th>
                         <th className="pb-2 pr-4 font-medium text-center">Confidence</th>
+                        <th className="pb-2 pr-4 font-medium text-center">Validation</th>
                         <th className="pb-2 font-medium text-center">Platforms</th>
                       </tr>
                     </thead>
@@ -657,7 +676,33 @@ export default function BusinessDetail() {
                               <span className="text-xs text-muted-foreground">—</span>
                             )}
                           </td>
-                          <td className="py-2 text-center tabular-nums">{q.platformsCovered}</td>
+                          <td className="py-2 pr-4 text-center">
+                            <div className="flex items-center justify-center gap-1">
+                              {q.crossValidated > 0 && (
+                                <span className="text-xs px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400" title="Cross-validated (platforms agree)">
+                                  {q.crossValidated}<CheckCircle className="w-3 h-3 inline ml-0.5" />
+                                </span>
+                              )}
+                              {q.outliers > 0 && (
+                                <span className="text-xs px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400" title="Outlier (disagrees with majority)">
+                                  {q.outliers}<AlertTriangle className="w-3 h-3 inline ml-0.5" />
+                                </span>
+                              )}
+                              {q.crossValidated === 0 && q.outliers === 0 && (
+                                <span className="text-xs text-muted-foreground">—</span>
+                              )}
+                            </div>
+                          </td>
+                          <td className="py-2 text-center">
+                            <div className="flex items-center justify-center gap-1">
+                              <span className="tabular-nums">{q.platformsCovered}</span>
+                              {q.groundedRuns > 0 && (
+                                <span className="text-[9px] px-1 py-0.5 rounded bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400" title={`${q.groundedRuns} grounded, ${q.knowledgeRuns} knowledge-only`}>
+                                  {q.groundedRuns}G
+                                </span>
+                              )}
+                            </div>
+                          </td>
                         </tr>
                       ))}
                     </tbody>
