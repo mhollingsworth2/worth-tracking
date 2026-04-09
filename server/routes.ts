@@ -120,6 +120,81 @@ async function autoScanBusiness(businessId: number, businessName: string, indust
   }
 }
 
+// ── Nightly scan scheduler ──────────────────────────────────────────────────
+// Runs all business scans once per night at 2 AM, plus on-login trigger.
+let nightlyScanRunning = false;
+let lastNightlyScanDate = ""; // tracks which date we already ran for
+
+async function runAllBusinessScans(trigger: string) {
+  if (nightlyScanRunning) {
+    console.log(`[Scheduler] Scan already running — skipping ${trigger} trigger`);
+    return;
+  }
+  nightlyScanRunning = true;
+
+  try {
+    const keys = await storage.getApiKeys();
+    const activeKeys = keys.filter((k) => k.isActive);
+    if (activeKeys.length === 0) {
+      console.log(`[Scheduler] No API keys configured — skipping ${trigger} scan`);
+      return;
+    }
+
+    // Check daily budget
+    const settings = db.select().from(apiSettings).get() as any;
+    const dailyBudget = parseFloat(settings?.dailyBudget ?? settings?.daily_budget ?? "10.00");
+    const today = new Date().toISOString().split("T")[0];
+    const todayUsage = db.select({ total: sql<string>`coalesce(sum(cast(estimated_cost as real)), 0)` })
+      .from(apiUsage).where(sql`date = ${today}`).get();
+    const currentSpend = parseFloat(todayUsage?.total ?? "0");
+
+    if (settings?.autoPauseEnabled && currentSpend >= dailyBudget) {
+      console.log(`[Scheduler] Daily budget reached ($${currentSpend.toFixed(2)} / $${dailyBudget.toFixed(2)}) — skipping`);
+      return;
+    }
+
+    const allBiz = await storage.getBusinesses();
+    console.log(`[Scheduler] ${trigger}: scanning ${allBiz.length} businesses`);
+
+    for (const biz of allBiz) {
+      // Re-check budget before each business
+      const latestUsage = db.select({ total: sql<string>`coalesce(sum(cast(estimated_cost as real)), 0)` })
+        .from(apiUsage).where(sql`date = ${today}`).get();
+      const latestSpend = parseFloat(latestUsage?.total ?? "0");
+      if (settings?.autoPauseEnabled && latestSpend >= dailyBudget) {
+        console.log(`[Scheduler] Budget hit mid-cycle — stopping`);
+        break;
+      }
+
+      console.log(`[Scheduler] Scanning "${biz.name}"...`);
+      await autoScanBusiness(biz.id, biz.name, biz.industry, biz.location ?? null);
+    }
+
+    lastNightlyScanDate = today;
+    console.log(`[Scheduler] ${trigger}: all scans complete`);
+  } catch (err: any) {
+    console.error(`[Scheduler] Error during ${trigger} scan:`, err.message);
+  } finally {
+    nightlyScanRunning = false;
+  }
+}
+
+// Check every 30 minutes if it's past 2 AM and we haven't scanned today yet
+function startNightlyScheduler() {
+  setInterval(() => {
+    const now = new Date();
+    const hour = now.getHours();
+    const today = now.toISOString().split("T")[0];
+
+    // Run at 2 AM if we haven't run today
+    if (hour >= 2 && lastNightlyScanDate !== today) {
+      runAllBusinessScans("nightly-2am");
+    }
+  }, 30 * 60 * 1000); // check every 30 min
+
+  console.log("[Scheduler] Nightly 2 AM scan scheduler started");
+}
+
 export async function registerRoutes(
   httpServer: Server,
   app: Express
@@ -366,6 +441,12 @@ export async function registerRoutes(
     res.cookie("session", token, { httpOnly: true, sameSite: "lax", maxAge: 24 * 60 * 60 * 1000 });
     const { passwordHash, ...safeUser } = user;
     res.json({ token, user: safeUser });
+
+    // Trigger a background scan on login if we haven't scanned today
+    const today = new Date().toISOString().split("T")[0];
+    if (lastNightlyScanDate !== today) {
+      runAllBusinessScans("login");
+    }
   });
 
   app.post("/api/auth/logout", (req, res) => {
@@ -509,6 +590,7 @@ export async function registerRoutes(
     if (!business) return res.status(404).json({ error: "Business not found" });
     res.json(business);
   });
+
 
   app.delete("/api/businesses/:id", async (req, res) => {
     const id = parseInt(req.params.id);
@@ -1156,6 +1238,9 @@ export async function registerRoutes(
     const result = runArchival();
     res.json({ success: true, ...result });
   });
+
+  // Start nightly 2 AM scan scheduler
+  startNightlyScheduler();
 
   console.log("[init] registerRoutes() completed successfully — all routes registered");
   return httpServer;
