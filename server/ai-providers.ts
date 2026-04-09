@@ -836,12 +836,19 @@ export function generateScanQueries(ctx: BusinessContext): string[] {
   }
 
   // ── Review / reputation queries (intent: validate trust) ─────────────────
-  const review: string[] = [
-    `${name} reviews and reputation`,
-    `Is ${name} worth it?`,
-    `What do customers say about ${name}?`,
-    `Problems or complaints about ${name}`,
-  ];
+  const review: string[] = loc
+    ? [
+        `${name} in ${loc} reviews and reputation`,
+        `Is ${name} in ${loc} worth it?`,
+        `What do customers say about ${name} in ${loc}?`,
+        `Problems or complaints about ${name} ${loc}`,
+      ]
+    : [
+        `${name} reviews and reputation`,
+        `Is ${name} worth it?`,
+        `What do customers say about ${name}?`,
+        `Problems or complaints about ${name}`,
+      ];
 
   // ── Local queries (intent: find nearby) ──────────────────────────────────
   const local: string[] = loc
@@ -873,7 +880,7 @@ export function generateScanQueries(ctx: BusinessContext): string[] {
   const seasonal: string[] = loc
     ? [
         `best ${ind} businesses in ${loc} in ${currentYear}`,
-        `${name} — is it still a good choice in ${currentYear}?`,
+        `${name} in ${loc} — is it still a good choice in ${currentYear}?`,
       ]
     : [
         `best ${ind} businesses in ${currentYear}`,
