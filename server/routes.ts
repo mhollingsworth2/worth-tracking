@@ -1013,6 +1013,178 @@ export async function registerRoutes(
     res.json(result);
   });
 
+  // === COMPETITIVE PROMPT INTELLIGENCE ===
+  // Compares query-level performance: your business vs each competitor
+  app.get("/api/businesses/:id/competitor-prompts", async (req, res) => {
+    const businessId = parseInt(req.params.id);
+    const business = await storage.getBusiness(businessId);
+    if (!business) return res.status(404).json({ error: "Business not found" });
+
+    const comps = await storage.getCompetitors(businessId);
+    if (comps.length === 0) return res.json({ queries: [], recommendations: [] });
+
+    const allPlatforms = await storage.getPlatforms();
+    const platformMap = Object.fromEntries(allPlatforms.map((p) => [p.id, p.name]));
+
+    // Get YOUR search records (no competitor)
+    const myRecords = db.select({
+      query: searchRecords.query,
+      mentioned: searchRecords.mentioned,
+      position: searchRecords.position,
+      sentiment: searchRecords.sentiment,
+      confidence: searchRecords.confidence,
+      platformId: searchRecords.platformId,
+    })
+      .from(searchRecords)
+      .where(sql`business_id = ${businessId} AND competitor_id IS NULL`)
+      .all();
+
+    // Get COMPETITOR search records
+    const compRecords = db.select({
+      query: searchRecords.query,
+      mentioned: searchRecords.mentioned,
+      position: searchRecords.position,
+      competitorId: sql<number>`competitor_id`,
+      platformId: searchRecords.platformId,
+    })
+      .from(searchRecords)
+      .where(sql`business_id = ${businessId} AND competitor_id IS NOT NULL`)
+      .all();
+
+    const compNameMap = Object.fromEntries(comps.map((c) => [c.id, c.name]));
+
+    // Build per-query comparison
+    type QueryStats = {
+      query: string;
+      myMentionRate: number;
+      myMentions: number;
+      myTotal: number;
+      myAvgPosition: number | null;
+      mySentiment: string | null;
+      competitors: {
+        name: string;
+        mentionRate: number;
+        mentions: number;
+        total: number;
+        avgPosition: number | null;
+      }[];
+      gap: number; // best competitor rate - my rate (positive = they're winning)
+      status: "winning" | "losing" | "tied" | "no_data";
+    };
+
+    const queryMap = new Map<string, {
+      myMentions: number; myTotal: number; myPosSum: number; myPosCount: number; mySentiments: string[];
+      comps: Map<number, { mentions: number; total: number; posSum: number; posCount: number }>;
+    }>();
+
+    // Aggregate own records
+    for (const r of myRecords) {
+      if (!queryMap.has(r.query)) {
+        queryMap.set(r.query, { myMentions: 0, myTotal: 0, myPosSum: 0, myPosCount: 0, mySentiments: [], comps: new Map() });
+      }
+      const q = queryMap.get(r.query)!;
+      q.myTotal++;
+      if (r.mentioned) {
+        q.myMentions++;
+        if (r.position) { q.myPosSum += r.position; q.myPosCount++; }
+      }
+      if (r.sentiment) q.mySentiments.push(r.sentiment);
+    }
+
+    // Aggregate competitor records
+    for (const r of compRecords) {
+      if (!queryMap.has(r.query)) {
+        queryMap.set(r.query, { myMentions: 0, myTotal: 0, myPosSum: 0, myPosCount: 0, mySentiments: [], comps: new Map() });
+      }
+      const q = queryMap.get(r.query)!;
+      if (!q.comps.has(r.competitorId)) {
+        q.comps.set(r.competitorId, { mentions: 0, total: 0, posSum: 0, posCount: 0 });
+      }
+      const c = q.comps.get(r.competitorId)!;
+      c.total++;
+      if (r.mentioned) {
+        c.mentions++;
+        if (r.position) { c.posSum += r.position; c.posCount++; }
+      }
+    }
+
+    // Build final query comparison list
+    const queries: QueryStats[] = [];
+    for (const [query, data] of queryMap) {
+      const myRate = data.myTotal > 0 ? Math.round((data.myMentions / data.myTotal) * 100) : 0;
+      const myPos = data.myPosCount > 0 ? Math.round((data.myPosSum / data.myPosCount) * 10) / 10 : null;
+      const topSentiment = data.mySentiments.length > 0
+        ? (data.mySentiments.filter(s => s === "positive").length >= data.mySentiments.length / 2 ? "positive"
+          : data.mySentiments.filter(s => s === "negative").length >= data.mySentiments.length / 2 ? "negative" : "neutral")
+        : null;
+
+      const compStats = Array.from(data.comps.entries()).map(([cId, c]) => ({
+        name: compNameMap[cId] || `Competitor #${cId}`,
+        mentionRate: c.total > 0 ? Math.round((c.mentions / c.total) * 100) : 0,
+        mentions: c.mentions,
+        total: c.total,
+        avgPosition: c.posCount > 0 ? Math.round((c.posSum / c.posCount) * 10) / 10 : null,
+      }));
+
+      const bestCompRate = compStats.length > 0 ? Math.max(...compStats.map(c => c.mentionRate)) : 0;
+      const gap = bestCompRate - myRate;
+      const status = data.myTotal === 0 && compStats.every(c => c.total === 0) ? "no_data"
+        : gap > 10 ? "losing" : gap < -10 ? "winning" : "tied";
+
+      queries.push({
+        query,
+        myMentionRate: myRate,
+        myMentions: data.myMentions,
+        myTotal: data.myTotal,
+        myAvgPosition: myPos,
+        mySentiment: topSentiment,
+        competitors: compStats,
+        gap,
+        status,
+      });
+    }
+
+    // Sort by gap descending (biggest competitor advantage first)
+    queries.sort((a, b) => b.gap - a.gap);
+
+    // Generate recommendations for queries where competitors are winning
+    const recommendations: { query: string; competitors: string[]; tip: string; priority: "high" | "medium" | "low" }[] = [];
+
+    for (const q of queries) {
+      if (q.status !== "losing") continue;
+      const winningComps = q.competitors.filter(c => c.mentionRate > q.myMentionRate).map(c => c.name);
+      let tip = "";
+      let priority: "high" | "medium" | "low" = "medium";
+
+      if (q.myMentionRate === 0) {
+        tip = `You're not mentioned at all for "${q.query}" but ${winningComps.join(", ")} ${winningComps.length === 1 ? "is" : "are"}. Add this topic to your website content, FAQ page, or blog to increase visibility.`;
+        priority = "high";
+      } else if (q.gap > 50) {
+        tip = `${winningComps.join(", ")} ${winningComps.length === 1 ? "dominates" : "dominate"} this query with ${q.gap}% higher mention rate. Create dedicated content targeting "${q.query}" — consider a landing page, detailed blog post, or structured FAQ.`;
+        priority = "high";
+      } else if (q.gap > 25) {
+        tip = `Competitors are ahead by ${q.gap}%. Strengthen your content around "${q.query}" with more specific details, case studies, or customer testimonials.`;
+        priority = "medium";
+      } else {
+        tip = `Close gap (${q.gap}%). Fine-tune your existing content for "${q.query}" — ensure your business name, services, and differentiators are clearly stated.`;
+        priority = "low";
+      }
+
+      recommendations.push({ query: q.query, competitors: winningComps, tip, priority });
+    }
+
+    res.json({
+      queries: queries.slice(0, 50), // limit response size
+      recommendations: recommendations.slice(0, 20),
+      summary: {
+        totalQueries: queries.length,
+        winning: queries.filter(q => q.status === "winning").length,
+        losing: queries.filter(q => q.status === "losing").length,
+        tied: queries.filter(q => q.status === "tied").length,
+      },
+    });
+  });
+
   app.post("/api/businesses/:id/competitors", async (req, res) => {
     const businessId = parseInt(req.params.id);
     const parsed = insertCompetitorSchema.safeParse({ ...req.body, businessId });

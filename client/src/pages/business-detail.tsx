@@ -1287,6 +1287,183 @@ function CompetitorsSection({ businessId, competitors, stats }: { businessId: nu
           </CardContent>
         </Card>
       )}
+
+      {competitors.length > 0 && <CompetitorPromptIntel businessId={businessId} />}
+    </>
+  );
+}
+
+/* ============ COMPETITIVE PROMPT INTELLIGENCE ============ */
+function CompetitorPromptIntel({ businessId }: { businessId: number }) {
+  const [filter, setFilter] = useState<"all" | "losing" | "winning" | "tied">("all");
+
+  const { data, isLoading } = useQuery<{
+    queries: {
+      query: string;
+      myMentionRate: number;
+      myMentions: number;
+      myTotal: number;
+      myAvgPosition: number | null;
+      mySentiment: string | null;
+      competitors: { name: string; mentionRate: number; mentions: number; total: number; avgPosition: number | null }[];
+      gap: number;
+      status: "winning" | "losing" | "tied" | "no_data";
+    }[];
+    recommendations: { query: string; competitors: string[]; tip: string; priority: "high" | "medium" | "low" }[];
+    summary: { totalQueries: number; winning: number; losing: number; tied: number };
+  }>({
+    queryKey: ["/api/businesses", businessId, "competitor-prompts"],
+    queryFn: async () => { const res = await fetch(`/api/businesses/${businessId}/competitor-prompts`); return res.json(); },
+  });
+
+  if (isLoading) return <Card><CardContent className="p-6"><Skeleton className="h-40 w-full" /></CardContent></Card>;
+  if (!data || data.queries.length === 0) return null;
+
+  const filtered = filter === "all" ? data.queries.filter(q => q.status !== "no_data") : data.queries.filter(q => q.status === filter);
+
+  return (
+    <>
+      {/* Recommendations Card */}
+      {data.recommendations.length > 0 && (
+        <Card className="border-amber-200 dark:border-amber-800">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium flex items-center gap-2">
+              <Lightbulb className="w-4 h-4 text-amber-500" />
+              Ranking Improvement Tips
+              <InfoTip text="AI-generated recommendations based on queries where your competitors outrank you. Implement these to close visibility gaps." />
+            </CardTitle>
+            <CardDescription className="text-xs">Actionable steps to outrank competitors on key queries</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-3">
+              {data.recommendations.map((rec, i) => (
+                <div key={i} className="border rounded-lg p-3 space-y-1.5">
+                  <div className="flex items-start justify-between gap-2">
+                    <code className="text-xs bg-muted px-2 py-0.5 rounded font-mono flex-1">{rec.query}</code>
+                    <Badge variant={rec.priority === "high" ? "destructive" : rec.priority === "medium" ? "default" : "secondary"} className="text-[10px] shrink-0">
+                      {rec.priority}
+                    </Badge>
+                  </div>
+                  <div className="flex flex-wrap gap-1 mt-1">
+                    {rec.competitors.map((c) => (
+                      <Badge key={c} variant="outline" className="text-[10px]">{c}</Badge>
+                    ))}
+                  </div>
+                  <p className="text-xs text-muted-foreground leading-relaxed">{rec.tip}</p>
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Query-by-Query Comparison */}
+      <Card>
+        <CardHeader className="pb-2">
+          <div className="flex items-center justify-between">
+            <div>
+              <CardTitle className="text-sm font-medium flex items-center gap-2">
+                <ArrowRightLeft className="w-4 h-4 text-primary" />
+                Query-by-Query Comparison
+                <InfoTip text="Compare your mention rate against competitors for each search query. 'Gap' shows how far ahead or behind the best competitor is." />
+              </CardTitle>
+              <CardDescription className="text-xs mt-1">See exactly which queries competitors win and where you lead</CardDescription>
+            </div>
+          </div>
+          {/* Summary badges */}
+          <div className="flex gap-2 mt-2 flex-wrap">
+            <Badge
+              variant={filter === "all" ? "default" : "outline"}
+              className="cursor-pointer text-xs"
+              onClick={() => setFilter("all")}
+            >
+              All ({data.summary.totalQueries})
+            </Badge>
+            <Badge
+              variant={filter === "losing" ? "destructive" : "outline"}
+              className="cursor-pointer text-xs"
+              onClick={() => setFilter("losing")}
+            >
+              Losing ({data.summary.losing})
+            </Badge>
+            <Badge
+              variant={filter === "winning" ? "default" : "outline"}
+              className={`cursor-pointer text-xs ${filter === "winning" ? "bg-emerald-600" : ""}`}
+              onClick={() => setFilter("winning")}
+            >
+              Winning ({data.summary.winning})
+            </Badge>
+            <Badge
+              variant={filter === "tied" ? "secondary" : "outline"}
+              className="cursor-pointer text-xs"
+              onClick={() => setFilter("tied")}
+            >
+              Tied ({data.summary.tied})
+            </Badge>
+          </div>
+        </CardHeader>
+        <CardContent>
+          {filtered.length === 0 ? (
+            <p className="text-sm text-muted-foreground text-center py-4">No queries match this filter.</p>
+          ) : (
+            <div className="space-y-3">
+              {filtered.slice(0, 25).map((q, i) => (
+                <div key={i} className="border rounded-lg p-3">
+                  <div className="flex items-start justify-between gap-2 mb-2">
+                    <code className="text-xs bg-muted px-2 py-0.5 rounded font-mono">{q.query}</code>
+                    <Badge
+                      variant={q.status === "losing" ? "destructive" : q.status === "winning" ? "default" : "secondary"}
+                      className={`text-[10px] shrink-0 ${q.status === "winning" ? "bg-emerald-600" : ""}`}
+                    >
+                      {q.status === "losing" ? `−${q.gap}%` : q.status === "winning" ? `+${Math.abs(q.gap)}%` : "Tied"}
+                    </Badge>
+                  </div>
+                  {/* Bars */}
+                  <div className="space-y-1.5">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] w-24 truncate font-medium">You</span>
+                      <div className="flex-1 h-4 bg-muted rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-primary rounded-full transition-all"
+                          style={{ width: `${Math.max(q.myMentionRate, 2)}%` }}
+                        />
+                      </div>
+                      <span className="text-[10px] w-10 text-right font-medium">{q.myMentionRate}%</span>
+                    </div>
+                    {q.competitors.map((c) => {
+                      const isAhead = c.mentionRate > q.myMentionRate;
+                      return (
+                        <div key={c.name} className="flex items-center gap-2">
+                          <span className="text-[10px] w-24 truncate text-muted-foreground">{c.name}</span>
+                          <div className="flex-1 h-4 bg-muted rounded-full overflow-hidden">
+                            <div
+                              className={`h-full rounded-full transition-all ${isAhead ? "bg-destructive/70" : "bg-emerald-500/70"}`}
+                              style={{ width: `${Math.max(c.mentionRate, 2)}%` }}
+                            />
+                          </div>
+                          <span className="text-[10px] w-10 text-right text-muted-foreground">{c.mentionRate}%</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {/* Position & sentiment row */}
+                  <div className="flex gap-3 mt-2 text-[10px] text-muted-foreground">
+                    {q.myAvgPosition && <span>Your avg position: #{q.myAvgPosition}</span>}
+                    {q.mySentiment && (
+                      <span className={q.mySentiment === "positive" ? "text-emerald-600" : q.mySentiment === "negative" ? "text-destructive" : ""}>
+                        Sentiment: {q.mySentiment}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              ))}
+              {filtered.length > 25 && (
+                <p className="text-xs text-muted-foreground text-center">Showing top 25 of {filtered.length} queries</p>
+              )}
+            </div>
+          )}
+        </CardContent>
+      </Card>
     </>
   );
 }
