@@ -11,7 +11,7 @@ import {
   insertCompetitorSchema, insertAlertSchema, insertLocationSchema,
 } from "@shared/schema";
 import { sql } from "drizzle-orm";
-import { runScan, testApiKey, generateScanQueries, detectCompetitors, setAnalysisKeys, detectHallucinations, verifyCitations, setHealthCallback, PROVIDER_COST_PER_CALL, type BusinessContext } from "./ai-providers";
+import { runScan, testApiKey, diagnosticQuery, generateScanQueries, detectCompetitors, setAnalysisKeys, detectHallucinations, verifyCitations, setHealthCallback, PROVIDER_COST_PER_CALL, type BusinessContext } from "./ai-providers";
 import { generateDemoData, clearDemoData } from "./demo-data";
 import { requireAuth, requireAdmin, createSession, deleteSession, getSession } from "./auth";
 import bcrypt from "bcryptjs";
@@ -1346,6 +1346,38 @@ export async function registerRoutes(
     const id = parseInt(req.params.id);
     const breakdown = await storage.getPlatformBreakdown(id);
     res.json(breakdown);
+  });
+
+  // === DIAGNOSTIC: test a single query to see raw AI responses ===
+  app.get("/api/businesses/:id/diagnostic", async (req, res) => {
+    try {
+      const businessId = parseInt(req.params.id);
+      const biz = await storage.getBusiness(businessId);
+      if (!biz) return res.status(404).json({ error: "Business not found" });
+
+      const activeKeys = db.select().from(apiKeys).where(eq(apiKeys.isActive, 1)).all();
+      if (activeKeys.length === 0) return res.status(400).json({ error: "No API keys configured" });
+
+      const keyInputs = activeKeys.map((k) => ({ provider: k.provider, apiKey: k.apiKey }));
+
+      // Test with a direct name query and a discovery query
+      const directQuery = `Tell me about ${biz.name}${biz.location ? ` in ${biz.location}` : ""}. Are they any good?`;
+      const discoveryQuery = `What are the best ${biz.industry?.toLowerCase() || "service"} companies${biz.location ? ` in ${biz.location}` : ""}? Give me your top picks.`;
+
+      const [directResults, discoveryResults] = await Promise.all([
+        diagnosticQuery(biz.name, directQuery, keyInputs, { location: biz.location, website: biz.website, services: (biz as any).services, industry: biz.industry ?? null }),
+        diagnosticQuery(biz.name, discoveryQuery, keyInputs, { location: biz.location, website: biz.website, services: (biz as any).services, industry: biz.industry ?? null }),
+      ]);
+
+      res.json({
+        businessName: biz.name,
+        platformsConfigured: activeKeys.map(k => k.provider),
+        directQuery: { query: directQuery, results: directResults },
+        discoveryQuery: { query: discoveryQuery, results: discoveryResults },
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
   // === DASHBOARD SUMMARY (cross-business aggregate) ===

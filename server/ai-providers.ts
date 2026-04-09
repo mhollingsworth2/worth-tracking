@@ -668,6 +668,44 @@ export async function* runScan(
   }
 }
 
+// Diagnostic: run a single query against all platforms and return full details
+export async function diagnosticQuery(
+  businessName: string,
+  query: string,
+  keys: { provider: string; apiKey: string }[],
+  businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }
+): Promise<{ platform: string; mentioned: boolean; nameFoundInResponse: boolean; responsePreview: string; responseLength: number; searchVariantsUsed: string[] }[]> {
+  const nameLower = businessName.toLowerCase();
+  const nameWords = nameLower.split(/\s+/).filter(w => w.length > 2);
+  const searchVariants: string[] = [nameLower];
+  if (nameWords.length >= 2) {
+    for (let len = nameWords.length; len >= 2; len--) {
+      searchVariants.push(nameWords.slice(0, len).join(" "));
+    }
+  }
+
+  const results = await Promise.all(keys.map(async (key) => {
+    const fn = PROVIDER_FN[key.provider];
+    if (!fn) return null;
+    try {
+      const result = await fn(key.apiKey, query, businessName, [], businessContext);
+      const lower = result.responseText.toLowerCase();
+      const nameFoundInResponse = searchVariants.some(v => lower.includes(v));
+      return {
+        platform: result.platform,
+        mentioned: result.mentioned,
+        nameFoundInResponse,
+        responsePreview: result.responseText.substring(0, 500),
+        responseLength: result.responseText.length,
+        searchVariantsUsed: searchVariants,
+      };
+    } catch (err: any) {
+      return { platform: key.provider, mentioned: false, nameFoundInResponse: false, responsePreview: `ERROR: ${err.message}`, responseLength: 0, searchVariantsUsed: searchVariants };
+    }
+  }));
+  return results.filter((r): r is NonNullable<typeof r> => r !== null);
+}
+
 export async function testApiKey(provider: string, apiKey: string): Promise<{ success: boolean; error?: string }> {
   const fn = PROVIDER_FN[provider];
   if (!fn) return { success: false, error: `Unknown provider: ${provider}` };
