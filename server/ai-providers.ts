@@ -635,27 +635,27 @@ export async function* runScan(
   const RUNS_PER_QUERY = 2; // Run each query 2x per platform for stability
 
   for (const query of queries) {
-    // Collect results across multiple runs
-    const allRuns: AIQueryResult[][] = [];
-
-    for (let run = 0; run < RUNS_PER_QUERY; run++) {
-      const runResults: AIQueryResult[] = [];
-      for (const key of keys) {
+    // Run all platforms × all runs in parallel for speed
+    const runPromises = Array.from({ length: RUNS_PER_QUERY }, (_, run) => {
+      const platformPromises = keys.map(async (key) => {
         const fn = PROVIDER_FN[key.provider];
-        if (!fn) continue;
+        if (!fn) return null;
         try {
           const result = await fn(key.apiKey, query, businessName, extraTerms, businessContext);
           if (isGenericResponse(result.responseText)) {
             console.log(`[Scan] Generic response detected from ${result.platform} for "${query}" (run ${run + 1})`);
             result.confidence = "low";
           }
-          runResults.push(result);
+          return result;
         } catch (err: any) {
           console.error(`[AI Scan] ${key.provider} run ${run + 1} failed for query "${query}":`, err.message);
+          return null;
         }
-      }
-      allRuns.push(runResults);
-    }
+      });
+      return Promise.all(platformPromises).then(results => results.filter((r): r is AIQueryResult => r !== null));
+    });
+
+    const allRuns = await Promise.all(runPromises);
 
     // Average results per platform across runs
     const platformResults = new Map<string, AIQueryResult[]>();
