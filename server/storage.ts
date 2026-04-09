@@ -17,7 +17,7 @@ import {
 import bcrypt from "bcryptjs";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import Database from "better-sqlite3";
-import { eq, sql, desc, and } from "drizzle-orm";
+import { eq, sql, desc, and, inArray } from "drizzle-orm";
 import { validateSearchRecord, normalizeQuery, jaccardSimilarity } from "./data-validation";
 import type { ValidationResult } from "./data-validation";
 import { generateQualityReport, getDataFreshness } from "./data-quality";
@@ -48,6 +48,9 @@ export interface IStorage {
   getSearchStats(businessId: number): Promise<any>;
   getSearchTrend(businessId: number): Promise<any[]>;
   getPlatformBreakdown(businessId: number): Promise<any[]>;
+  getDashboardSummary(businessIds: number[]): Promise<any>;
+  getQueryPerformance(businessId: number): Promise<any[]>;
+  getVisibilityScores(businessId: number): Promise<any[]>;
 
   // Optimized Prompts
   getOptimizedPrompts(businessId: number): Promise<OptimizedPrompt[]>;
@@ -235,6 +238,143 @@ export class DatabaseStorage implements IStorage {
       .where(eq(searchRecords.businessId, businessId))
       .groupBy(searchRecords.platformId)
       .all();
+  }
+
+  // === DASHBOARD SUMMARY (cross-business KPIs) ===
+  async getDashboardSummary(businessIds: number[]): Promise<any> {
+    if (businessIds.length === 0) {
+      return {
+        businessCount: 0, totalSearches: 0, totalMentions: 0,
+        mentionRate: 0, avgPosition: null, topPlatform: null,
+        mentionsThisWeek: 0, mentionsLastWeek: 0, weekDelta: 0,
+      };
+    }
+
+    const inIds = inArray(searchRecords.businessId, businessIds);
+
+    const totalSearches = db.select({ count: sql<number>`count(*)` })
+      .from(searchRecords)
+      .where(inIds)
+      .get();
+
+    const totalMentions = db.select({ count: sql<number>`count(*)` })
+      .from(searchRecords)
+      .where(and(inIds, eq(searchRecords.mentioned, 1)))
+      .get();
+
+    const avgPos = db.select({ avg: sql<number>`avg(position)` })
+      .from(searchRecords)
+      .where(and(inIds, eq(searchRecords.mentioned, 1)))
+      .get();
+
+    const top = db.select({
+      platformId: searchRecords.platformId,
+      name: platforms.name,
+      color: platforms.color,
+      mentions: sql<number>`sum(case when ${searchRecords.mentioned} = 1 then 1 else 0 end)`,
+    })
+      .from(searchRecords)
+      .innerJoin(platforms, eq(searchRecords.platformId, platforms.id))
+      .where(inIds)
+      .groupBy(searchRecords.platformId)
+      .orderBy(sql`mentions desc`)
+      .limit(1)
+      .get();
+
+    const now = new Date();
+    const sevenAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const fourteenAgo = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+    const thisWeek = db.select({ count: sql<number>`count(*)` })
+      .from(searchRecords)
+      .where(and(inIds, eq(searchRecords.mentioned, 1), sql`${searchRecords.date} >= ${sevenAgo}`))
+      .get();
+
+    const lastWeek = db.select({ count: sql<number>`count(*)` })
+      .from(searchRecords)
+      .where(and(
+        inIds,
+        eq(searchRecords.mentioned, 1),
+        sql`${searchRecords.date} >= ${fourteenAgo}`,
+        sql`${searchRecords.date} < ${sevenAgo}`,
+      ))
+      .get();
+
+    const totS = totalSearches?.count ?? 0;
+    const totM = totalMentions?.count ?? 0;
+    const tw = thisWeek?.count ?? 0;
+    const lw = lastWeek?.count ?? 0;
+    const weekDelta = lw > 0 ? Math.round(((tw - lw) / lw) * 100) : (tw > 0 ? 100 : 0);
+
+    return {
+      businessCount: businessIds.length,
+      totalSearches: totS,
+      totalMentions: totM,
+      mentionRate: totS > 0 ? Math.round((totM / totS) * 100) : 0,
+      avgPosition: avgPos?.avg ? Math.round(avgPos.avg * 10) / 10 : null,
+      topPlatform: top ? { name: top.name, color: top.color, mentions: top.mentions } : null,
+      mentionsThisWeek: tw,
+      mentionsLastWeek: lw,
+      weekDelta,
+    };
+  }
+
+  // === QUERY PERFORMANCE (per-query table) ===
+  async getQueryPerformance(businessId: number): Promise<any[]> {
+    const rows = db.select({
+      query: searchRecords.query,
+      runs: sql<number>`count(*)`,
+      mentions: sql<number>`sum(case when ${searchRecords.mentioned} = 1 then 1 else 0 end)`,
+      avgPosition: sql<number>`avg(case when ${searchRecords.mentioned} = 1 then ${searchRecords.position} end)`,
+      platformsCovered: sql<number>`count(distinct ${searchRecords.platformId})`,
+    })
+      .from(searchRecords)
+      .where(eq(searchRecords.businessId, businessId))
+      .groupBy(searchRecords.query)
+      .all();
+
+    return rows.map((r: any) => ({
+      query: r.query,
+      runs: r.runs,
+      mentions: r.mentions,
+      mentionRate: r.runs > 0 ? Math.round((r.mentions / r.runs) * 100) : 0,
+      avgPosition: r.avgPosition ? Math.round(r.avgPosition * 10) / 10 : null,
+      platformsCovered: r.platformsCovered,
+    })).sort((a: any, b: any) => b.mentions - a.mentions || b.mentionRate - a.mentionRate);
+  }
+
+  // === VISIBILITY SCORES (per-platform 0-100) ===
+  async getVisibilityScores(businessId: number): Promise<any[]> {
+    const rows = db.select({
+      platformId: searchRecords.platformId,
+      platformName: platforms.name,
+      color: platforms.color,
+      total: sql<number>`count(*)`,
+      mentions: sql<number>`sum(case when ${searchRecords.mentioned} = 1 then 1 else 0 end)`,
+      avgPosition: sql<number>`avg(case when ${searchRecords.mentioned} = 1 then ${searchRecords.position} end)`,
+    })
+      .from(searchRecords)
+      .innerJoin(platforms, eq(searchRecords.platformId, platforms.id))
+      .where(eq(searchRecords.businessId, businessId))
+      .groupBy(searchRecords.platformId)
+      .all();
+
+    return rows.map((r: any) => {
+      const mentionRate = r.total > 0 ? (r.mentions / r.total) * 100 : 0;
+      // Position bonus: pos 1 = 100, pos 6+ = 0 (linear falloff, each position costs 20 pts)
+      const posBonus = r.avgPosition ? Math.max(0, 100 - (r.avgPosition - 1) * 20) : 0;
+      const score = Math.round(mentionRate * 0.7 + posBonus * 0.3);
+      return {
+        platformId: r.platformId,
+        platformName: r.platformName,
+        color: r.color,
+        total: r.total,
+        mentions: r.mentions,
+        mentionRate: Math.round(mentionRate),
+        avgPosition: r.avgPosition ? Math.round(r.avgPosition * 10) / 10 : null,
+        score,
+      };
+    }).sort((a: any, b: any) => b.score - a.score);
   }
 
   // === OPTIMIZED PROMPTS ===

@@ -114,15 +114,6 @@ async function queryAnthropic(apiKey: string, query: string, businessName: strin
       model: "claude-haiku-4-5-20251001",
       max_tokens: 1024,
       system: SYSTEM_INSTRUCTION,
-      // Enable Anthropic's native web search so Claude can look up live
-      // information instead of relying on training data only.
-      tools: [
-        {
-          type: "web_search_20250305",
-          name: "web_search",
-          max_uses: 3,
-        },
-      ],
       messages: [{ role: "user", content: query }],
     }),
   });
@@ -133,8 +124,7 @@ async function queryAnthropic(apiKey: string, query: string, businessName: strin
   }
 
   const data = await res.json();
-  // When tools are used, content is an array of blocks (text + tool_use).
-  // Concatenate all text blocks.
+  // Concatenate all text blocks (content is an array).
   const responseText = Array.isArray(data.content)
     ? data.content.filter((block: any) => block.type === "text").map((block: any) => block.text).join("\n")
     : "";
@@ -155,8 +145,6 @@ async function queryGemini(apiKey: string, query: string, businessName: string):
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      // Enable Google Search grounding so Gemini pulls live web information.
-      tools: [{ google_search: {} }],
       systemInstruction: {
         parts: [{ text: SYSTEM_INSTRUCTION }],
       },

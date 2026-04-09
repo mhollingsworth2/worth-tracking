@@ -777,6 +777,34 @@ export async function registerRoutes(
     res.json(breakdown);
   });
 
+  // === DASHBOARD SUMMARY (cross-business aggregate) ===
+  app.get("/api/dashboard/summary", async (req, res) => {
+    const allBiz = await storage.getBusinesses();
+    let ids: number[];
+    if (req.user?.role === "admin") {
+      ids = allBiz.map((b) => b.id);
+    } else {
+      const allowed = await storage.getUserBusinessIds(req.user!.userId);
+      ids = allBiz.filter((b) => allowed.includes(b.id)).map((b) => b.id);
+    }
+    const summary = await storage.getDashboardSummary(ids);
+    res.json(summary);
+  });
+
+  // === QUERY PERFORMANCE ===
+  app.get("/api/businesses/:id/query-performance", async (req, res) => {
+    const id = parseInt(req.params.id);
+    const rows = await storage.getQueryPerformance(id);
+    res.json(rows);
+  });
+
+  // === VISIBILITY SCORES ===
+  app.get("/api/businesses/:id/visibility-scores", async (req, res) => {
+    const id = parseInt(req.params.id);
+    const scores = await storage.getVisibilityScores(id);
+    res.json(scores);
+  });
+
   // === OPTIMIZED PROMPTS ===
   app.get("/api/businesses/:id/prompts", async (req, res) => {
     const id = parseInt(req.params.id);

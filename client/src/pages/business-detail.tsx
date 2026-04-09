@@ -211,6 +211,16 @@ export default function BusinessDetail() {
     queryFn: async () => { const res = await fetch(`/api/businesses/${id}/locations`); return res.json(); },
   });
 
+  const { data: queryPerf } = useQuery<any[]>({
+    queryKey: ["/api/businesses", id, "query-performance"],
+    queryFn: async () => { const res = await fetch(`/api/businesses/${id}/query-performance`); return res.json(); },
+  });
+
+  const { data: visibilityScores } = useQuery<any[]>({
+    queryKey: ["/api/businesses", id, "visibility-scores"],
+    queryFn: async () => { const res = await fetch(`/api/businesses/${id}/visibility-scores`); return res.json(); },
+  });
+
   const deleteMutation = useMutation({
     mutationFn: async () => { await apiRequest("DELETE", `/api/businesses/${id}`); },
     onSuccess: () => {
@@ -480,6 +490,91 @@ export default function BusinessDetail() {
                 ) : <p className="text-sm text-muted-foreground py-4 text-center">No search records yet</p>}
               </CardContent>
             </Card>
+
+            {/* ── Visibility Scores (per-platform 0–100) ────────────── */}
+            {visibilityScores && visibilityScores.length > 0 && (
+              <Card>
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-sm font-medium">
+                    Platform Visibility Scores
+                    <InfoTip text="A 0-100 composite score per platform (70% mention rate + 30% position bonus). Higher = more visible on that AI engine." />
+                  </CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                    {visibilityScores.map((v: any) => {
+                      const PIcon = platformIcons[v.platformName] || Globe;
+                      return (
+                        <div key={v.platformId} className="flex items-center gap-3 p-3 rounded-lg border" data-testid={`visibility-${v.platformName}`}>
+                          <div className="w-10 h-10 rounded-md flex items-center justify-center" style={{ backgroundColor: `${v.color}18` }}>
+                            <PIcon className="w-5 h-5" style={{ color: v.color }} />
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center justify-between mb-1">
+                              <span className="text-sm font-medium">{v.platformName}</span>
+                              <span className="text-lg font-bold tabular-nums" style={{ color: v.color }}>{v.score}</span>
+                            </div>
+                            <div className="h-2 rounded-full bg-muted overflow-hidden">
+                              <div className="h-full rounded-full transition-all duration-500" style={{ width: `${v.score}%`, backgroundColor: v.color }} />
+                            </div>
+                            <div className="flex items-center justify-between mt-1 text-[10px] text-muted-foreground">
+                              <span>{v.mentionRate}% mention rate</span>
+                              <span>{v.avgPosition ? `Pos ${v.avgPosition}` : "—"}</span>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </CardContent>
+              </Card>
+            )}
+
+            {/* ── Query Performance Table ────────────────────────── */}
+            {queryPerf && queryPerf.length > 0 && (
+              <Card>
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-sm font-medium">
+                    Query Performance
+                    <InfoTip text="Detailed breakdown of every query: how often you're mentioned, your average position, and how many platforms covered." />
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b text-left text-xs text-muted-foreground uppercase">
+                        <th className="pb-2 pr-4 font-medium">Query</th>
+                        <th className="pb-2 pr-4 font-medium text-center">Runs</th>
+                        <th className="pb-2 pr-4 font-medium text-center">Mentions</th>
+                        <th className="pb-2 pr-4 font-medium text-center">Rate</th>
+                        <th className="pb-2 pr-4 font-medium text-center">Avg Pos</th>
+                        <th className="pb-2 font-medium text-center">Platforms</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {queryPerf.slice(0, 25).map((q: any, i: number) => (
+                        <tr key={i} className="border-b last:border-0 hover:bg-muted/50 transition-colors">
+                          <td className="py-2 pr-4 max-w-[300px] truncate">{q.query}</td>
+                          <td className="py-2 pr-4 text-center tabular-nums">{q.runs}</td>
+                          <td className="py-2 pr-4 text-center tabular-nums">{q.mentions}</td>
+                          <td className="py-2 pr-4 text-center">
+                            <span className={`inline-flex items-center gap-1 text-xs font-medium px-1.5 py-0.5 rounded-full ${
+                              q.mentionRate >= 75 ? "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400"
+                              : q.mentionRate >= 40 ? "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
+                              : "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400"
+                            }`}>
+                              {q.mentionRate}%
+                            </span>
+                          </td>
+                          <td className="py-2 pr-4 text-center tabular-nums">{q.avgPosition ?? "—"}</td>
+                          <td className="py-2 text-center tabular-nums">{q.platformsCovered}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </CardContent>
+              </Card>
+            )}
           </TabsContent>
 
           {/* ========== REFERRALS TAB ========== */}
