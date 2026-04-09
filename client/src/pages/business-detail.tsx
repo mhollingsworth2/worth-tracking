@@ -991,6 +991,7 @@ export default function BusinessDetail() {
 
           {/* ========== SETTINGS TAB ========== */}
           <TabsContent value="settings" className="space-y-6 mt-4">
+            <AIContextSettings businessId={id} business={business} />
             {/* Embed Click Tracker */}
             <Card>
               <CardHeader>
@@ -1291,6 +1292,104 @@ function ContentGapsSection({ gaps }: { gaps: ContentGap[] }) {
         </Card>
       )}
     </>
+  );
+}
+
+/* ============ AI SEARCH CONTEXT SETTINGS ============ */
+function AIContextSettings({ businessId, business }: { businessId: number; business: Business }) {
+  const [services, setServices] = useState((business as any).services ?? "");
+  const [keywords, setKeywords] = useState((business as any).keywords ?? "");
+  const [targetAudience, setTargetAudience] = useState((business as any).targetAudience ?? (business as any).target_audience ?? "");
+  const [uniqueSellingPoints, setUniqueSellingPoints] = useState((business as any).uniqueSellingPoints ?? (business as any).unique_selling_points ?? "");
+  const [knownCompetitors, setKnownCompetitors] = useState((business as any).competitors ?? (business as any).known_competitors ?? "");
+  const { toast } = useToast();
+
+  const mutation = useMutation({
+    mutationFn: async () => {
+      await apiRequest("PATCH", `/api/businesses/${businessId}`, {
+        services: services || null,
+        keywords: keywords || null,
+        targetAudience: targetAudience || null,
+        uniqueSellingPoints: uniqueSellingPoints || null,
+        competitors: knownCompetitors || null,
+      });
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/businesses", businessId] });
+      toast({ title: "AI search context updated", description: "Next scan will use the new context for smarter queries." });
+    },
+  });
+
+  return (
+    <Card>
+      <CardContent className="p-5 space-y-4">
+        <div>
+          <h3 className="text-sm font-semibold mb-0.5">AI Search Context</h3>
+          <p className="text-xs text-muted-foreground">These fields help generate smarter, more targeted scan queries. The more detail you provide, the better your visibility tracking.</p>
+        </div>
+
+        <div className="space-y-3">
+          <div>
+            <Label className="text-xs">Services / Products</Label>
+            <Input
+              value={services}
+              onChange={(e) => setServices(e.target.value)}
+              placeholder="e.g. deep cleaning, move-out cleaning, office cleaning"
+              className="mt-1"
+            />
+            <p className="text-[10px] text-muted-foreground mt-0.5">Comma-separated list of what you offer</p>
+          </div>
+
+          <div>
+            <Label className="text-xs">Search Keywords</Label>
+            <Input
+              value={keywords}
+              onChange={(e) => setKeywords(e.target.value)}
+              placeholder="e.g. eco-friendly cleaning, same-day service, licensed and insured"
+              className="mt-1"
+            />
+            <p className="text-[10px] text-muted-foreground mt-0.5">Terms you want to rank for in AI search</p>
+          </div>
+
+          <div>
+            <Label className="text-xs">Target Audience</Label>
+            <Input
+              value={targetAudience}
+              onChange={(e) => setTargetAudience(e.target.value)}
+              placeholder="e.g. homeowners, property managers, small businesses"
+              className="mt-1"
+            />
+          </div>
+
+          <div>
+            <Label className="text-xs">What Makes You Different</Label>
+            <Textarea
+              value={uniqueSellingPoints}
+              onChange={(e) => setUniqueSellingPoints(e.target.value)}
+              placeholder="e.g. All-natural products, 100% satisfaction guarantee, family-owned for 15 years"
+              rows={2}
+              className="mt-1"
+            />
+          </div>
+
+          <div>
+            <Label className="text-xs">Known Competitors</Label>
+            <Input
+              value={knownCompetitors}
+              onChange={(e) => setKnownCompetitors(e.target.value)}
+              placeholder="e.g. Merry Maids, Molly Maid, The Cleaning Authority"
+              className="mt-1"
+            />
+            <p className="text-[10px] text-muted-foreground mt-0.5">We'll include comparison queries against these names</p>
+          </div>
+        </div>
+
+        <Button size="sm" onClick={() => mutation.mutate()} disabled={mutation.isPending}>
+          {mutation.isPending ? <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" /> : null}
+          Save Context
+        </Button>
+      </CardContent>
+    </Card>
   );
 }
 

@@ -10,7 +10,7 @@ import {
   insertCompetitorSchema, insertAlertSchema, insertLocationSchema,
 } from "@shared/schema";
 import { sql } from "drizzle-orm";
-import { runScan, testApiKey, generateScanQueries, PROVIDER_COST_PER_CALL } from "./ai-providers";
+import { runScan, testApiKey, generateScanQueries, PROVIDER_COST_PER_CALL, type BusinessContext } from "./ai-providers";
 import { requireAuth, requireAdmin, createSession, deleteSession, getSession } from "./auth";
 import bcrypt from "bcryptjs";
 import { validateSearchRecord, validateReferral, validateAiSnapshot } from "./data-validation";
@@ -36,16 +36,43 @@ function seedPlatforms() {
 
 // Auto-scan runs in the background after business creation (fire-and-forget).
 // It uses the same logic as the /scan endpoint but doesn't block the response.
-async function autoScanBusiness(businessId: number, businessName: string, industry: string, location: string | null) {
+// Helper: build extraTerms for mention detection from business fields
+function buildExtraTerms(biz: any): string[] {
+  const terms: string[] = [];
+  if (biz.services) biz.services.split(",").map((s: string) => s.trim()).filter(Boolean).forEach((s: string) => terms.push(s));
+  if (biz.keywords) biz.keywords.split(",").map((s: string) => s.trim()).filter(Boolean).forEach((s: string) => terms.push(s));
+  return terms;
+}
+
+// Helper: build BusinessContext from a business record
+function toBizContext(biz: any): BusinessContext {
+  return {
+    name: biz.name,
+    industry: biz.industry,
+    location: biz.location ?? null,
+    services: biz.services ?? null,
+    keywords: biz.keywords ?? null,
+    targetAudience: biz.targetAudience ?? biz.target_audience ?? null,
+    uniqueSellingPoints: biz.uniqueSellingPoints ?? biz.unique_selling_points ?? null,
+    competitors: biz.competitors ?? biz.known_competitors ?? null,
+  };
+}
+
+async function autoScanBusiness(businessId: number) {
   try {
+    const biz = await storage.getBusiness(businessId);
+    if (!biz) return;
+
     const keys = await storage.getApiKeys();
     const activeKeys = keys.filter((k) => k.isActive);
     if (activeKeys.length === 0) {
-      console.log(`[Auto-Scan] No API keys configured — skipping initial scan for "${businessName}"`);
+      console.log(`[Auto-Scan] No API keys configured — skipping initial scan for "${biz.name}"`);
       return;
     }
 
-    const queries = generateScanQueries(businessName, industry, location);
+    const ctx = toBizContext(biz);
+    const queries = generateScanQueries(ctx);
+    const extraTerms = buildExtraTerms(biz);
     const allPlatforms = await storage.getPlatforms();
     const platformMap = Object.fromEntries(allPlatforms.map((p) => [p.name, p.id]));
 
@@ -61,7 +88,7 @@ async function autoScanBusiness(businessId: number, businessName: string, indust
     let mentionCount = 0;
     const keyInputs = activeKeys.map((k) => ({ provider: k.provider, apiKey: k.apiKey }));
 
-    for await (const result of runScan(businessName, queries, keyInputs)) {
+    for await (const result of runScan(biz.name, queries, keyInputs, extraTerms)) {
       completed++;
       const platformId = platformMap[result.platform] ?? 1;
       const dateStr = new Date().toISOString().split("T")[0];
@@ -114,9 +141,9 @@ async function autoScanBusiness(businessId: number, businessName: string, indust
       completedAt: new Date().toISOString(),
     });
 
-    console.log(`[Auto-Scan] Finished "${businessName}": ${completed} queries, ${mentionCount} mentions`);
+    console.log(`[Auto-Scan] Finished "${biz.name}": ${completed} queries, ${mentionCount} mentions`);
   } catch (err: any) {
-    console.error(`[Auto-Scan] Error for "${businessName}":`, err.message);
+    console.error(`[Auto-Scan] Error for business ${businessId}:`, err.message);
   }
 }
 
@@ -167,7 +194,7 @@ async function runAllBusinessScans(trigger: string) {
       }
 
       console.log(`[Scheduler] Scanning "${biz.name}"...`);
-      await autoScanBusiness(biz.id, biz.name, biz.industry, biz.location ?? null);
+      await autoScanBusiness(biz.id);
     }
 
     lastNightlyScanDate = today;
@@ -213,6 +240,13 @@ export async function registerRoutes(
     location TEXT,
     ga4_id TEXT
   )`);
+
+  // Add rich context columns (safe for existing DBs)
+  try { db.run(sql`ALTER TABLE businesses ADD COLUMN keywords TEXT`); } catch (_e) { /* exists */ }
+  try { db.run(sql`ALTER TABLE businesses ADD COLUMN services TEXT`); } catch (_e) { /* exists */ }
+  try { db.run(sql`ALTER TABLE businesses ADD COLUMN target_audience TEXT`); } catch (_e) { /* exists */ }
+  try { db.run(sql`ALTER TABLE businesses ADD COLUMN unique_selling_points TEXT`); } catch (_e) { /* exists */ }
+  try { db.run(sql`ALTER TABLE businesses ADD COLUMN known_competitors TEXT`); } catch (_e) { /* exists */ }
 
   db.run(sql`CREATE TABLE IF NOT EXISTS platforms (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -597,7 +631,7 @@ export async function registerRoutes(
 
     // Fire-and-forget: run an initial AI scan in the background so the user
     // gets real data instead of simulated data. The response returns immediately.
-    autoScanBusiness(business.id, business.name, business.industry, business.location ?? null);
+    autoScanBusiness(business.id);
 
     res.json(business);
   });
@@ -968,7 +1002,9 @@ export async function registerRoutes(
       .from(apiUsage).where(sql`date = ${today}`).get();
     const currentSpend = parseFloat(todayUsage?.total ?? "0");
 
-    const queries = generateScanQueries(business.name, business.industry, business.location ?? null);
+    const ctx = toBizContext(business);
+    const queries = generateScanQueries(ctx);
+    const extraTerms = buildExtraTerms(business);
     const totalQueries = queries.length * activeKeys.length;
 
     // Estimate cost of this scan
@@ -999,7 +1035,7 @@ export async function registerRoutes(
 
     try {
       const keyInputs = activeKeys.map((k) => ({ provider: k.provider, apiKey: k.apiKey }));
-      for await (const result of runScan(business.name, queries, keyInputs)) {
+      for await (const result of runScan(business.name, queries, keyInputs, extraTerms)) {
         completed++;
         const platformId = platformMap[result.platform] ?? 1;
         const dateStr = new Date().toISOString().split("T")[0];

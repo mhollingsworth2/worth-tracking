@@ -11,6 +11,12 @@ export const businesses = sqliteTable("businesses", {
   website: text("website"),
   location: text("location"),
   ga4Id: text("ga4_id"),
+  // Rich context fields for better AI scan results
+  keywords: text("keywords"),           // comma-separated terms the business wants to rank for
+  services: text("services"),           // comma-separated list of services/products offered
+  targetAudience: text("target_audience"), // who the business serves
+  uniqueSellingPoints: text("unique_selling_points"), // what makes them different
+  competitors: text("known_competitors"), // comma-separated competitor names
 });
 
 export const insertBusinessSchema = createInsertSchema(businesses).omit({ id: true });

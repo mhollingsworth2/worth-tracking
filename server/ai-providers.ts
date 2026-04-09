@@ -36,22 +36,50 @@ const NO_KNOWLEDGE_PHRASES = [
 // Models are told to explicitly decline rather than fabricate business details.
 const SYSTEM_INSTRUCTION = "You are answering questions about real-world businesses. Base your answer only on verified, factual information. If you do not have reliable, specific information about a business being asked about, respond with 'No verified information available' and briefly explain what you do and don't know. Do not guess, fabricate details, or invent reviews, ratings, addresses, or services. It is better to say you don't know than to make something up.";
 
-function analyzeMention(responseText: string, businessName: string): { mentioned: boolean; position: number | null; sentiment: "positive" | "neutral" | "negative" } {
+function analyzeMention(responseText: string, businessName: string, extraTerms?: string[]): { mentioned: boolean; position: number | null; sentiment: "positive" | "neutral" | "negative" } {
   const lowerResponse = responseText.toLowerCase();
   const lowerName = businessName.toLowerCase();
 
   // If the response explicitly says the model has no knowledge, treat as not mentioned
   // regardless of whether the business name appears (it was just echoed from the prompt).
   const hasNoKnowledge = NO_KNOWLEDGE_PHRASES.some(phrase => lowerResponse.includes(phrase));
-  const mentioned = !hasNoKnowledge && lowerResponse.includes(lowerName);
+
+  // Primary match: business name. Secondary: services/keywords with 2+ word overlap.
+  let nameMentioned = !hasNoKnowledge && lowerResponse.includes(lowerName);
+
+  // Also check extra terms (services, keywords) — but only multi-word ones to avoid
+  // false positives from generic single words like "cleaning".
+  if (!nameMentioned && !hasNoKnowledge && extraTerms) {
+    for (const term of extraTerms) {
+      const lower = term.toLowerCase().trim();
+      if (lower.split(/\s+/).length >= 2 && lowerResponse.includes(lower)) {
+        nameMentioned = true;
+        break;
+      }
+    }
+  }
+
+  const mentioned = nameMentioned;
 
   let position: number | null = null;
   if (mentioned) {
     const sentences = responseText.split(/[.!?]+/).filter(s => s.trim().length > 0);
     for (let i = 0; i < sentences.length; i++) {
-      if (sentences[i].toLowerCase().includes(lowerName)) {
+      const s = sentences[i].toLowerCase();
+      if (s.includes(lowerName)) {
         position = i + 1;
         break;
+      }
+      // Check multi-word extra terms for position too
+      if (extraTerms) {
+        for (const term of extraTerms) {
+          const lower = term.toLowerCase().trim();
+          if (lower.split(/\s+/).length >= 2 && s.includes(lower)) {
+            position = i + 1;
+            break;
+          }
+        }
+        if (position !== null) break;
       }
     }
   }
@@ -65,7 +93,7 @@ function analyzeMention(responseText: string, businessName: string): { mentioned
   return { mentioned, position, sentiment };
 }
 
-async function queryOpenAI(apiKey: string, query: string, businessName: string): Promise<AIQueryResult> {
+async function queryOpenAI(apiKey: string, query: string, businessName: string, extraTerms?: string[]): Promise<AIQueryResult> {
   // Note: gpt-5-mini on chat/completions does not include built-in web search.
   // Live-web answers come from Claude/Gemini/Perplexity; here we rely on the
   // system instruction to discourage hallucination.
@@ -92,7 +120,7 @@ async function queryOpenAI(apiKey: string, query: string, businessName: string):
 
   const data = await res.json();
   const responseText = data.choices?.[0]?.message?.content ?? "";
-  const analysis = analyzeMention(responseText, businessName);
+  const analysis = analyzeMention(responseText, businessName, extraTerms);
 
   return {
     platform: "ChatGPT",
@@ -102,7 +130,7 @@ async function queryOpenAI(apiKey: string, query: string, businessName: string):
   };
 }
 
-async function queryAnthropic(apiKey: string, query: string, businessName: string): Promise<AIQueryResult> {
+async function queryAnthropic(apiKey: string, query: string, businessName: string, extraTerms?: string[]): Promise<AIQueryResult> {
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -128,7 +156,7 @@ async function queryAnthropic(apiKey: string, query: string, businessName: strin
   const responseText = Array.isArray(data.content)
     ? data.content.filter((block: any) => block.type === "text").map((block: any) => block.text).join("\n")
     : "";
-  const analysis = analyzeMention(responseText, businessName);
+  const analysis = analyzeMention(responseText, businessName, extraTerms);
 
   return {
     platform: "Claude",
@@ -138,7 +166,7 @@ async function queryAnthropic(apiKey: string, query: string, businessName: strin
   };
 }
 
-async function queryGemini(apiKey: string, query: string, businessName: string): Promise<AIQueryResult> {
+async function queryGemini(apiKey: string, query: string, businessName: string, extraTerms?: string[]): Promise<AIQueryResult> {
   const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
     method: "POST",
     headers: {
@@ -159,7 +187,7 @@ async function queryGemini(apiKey: string, query: string, businessName: string):
 
   const data = await res.json();
   const responseText = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-  const analysis = analyzeMention(responseText, businessName);
+  const analysis = analyzeMention(responseText, businessName, extraTerms);
 
   return {
     platform: "Google Gemini",
@@ -169,7 +197,7 @@ async function queryGemini(apiKey: string, query: string, businessName: string):
   };
 }
 
-async function queryPerplexity(apiKey: string, query: string, businessName: string): Promise<AIQueryResult> {
+async function queryPerplexity(apiKey: string, query: string, businessName: string, extraTerms?: string[]): Promise<AIQueryResult> {
   const res = await fetch("https://api.perplexity.ai/chat/completions", {
     method: "POST",
     headers: {
@@ -193,7 +221,7 @@ async function queryPerplexity(apiKey: string, query: string, businessName: stri
 
   const data = await res.json();
   const responseText = data.choices?.[0]?.message?.content ?? "";
-  const analysis = analyzeMention(responseText, businessName);
+  const analysis = analyzeMention(responseText, businessName, extraTerms);
 
   return {
     platform: "Perplexity",
@@ -203,7 +231,7 @@ async function queryPerplexity(apiKey: string, query: string, businessName: stri
   };
 }
 
-const PROVIDER_FN: Record<string, (apiKey: string, query: string, businessName: string) => Promise<AIQueryResult>> = {
+const PROVIDER_FN: Record<string, (apiKey: string, query: string, businessName: string, extraTerms?: string[]) => Promise<AIQueryResult>> = {
   openai: queryOpenAI,
   anthropic: queryAnthropic,
   google: queryGemini,
@@ -229,14 +257,15 @@ export const PROVIDER_COST_PER_CALL: Record<string, number> = {
 export async function* runScan(
   businessName: string,
   queries: string[],
-  keys: { provider: string; apiKey: string }[]
+  keys: { provider: string; apiKey: string }[],
+  extraTerms?: string[]
 ): AsyncGenerator<AIQueryResult> {
   for (const query of queries) {
     for (const key of keys) {
       const fn = PROVIDER_FN[key.provider];
       if (!fn) continue;
       try {
-        const result = await fn(key.apiKey, query, businessName);
+        const result = await fn(key.apiKey, query, businessName, extraTerms);
         yield result;
       } catch (err: any) {
         console.error(`[AI Scan] ${key.provider} failed for query "${query}":`, err.message);
@@ -257,34 +286,74 @@ export async function testApiKey(provider: string, apiKey: string): Promise<{ su
   }
 }
 
-export function generateScanQueries(businessName: string, industry: string, location: string | null): string[] {
-  const ind = industry.toLowerCase();
-  const loc = location ?? null;
+export interface BusinessContext {
+  name: string;
+  industry: string;
+  location: string | null;
+  services: string | null;
+  keywords: string | null;
+  targetAudience: string | null;
+  uniqueSellingPoints: string | null;
+  competitors: string | null;
+}
+
+// Parse comma-separated field into trimmed non-empty strings
+function parseList(csv: string | null | undefined): string[] {
+  if (!csv) return [];
+  return csv.split(",").map(s => s.trim()).filter(Boolean);
+}
+
+export function generateScanQueries(ctx: BusinessContext): string[] {
+  const { name } = ctx;
+  const ind = ctx.industry.toLowerCase();
+  const loc = ctx.location ?? null;
+  const servicesList = parseList(ctx.services);
+  const keywordsList = parseList(ctx.keywords);
+  const audienceList = parseList(ctx.targetAudience);
+  const competitorsList = parseList(ctx.competitors);
 
   // ── Discovery queries (intent: find options) ──────────────────────────────
   const discovery: string[] = [
     `What are the best ${ind} businesses${loc ? ` in ${loc}` : ""}?`,
     `Top rated ${ind} companies to consider this year`,
     `Which ${ind} provider should I choose?`,
-    `Best ${ind} services for small businesses`,
     `Most recommended ${ind} options available right now`,
   ];
 
-  // ── Comparison queries (intent: evaluate alternatives) ────────────────────
-  const comparison: string[] = [
-    `Compare ${businessName} to other ${ind} options`,
-    `${businessName} vs competitors — which is better?`,
-    `How does ${businessName} compare to alternatives in ${ind}?`,
-    `${ind} provider comparison: pros and cons`,
+  // ── Service-specific queries ──────────────────────────────────────────────
+  const serviceQueries: string[] = [];
+  for (const svc of servicesList.slice(0, 4)) {
+    serviceQueries.push(`best ${svc} services${loc ? ` in ${loc}` : ""}`);
+    serviceQueries.push(`who offers ${svc}${loc ? ` near ${loc}` : ""}?`);
+  }
+
+  // ── Keyword-driven queries ────────────────────────────────────────────────
+  const keywordQueries: string[] = [];
+  for (const kw of keywordsList.slice(0, 4)) {
+    keywordQueries.push(`${kw} ${ind}${loc ? ` in ${loc}` : ""}`);
+  }
+
+  // ── Audience-specific queries ─────────────────────────────────────────────
+  const audienceQueries: string[] = [];
+  for (const aud of audienceList.slice(0, 3)) {
+    audienceQueries.push(`best ${ind} for ${aud}${loc ? ` in ${loc}` : ""}`);
+  }
+
+  // ── Competitor comparison queries ─────────────────────────────────────────
+  const competitorQueries: string[] = [
+    `Compare ${name} to other ${ind} options`,
+    `${name} vs competitors — which is better?`,
   ];
+  for (const comp of competitorsList.slice(0, 3)) {
+    competitorQueries.push(`${name} vs ${comp} — which is better?`);
+  }
 
   // ── Review / reputation queries (intent: validate trust) ─────────────────
   const review: string[] = [
-    `${businessName} reviews and reputation`,
-    `Is ${businessName} worth it?`,
-    `What do customers say about ${businessName}?`,
-    `${businessName} customer feedback and ratings`,
-    `Problems or complaints about ${businessName}`,
+    `${name} reviews and reputation`,
+    `Is ${name} worth it?`,
+    `What do customers say about ${name}?`,
+    `Problems or complaints about ${name}`,
   ];
 
   // ── Local queries (intent: find nearby) ──────────────────────────────────
@@ -292,7 +361,6 @@ export function generateScanQueries(businessName: string, industry: string, loca
     ? [
         `Best ${ind} near ${loc}`,
         `Top rated ${ind} in ${loc}`,
-        `${ind} businesses open now in ${loc}`,
         `Highly reviewed ${ind} services in ${loc}`,
       ]
     : [
@@ -300,34 +368,33 @@ export function generateScanQueries(businessName: string, industry: string, loca
         `Local ${ind} providers with good reviews`,
       ];
 
-  // ── Long-tail queries (3+ words, specific intent) ─────────────────────────
+  // ── Long-tail / intent queries ────────────────────────────────────────────
   const longTail: string[] = [
     `affordable ${ind} services with good customer support`,
-    `best value ${ind} provider for new customers`,
     `how to choose a reliable ${ind} business`,
-    `what to look for when hiring a ${ind} company`,
     `${ind} services that are worth the price`,
   ];
 
-  // ── Seasonal / trending variations ───────────────────────────────────────
+  // ── Seasonal / trending ───────────────────────────────────────────────────
   const currentYear = new Date().getFullYear();
   const seasonal: string[] = [
     `best ${ind} businesses in ${currentYear}`,
-    `top ${ind} trends and recommendations`,
-    `${businessName} — is it still a good choice in ${currentYear}?`,
+    `${name} — is it still a good choice in ${currentYear}?`,
   ];
 
-  // Combine all categories, deduplicate, and cap at 20
+  // Combine all categories, deduplicate, and cap at 25
   const all = [
     ...discovery,
-    ...comparison,
+    ...serviceQueries,
+    ...keywordQueries,
+    ...audienceQueries,
+    ...competitorQueries,
     ...review,
     ...local,
     ...longTail,
     ...seasonal,
   ];
 
-  // Simple deduplication by normalized string
   const seen = new Set<string>();
   const unique: string[] = [];
   for (const q of all) {
@@ -338,5 +405,5 @@ export function generateScanQueries(businessName: string, industry: string, loca
     }
   }
 
-  return unique.slice(0, 20);
+  return unique.slice(0, 25);
 }

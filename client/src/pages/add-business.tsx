@@ -5,12 +5,12 @@ import { useLocation } from "wouter";
 import { insertBusinessSchema, type InsertBusiness } from "@shared/schema";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
+import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage, FormDescription } from "@/components/ui/form";
 import { ArrowLeft, Loader2 } from "lucide-react";
 import { Link } from "wouter";
 
@@ -45,6 +45,11 @@ export default function AddBusiness() {
       industry: "",
       website: "",
       location: "",
+      keywords: "",
+      services: "",
+      targetAudience: "",
+      uniqueSellingPoints: "",
+      competitors: "",
     },
   });
 
@@ -73,12 +78,14 @@ export default function AddBusiness() {
       </Link>
 
       <h1 className="text-xl font-semibold mb-1" data-testid="text-page-title">Add a Business</h1>
-      <p className="text-sm text-muted-foreground mb-6">Enter your business details and we'll generate AI search tracking data with optimized prompt suggestions.</p>
+      <p className="text-sm text-muted-foreground mb-6">The more detail you provide, the better we can track your AI visibility with targeted queries.</p>
 
       <Card>
         <CardContent className="p-6">
           <Form {...form}>
             <form onSubmit={form.handleSubmit((d) => mutation.mutate(d))} className="space-y-5">
+
+              {/* ── Core fields ──────────────────────────── */}
               <FormField
                 control={form.control}
                 name="name"
@@ -124,12 +131,13 @@ export default function AddBusiness() {
                     <FormLabel>Description</FormLabel>
                     <FormControl>
                       <Textarea
-                        placeholder="Briefly describe what your business does, its unique selling points, and target audience..."
+                        placeholder="What does your business do? What makes it special?"
                         rows={3}
                         {...field}
                         data-testid="input-description"
                       />
                     </FormControl>
+                    <FormDescription>Used to understand your business — not sent to AI platforms directly.</FormDescription>
                     <FormMessage />
                   </FormItem>
                 )}
@@ -163,6 +171,114 @@ export default function AddBusiness() {
                     </FormItem>
                   )}
                 />
+              </div>
+
+              {/* ── Rich context fields ──────────────────── */}
+              <div className="border-t pt-5 mt-2">
+                <p className="text-sm font-medium mb-1">AI Search Context</p>
+                <p className="text-xs text-muted-foreground mb-4">These fields help us generate smarter, more targeted scan queries. Fill in what you can — all optional.</p>
+
+                <div className="space-y-4">
+                  <FormField
+                    control={form.control}
+                    name="services"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Services / Products</FormLabel>
+                        <FormControl>
+                          <Input
+                            placeholder="e.g. deep cleaning, move-out cleaning, office cleaning, carpet shampooing"
+                            {...field}
+                            value={field.value ?? ""}
+                            data-testid="input-services"
+                          />
+                        </FormControl>
+                        <FormDescription>Comma-separated list of what you offer.</FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name="keywords"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Search Keywords</FormLabel>
+                        <FormControl>
+                          <Input
+                            placeholder="e.g. eco-friendly cleaning, same-day service, licensed and insured"
+                            {...field}
+                            value={field.value ?? ""}
+                            data-testid="input-keywords"
+                          />
+                        </FormControl>
+                        <FormDescription>Terms you want to rank for in AI search results.</FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name="targetAudience"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Target Audience</FormLabel>
+                        <FormControl>
+                          <Input
+                            placeholder="e.g. homeowners, property managers, small businesses, new parents"
+                            {...field}
+                            value={field.value ?? ""}
+                            data-testid="input-target-audience"
+                          />
+                        </FormControl>
+                        <FormDescription>Who are your ideal customers?</FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name="uniqueSellingPoints"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>What Makes You Different</FormLabel>
+                        <FormControl>
+                          <Textarea
+                            placeholder="e.g. We use all-natural products, offer a 100% satisfaction guarantee, and have been family-owned for 15 years"
+                            rows={2}
+                            {...field}
+                            value={field.value ?? ""}
+                            data-testid="input-usp"
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name="competitors"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Known Competitors</FormLabel>
+                        <FormControl>
+                          <Input
+                            placeholder="e.g. Merry Maids, Molly Maid, The Cleaning Authority"
+                            {...field}
+                            value={field.value ?? ""}
+                            data-testid="input-competitors"
+                          />
+                        </FormControl>
+                        <FormDescription>We'll include comparison queries against these names.</FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                </div>
               </div>
 
               <Button type="submit" className="w-full" disabled={mutation.isPending} data-testid="button-submit">
