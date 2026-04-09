@@ -160,7 +160,10 @@ function analyzeWithAI(businessName: string, query: string, responseText: string
     confidence = isGeneric ? "low" : "high";
   }
 
-  console.log(`[Analysis] "${businessName}" ${mentioned ? "FOUND" : "NOT FOUND"} (queryHadName: ${queryContainsName}, position: ${position}, sentiment: ${sentiment}, confidence: ${confidence})`);
+  console.log(`[Analysis] "${businessName}" ${mentioned ? "FOUND ✓" : "NOT FOUND ✗"} | queryHadName: ${queryContainsName} | nameInResponse: ${nameFoundInResponse} | responseLen: ${responseText.length} | position: ${position} | sentiment: ${sentiment} | confidence: ${confidence}`);
+  if (!mentioned && !nameFoundInResponse) {
+    console.log(`[Analysis] Response preview (first 200 chars): ${responseText.substring(0, 200).replace(/\n/g, " ")}`);
+  }
 
   return { mentioned, sentiment, confidence, position };
 }
@@ -586,7 +589,7 @@ export async function* runScan(
   extraTerms?: string[],
   businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }
 ): AsyncGenerator<AIQueryResult> {
-  const RUNS_PER_QUERY = 2; // Run each query 2x per platform for stability
+  const RUNS_PER_QUERY = 1; // Single run — deterministic text matching doesn't need averaging
 
   for (const query of queries) {
     // Run all platforms × all runs in parallel for speed
@@ -624,9 +627,9 @@ export async function* runScan(
     for (const [platform, results] of platformResults) {
       if (results.length === 0) continue;
 
-      // Majority vote on mentioned
+      // Mentioned if ANY run detected the name (avoids false negatives from even-count majority vote)
       const mentionedCount = results.filter(r => r.mentioned).length;
-      const mentioned = mentionedCount > results.length / 2;
+      const mentioned = mentionedCount >= 1;
 
       // Average position (only from runs where mentioned)
       const positions = results.filter(r => r.mentioned && r.position !== null).map(r => r.position!);
@@ -657,6 +660,8 @@ export async function* runScan(
 
     // Cross-validate the averaged batch, then yield
     const validated = crossValidateResults(averaged);
+    const mentionedInQuery = validated.filter(r => r.mentioned).length;
+    console.log(`[Scan] Query "${query.substring(0, 60)}..." → ${mentionedInQuery}/${validated.length} platforms mentioned`);
     for (const result of validated) {
       yield result;
     }
