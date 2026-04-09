@@ -28,6 +28,7 @@ import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { InfoTip } from "@/components/info-tip";
 import type { Business, SearchRecord, OptimizedPrompt, Platform, Referral, Competitor, AiSnapshot, ContentGap, Location as BizLocation } from "@shared/schema";
+import { PromptRecommendations } from "@/components/PromptRecommendations";
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer,
   BarChart, Bar, CartesianGrid, Cell, PieChart, Pie, Legend,
@@ -436,6 +437,10 @@ export default function BusinessDetail() {
               <Camera className="w-3.5 h-3.5 mr-1.5" />
               AI Snapshots
             </TabsTrigger>
+            <TabsTrigger value="recommendations" data-testid="tab-recommendations">
+              <Target className="w-3.5 h-3.5 mr-1.5" />
+              Recommendations
+            </TabsTrigger>
             <TabsTrigger value="content-gaps" data-testid="tab-content-gaps">
               <AlertTriangle className="w-3.5 h-3.5 mr-1.5" />
               Content Gaps
@@ -819,6 +824,19 @@ export default function BusinessDetail() {
           {/* ========== AI SNAPSHOTS TAB ========== */}
           <TabsContent value="snapshots" className="space-y-6 mt-4">
             <SnapshotsSection snapshots={snapshotsData ?? []} getPlatformName={getPlatformName} />
+          </TabsContent>
+
+          {/* ========== RECOMMENDATIONS TAB ========== */}
+          <TabsContent value="recommendations" className="space-y-6 mt-4">
+            <div className="flex items-start justify-between gap-3 flex-wrap">
+              <div>
+                <h2 className="text-sm font-semibold">Prompt Recommendations</h2>
+                <p className="text-xs text-muted-foreground mt-0.5">
+                  Data-driven prompts to focus on — based on your actual scan results.
+                </p>
+              </div>
+            </div>
+            <PromptRecommendations businessId={id} />
           </TabsContent>
 
           {/* ========== CONTENT GAPS TAB ========== */}

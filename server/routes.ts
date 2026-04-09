@@ -8,13 +8,28 @@ import {
   users, userBusinesses, loginSchema,
   insertBusinessSchema, insertSearchRecordSchema,
   insertCompetitorSchema, insertAlertSchema, insertLocationSchema,
+  promptRecommendations,
 } from "@shared/schema";
+import { analyzePrompts } from "./prompt-recommender";
 import { sql } from "drizzle-orm";
 import { runScan, testApiKey, generateScanQueries, PROVIDER_COST_PER_CALL } from "./ai-providers";
 import { requireAuth, requireAdmin, createSession, deleteSession, getSession } from "./auth";
 import bcrypt from "bcryptjs";
 import { validateSearchRecord, validateReferral, validateAiSnapshot } from "./data-validation";
 import { ensureArchiveTables, runArchival } from "./data-archival";
+
+// Helper: build a summary object from an already-computed recommendations array
+function buildSummaryFromRecs(recs: any[], totalScanned: number) {
+  return {
+    totalScanned,
+    strengthCount:    recs.filter((r) => r.category === "strength").length,
+    opportunityCount: recs.filter((r) => r.category === "opportunity").length,
+    trendingCount:    recs.filter((r) => r.category === "trending").length,
+    questionCount:    recs.filter((r) => r.category === "question").length,
+    competitorCount:  recs.filter((r) => r.category === "competitor").length,
+    intentCount:      recs.filter((r) => r.category === "intent").length,
+  };
+}
 
 // Seed default AI platforms
 function seedPlatforms() {
@@ -354,6 +369,19 @@ export async function registerRoutes(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     business_id INTEGER NOT NULL
+  )`);
+
+  db.run(sql`CREATE TABLE IF NOT EXISTS prompt_recommendations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    business_id INTEGER NOT NULL,
+    prompt TEXT NOT NULL,
+    category TEXT NOT NULL,
+    mention_rate INTEGER NOT NULL DEFAULT 0,
+    frequency INTEGER NOT NULL DEFAULT 0,
+    score INTEGER NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL,
+    suggested_action TEXT NOT NULL,
+    generated_at TEXT NOT NULL
   )`);
 
   console.log("[init] Core tables created successfully");
@@ -1237,6 +1265,126 @@ export async function registerRoutes(
   app.post("/api/data/archival-run", requireAdmin, async (_req, res) => {
     const result = runArchival();
     res.json({ success: true, ...result });
+  });
+
+  // === PROMPT RECOMMENDATIONS ===
+
+  // GET /api/businesses/:id/prompt-recommendations
+  // Query params: category (optional), limit (default 20), days (default 30)
+  app.get("/api/businesses/:id/prompt-recommendations", async (req, res) => {
+    const businessId = parseInt(req.params.id);
+    if (isNaN(businessId)) return res.status(400).json({ error: "Invalid business id" });
+
+    const business = await storage.getBusiness(businessId);
+    if (!business) return res.status(404).json({ error: "Business not found" });
+
+    const days  = Math.max(1, parseInt((req.query.days  as string) || "30") || 30);
+    const limit = Math.max(1, parseInt((req.query.limit as string) || "20") || 20);
+    const categoryFilter = (req.query.category as string) || "";
+
+    // Check for a fresh cached result (< 24 hours old)
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const cached = db
+      .select()
+      .from(promptRecommendations)
+      .where(sql`business_id = ${businessId} AND generated_at > ${oneDayAgo}`)
+      .all();
+
+    let recs;
+    let summary;
+
+    if (cached.length > 0) {
+      // Use cached results
+      recs = cached.map((r: any) => ({
+        prompt:          r.prompt,
+        category:        r.category,
+        mentionRate:     r.mentionRate ?? r.mention_rate,
+        frequency:       r.frequency,
+        score:           r.score,
+        reason:          r.reason,
+        suggestedAction: r.suggestedAction ?? r.suggested_action,
+      }));
+      summary = buildSummaryFromRecs(recs, cached.reduce((s: number, r: any) => s + (r.frequency ?? 0), 0));
+    } else {
+      // Re-analyse and cache
+      const result = await analyzePrompts(businessId, days, 100);
+      recs    = result.recommendations;
+      summary = result.summary;
+
+      // Persist to cache (replace old entries)
+      db.run(sql`DELETE FROM prompt_recommendations WHERE business_id = ${businessId}`);
+      const now = new Date().toISOString();
+      for (const rec of recs) {
+        db.insert(promptRecommendations).values({
+          businessId,
+          prompt:          rec.prompt,
+          category:        rec.category,
+          mentionRate:     rec.mentionRate,
+          frequency:       rec.frequency,
+          score:           rec.score,
+          reason:          rec.reason,
+          suggestedAction: rec.suggestedAction,
+          generatedAt:     now,
+        }).run();
+      }
+    }
+
+    // Apply optional category filter
+    if (categoryFilter) {
+      recs = recs.filter((r: any) => r.category === categoryFilter);
+    }
+
+    // Apply limit
+    recs = recs.slice(0, limit);
+
+    res.json({ recommendations: recs, summary });
+  });
+
+  // GET /api/businesses/:id/prompt-recommendations/summary
+  app.get("/api/businesses/:id/prompt-recommendations/summary", async (req, res) => {
+    const businessId = parseInt(req.params.id);
+    if (isNaN(businessId)) return res.status(400).json({ error: "Invalid business id" });
+
+    const business = await storage.getBusiness(businessId);
+    if (!business) return res.status(404).json({ error: "Business not found" });
+
+    const days = Math.max(1, parseInt((req.query.days as string) || "30") || 30);
+    const result = await analyzePrompts(businessId, days, 100);
+    res.json(result.summary);
+  });
+
+  // POST /api/businesses/:id/prompt-recommendations/refresh
+  // Force re-analyse (invalidates cache)
+  app.post("/api/businesses/:id/prompt-recommendations/refresh", async (req, res) => {
+    const businessId = parseInt(req.params.id);
+    if (isNaN(businessId)) return res.status(400).json({ error: "Invalid business id" });
+
+    const business = await storage.getBusiness(businessId);
+    if (!business) return res.status(404).json({ error: "Business not found" });
+
+    const days = Math.max(1, parseInt((req.body.days as string) || "30") || 30);
+
+    // Clear cache
+    db.run(sql`DELETE FROM prompt_recommendations WHERE business_id = ${businessId}`);
+
+    const result = await analyzePrompts(businessId, days, 100);
+    const now = new Date().toISOString();
+
+    for (const rec of result.recommendations) {
+      db.insert(promptRecommendations).values({
+        businessId,
+        prompt:          rec.prompt,
+        category:        rec.category,
+        mentionRate:     rec.mentionRate,
+        frequency:       rec.frequency,
+        score:           rec.score,
+        reason:          rec.reason,
+        suggestedAction: rec.suggestedAction,
+        generatedAt:     now,
+      }).run();
+    }
+
+    res.json({ ...result, refreshedAt: now });
   });
 
   // Start nightly 2 AM scan scheduler
