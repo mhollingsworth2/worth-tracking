@@ -179,7 +179,7 @@ export class DatabaseStorage implements IStorage {
   // === SEARCH RECORDS ===
   async getSearchRecords(businessId: number): Promise<SearchRecord[]> {
     return db.select().from(searchRecords)
-      .where(eq(searchRecords.businessId, businessId))
+      .where(and(eq(searchRecords.businessId, businessId), sql`competitor_id IS NULL`))
       .orderBy(desc(searchRecords.date))
       .all();
   }
@@ -189,24 +189,25 @@ export class DatabaseStorage implements IStorage {
   }
 
   async getSearchStats(businessId: number): Promise<any> {
+    const ownFilter = and(eq(searchRecords.businessId, businessId), sql`competitor_id IS NULL`);
     const totalSearches = db.select({ count: sql<number>`count(*)` })
       .from(searchRecords)
-      .where(eq(searchRecords.businessId, businessId))
+      .where(ownFilter)
       .get();
 
     const totalMentions = db.select({ count: sql<number>`count(*)` })
       .from(searchRecords)
-      .where(and(eq(searchRecords.businessId, businessId), eq(searchRecords.mentioned, 1)))
+      .where(and(ownFilter, eq(searchRecords.mentioned, 1)))
       .get();
 
     const avgPosition = db.select({ avg: sql<number>`avg(position)` })
       .from(searchRecords)
-      .where(and(eq(searchRecords.businessId, businessId), eq(searchRecords.mentioned, 1)))
+      .where(and(ownFilter, eq(searchRecords.mentioned, 1)))
       .get();
 
     const platformCount = db.select({ count: sql<number>`count(distinct platform_id)` })
       .from(searchRecords)
-      .where(eq(searchRecords.businessId, businessId))
+      .where(ownFilter)
       .get();
 
     return {
@@ -225,7 +226,7 @@ export class DatabaseStorage implements IStorage {
       mentions: sql<number>`sum(case when mentioned = 1 then 1 else 0 end)`,
     })
       .from(searchRecords)
-      .where(eq(searchRecords.businessId, businessId))
+      .where(and(eq(searchRecords.businessId, businessId), sql`competitor_id IS NULL`))
       .groupBy(searchRecords.date)
       .orderBy(searchRecords.date)
       .all();
@@ -241,7 +242,7 @@ export class DatabaseStorage implements IStorage {
     })
       .from(searchRecords)
       .innerJoin(platforms, eq(searchRecords.platformId, platforms.id))
-      .where(eq(searchRecords.businessId, businessId))
+      .where(and(eq(searchRecords.businessId, businessId), sql`competitor_id IS NULL`))
       .groupBy(searchRecords.platformId)
       .all();
   }
@@ -257,20 +258,21 @@ export class DatabaseStorage implements IStorage {
     }
 
     const inIds = inArray(searchRecords.businessId, businessIds);
+    const ownOnly = sql`competitor_id IS NULL`;
 
     const totalSearches = db.select({ count: sql<number>`count(*)` })
       .from(searchRecords)
-      .where(inIds)
+      .where(and(inIds, ownOnly))
       .get();
 
     const totalMentions = db.select({ count: sql<number>`count(*)` })
       .from(searchRecords)
-      .where(and(inIds, eq(searchRecords.mentioned, 1)))
+      .where(and(inIds, ownOnly, eq(searchRecords.mentioned, 1)))
       .get();
 
     const avgPos = db.select({ avg: sql<number>`avg(position)` })
       .from(searchRecords)
-      .where(and(inIds, eq(searchRecords.mentioned, 1)))
+      .where(and(inIds, ownOnly, eq(searchRecords.mentioned, 1)))
       .get();
 
     const top = db.select({
@@ -281,7 +283,7 @@ export class DatabaseStorage implements IStorage {
     })
       .from(searchRecords)
       .innerJoin(platforms, eq(searchRecords.platformId, platforms.id))
-      .where(inIds)
+      .where(and(inIds, ownOnly))
       .groupBy(searchRecords.platformId)
       .orderBy(sql`mentions desc`)
       .limit(1)
@@ -293,13 +295,14 @@ export class DatabaseStorage implements IStorage {
 
     const thisWeek = db.select({ count: sql<number>`count(*)` })
       .from(searchRecords)
-      .where(and(inIds, eq(searchRecords.mentioned, 1), sql`${searchRecords.date} >= ${sevenAgo}`))
+      .where(and(inIds, ownOnly, eq(searchRecords.mentioned, 1), sql`${searchRecords.date} >= ${sevenAgo}`))
       .get();
 
     const lastWeek = db.select({ count: sql<number>`count(*)` })
       .from(searchRecords)
       .where(and(
         inIds,
+        ownOnly,
         eq(searchRecords.mentioned, 1),
         sql`${searchRecords.date} >= ${fourteenAgo}`,
         sql`${searchRecords.date} < ${sevenAgo}`,
@@ -344,7 +347,7 @@ export class DatabaseStorage implements IStorage {
       outliers: sql<number>`sum(case when ${searchRecords.crossValidated} = 0 then 1 else 0 end)`,
     })
       .from(searchRecords)
-      .where(eq(searchRecords.businessId, businessId))
+      .where(and(eq(searchRecords.businessId, businessId), sql`competitor_id IS NULL`))
       .groupBy(searchRecords.query)
       .all();
 
@@ -386,7 +389,7 @@ export class DatabaseStorage implements IStorage {
     })
       .from(searchRecords)
       .innerJoin(platforms, eq(searchRecords.platformId, platforms.id))
-      .where(eq(searchRecords.businessId, businessId))
+      .where(and(eq(searchRecords.businessId, businessId), sql`competitor_id IS NULL`))
       .groupBy(searchRecords.platformId)
       .all();
 

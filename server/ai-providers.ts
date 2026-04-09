@@ -175,6 +175,141 @@ function fallbackAnalysis(businessName: string, responseText: string): AnalysisR
   return { mentioned, sentiment, confidence: "low", position };
 }
 
+// ── Hallucination Detection ──────────────────────────────────────────────
+// After confirming a business IS mentioned, check if the AI fabricated any
+// facts about it (wrong location, made-up services, etc.)
+
+const HALLUCINATION_PROMPT = (
+  businessName: string,
+  facts: { location: string | null; website: string | null; services: string | null },
+  responseText: string,
+  platform: string,
+) => {
+  const knownFacts: string[] = [];
+  if (facts.location) knownFacts.push(`Location: ${facts.location}`);
+  if (facts.website) knownFacts.push(`Website: ${facts.website}`);
+  if (facts.services) knownFacts.push(`Services offered: ${facts.services}`);
+  const factsBlock = knownFacts.length > 0 ? knownFacts.join("\n") : "No verified facts available";
+
+  return `Check this ${platform} AI response about "${businessName}" for hallucinated or incorrect facts.
+
+Known facts about the business:
+${factsBlock}
+
+AI Response:
+"""
+${responseText.slice(0, 1500)}
+"""
+
+List ONLY concrete factual errors (wrong address/location, fabricated services not offered, made-up reviews/ratings, wrong website URL, confused with a different business). Ignore subjective claims or opinions.
+
+Respond with ONLY valid JSON:
+{"issues": ["issue 1", "issue 2"]}
+If no issues found: {"issues": []}`;
+};
+
+export async function detectHallucinations(
+  businessFacts: {
+    name: string;
+    location: string | null;
+    website: string | null;
+    services: string | null;
+  },
+  responseText: string,
+  platform: string,
+): Promise<{ hasHallucinations: boolean; issues: string[] }> {
+  const priority = ["google", "openai", "anthropic", "perplexity"];
+  const sortedKeys = [...analysisKeys].sort((a, b) => {
+    return priority.indexOf(a.provider) - priority.indexOf(b.provider);
+  });
+
+  const prompt = HALLUCINATION_PROMPT(businessFacts.name, businessFacts, responseText, platform);
+
+  for (const key of sortedKeys) {
+    try {
+      let analysisText = "";
+
+      if (key.provider === "google") {
+        const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key.apiKey}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: "You are a precise JSON-only fact-checking tool. Respond with valid JSON only, no markdown, no explanation." }] },
+            contents: [{ parts: [{ text: prompt }] }],
+          }),
+        });
+        if (!res.ok) continue;
+        const data = await res.json();
+        analysisText = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+      } else if (key.provider === "openai") {
+        const res = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: { "Authorization": `Bearer ${key.apiKey}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: "gpt-4o-mini",
+            max_completion_tokens: 256,
+            messages: [
+              { role: "system", content: "You are a precise JSON-only fact-checking tool. Respond with valid JSON only, no markdown, no explanation." },
+              { role: "user", content: prompt },
+            ],
+          }),
+        });
+        if (!res.ok) continue;
+        const data = await res.json();
+        analysisText = data.choices?.[0]?.message?.content ?? "";
+      } else if (key.provider === "anthropic") {
+        const res = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: { "x-api-key": key.apiKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: "claude-haiku-4-5-20251001",
+            max_tokens: 256,
+            system: "You are a precise JSON-only fact-checking tool. Respond with valid JSON only, no markdown, no explanation.",
+            messages: [{ role: "user", content: prompt }],
+          }),
+        });
+        if (!res.ok) continue;
+        const data = await res.json();
+        analysisText = Array.isArray(data.content)
+          ? data.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("")
+          : "";
+      } else if (key.provider === "perplexity") {
+        const res = await fetch("https://api.perplexity.ai/chat/completions", {
+          method: "POST",
+          headers: { "Authorization": `Bearer ${key.apiKey}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: "sonar",
+            max_tokens: 256,
+            messages: [
+              { role: "system", content: "You are a precise JSON-only fact-checking tool. Respond with valid JSON only, no markdown, no explanation." },
+              { role: "user", content: prompt },
+            ],
+          }),
+        });
+        if (!res.ok) continue;
+        const data = await res.json();
+        analysisText = data.choices?.[0]?.message?.content ?? "";
+      }
+
+      // Parse JSON from response (strip markdown code fences if present)
+      const cleaned = analysisText.replace(/```json?\s*/gi, "").replace(/```/g, "").trim();
+      const parsed = JSON.parse(cleaned);
+      const issues: string[] = Array.isArray(parsed.issues)
+        ? parsed.issues.filter((i: unknown) => typeof i === "string" && i.length > 0)
+        : [];
+
+      return { hasHallucinations: issues.length > 0, issues };
+    } catch (err: any) {
+      console.error(`[Hallucination Detection] ${key.provider} failed:`, err.message);
+      continue;
+    }
+  }
+
+  // Fallback: if all providers fail, assume no hallucinations
+  console.warn("[Hallucination Detection] All providers failed — returning clean");
+  return { hasHallucinations: false, issues: [] };
+}
+
 async function queryOpenAI(apiKey: string, query: string, businessName: string, extraTerms?: string[]): Promise<AIQueryResult> {
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",

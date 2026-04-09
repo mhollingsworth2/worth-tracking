@@ -48,6 +48,7 @@ export const searchRecords = sqliteTable("search_records", {
   confidence: text("confidence"),       // "high" | "medium" | "low"
   sourceType: text("source_type"),      // "grounded" (web search) | "knowledge" (training data only)
   crossValidated: integer("cross_validated"), // 1 = agreed with majority, 0 = outlier, null = not validated
+  competitorId: integer("competitor_id"),    // null = your business, set = competitor being tracked
   date: text("date").notNull(),
 });
 
@@ -116,6 +117,7 @@ export const aiSnapshots = sqliteTable("ai_snapshots", {
   sentiment: text("sentiment").notNull(),
   mentionedAccurate: integer("mentioned_accurate").notNull().default(1),
   flaggedIssues: text("flagged_issues"),
+  hallucinationCount: integer("hallucination_count").notNull().default(0),
   date: text("date").notNull(),
 });
 

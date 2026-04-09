@@ -1125,12 +1125,19 @@ function CompetitorsSection({ businessId, competitors, stats }: { businessId: nu
   const [website, setWebsite] = useState("");
   const { toast } = useToast();
 
+  const { data: compVisibility } = useQuery<any[]>({
+    queryKey: ["/api/businesses", businessId, "competitor-visibility"],
+    queryFn: async () => { const res = await fetch(`/api/businesses/${businessId}/competitor-visibility`); return res.json(); },
+    enabled: competitors.length > 0,
+  });
+
   const addMutation = useMutation({
     mutationFn: async () => {
       await apiRequest("POST", `/api/businesses/${businessId}/competitors`, { name, website: website || null, businessId });
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["/api/businesses", businessId, "competitors"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/businesses", businessId, "competitor-visibility"] });
       setName("");
       setWebsite("");
       toast({ title: "Competitor added" });
@@ -1143,10 +1150,12 @@ function CompetitorsSection({ businessId, competitors, stats }: { businessId: nu
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["/api/businesses", businessId, "competitors"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/businesses", businessId, "competitor-visibility"] });
     },
   });
 
   const myMentionRate = stats?.mentionRate ?? 0;
+  const hasCompVisData = compVisibility && compVisibility.some((c: any) => c.totalQueries > 0);
 
   return (
     <>
@@ -1185,35 +1194,58 @@ function CompetitorsSection({ businessId, competitors, stats }: { businessId: nu
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium">Mention Rate Comparison<InfoTip text="Side-by-side comparison of how often each competitor gets mentioned versus your business. If a competitor has a higher rate, they're more visible to AI users." /></CardTitle>
-            <CardDescription className="text-xs">Your mention rate vs competitors (simulated)</CardDescription>
+            <CardDescription className="text-xs">Your mention rate vs competitors across AI platforms</CardDescription>
           </CardHeader>
           <CardContent>
-            <div className="space-y-4">
-              <div className="flex items-center gap-3">
-                <span className="text-sm font-medium w-32 truncate">You</span>
-                <div className="flex-1 h-6 bg-muted rounded-full overflow-hidden">
-                  <div className="h-full bg-primary rounded-full flex items-center justify-end pr-2" style={{ width: `${myMentionRate}%` }}>
-                    <span className="text-xs font-medium text-primary-foreground">{myMentionRate}%</span>
+            {hasCompVisData ? (
+              <div className="space-y-4">
+                <div className="flex items-center gap-3">
+                  <span className="text-sm font-medium w-32 truncate">You</span>
+                  <div className="flex-1 h-6 bg-muted rounded-full overflow-hidden">
+                    <div className="h-full bg-primary rounded-full flex items-center justify-end pr-2" style={{ width: `${Math.max(myMentionRate, 2)}%` }}>
+                      <span className="text-xs font-medium text-primary-foreground">{myMentionRate}%</span>
+                    </div>
                   </div>
                 </div>
-              </div>
-              {competitors.map((comp) => {
-                const simulatedRate = Math.max(10, Math.min(90, myMentionRate + Math.floor(Math.random() * 30) - 15));
-                return (
-                  <div key={comp.id} className="flex items-center gap-3" data-testid={`competitor-${comp.id}`}>
-                    <span className="text-sm w-32 truncate">{comp.name}</span>
-                    <div className="flex-1 h-6 bg-muted rounded-full overflow-hidden">
-                      <div className="h-full bg-chart-2 rounded-full flex items-center justify-end pr-2" style={{ width: `${simulatedRate}%` }}>
-                        <span className="text-xs font-medium">{simulatedRate}%</span>
+                {competitors.map((comp) => {
+                  const vis = compVisibility?.find((c: any) => c.competitorId === comp.id);
+                  const compRate = vis?.mentionRate ?? 0;
+                  const isHigher = compRate > myMentionRate;
+                  return (
+                    <div key={comp.id} data-testid={`competitor-${comp.id}`}>
+                      <div className="flex items-center gap-3">
+                        <span className="text-sm w-32 truncate">{comp.name}</span>
+                        <div className="flex-1 h-6 bg-muted rounded-full overflow-hidden">
+                          <div
+                            className={`h-full rounded-full flex items-center justify-end pr-2 ${isHigher ? "bg-destructive/80" : "bg-emerald-500/80"}`}
+                            style={{ width: `${Math.max(compRate, 2)}%` }}
+                          >
+                            <span className="text-xs font-medium text-white">{compRate}%</span>
+                          </div>
+                        </div>
+                        <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={() => deleteMutation.mutate(comp.id)} data-testid={`button-delete-competitor-${comp.id}`}>
+                          <X className="w-3.5 h-3.5" />
+                        </Button>
                       </div>
+                      {vis && vis.platformBreakdown.length > 0 && (
+                        <div className="ml-32 pl-3 mt-1 flex flex-wrap gap-2">
+                          {vis.platformBreakdown.map((pb: any) => (
+                            <span key={pb.platformName} className="inline-flex items-center gap-1 text-[10px] text-muted-foreground">
+                              <span className="w-2 h-2 rounded-full inline-block" style={{ backgroundColor: pb.color }} />
+                              {pb.platformName}: {pb.mentionRate}%
+                            </span>
+                          ))}
+                        </div>
+                      )}
                     </div>
-                    <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={() => deleteMutation.mutate(comp.id)} data-testid={`button-delete-competitor-${comp.id}`}>
-                      <X className="w-3.5 h-3.5" />
-                    </Button>
-                  </div>
-                );
-              })}
-            </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="text-center py-4">
+                <p className="text-sm text-muted-foreground">Competitor scans run automatically -- data will appear after the next scan</p>
+              </div>
+            )}
           </CardContent>
         </Card>
       )}
@@ -1225,15 +1257,23 @@ function CompetitorsSection({ businessId, competitors, stats }: { businessId: nu
           </CardHeader>
           <CardContent>
             <div className="space-y-2">
-              {competitors.map((comp) => (
-                <div key={comp.id} className="flex items-center justify-between border rounded-lg p-3">
-                  <div>
-                    <p className="text-sm font-medium">{comp.name}</p>
-                    {comp.website && <p className="text-xs text-muted-foreground">{comp.website}</p>}
-                    {comp.notes && <p className="text-xs text-muted-foreground mt-0.5">{comp.notes}</p>}
+              {competitors.map((comp) => {
+                const vis = compVisibility?.find((c: any) => c.competitorId === comp.id);
+                return (
+                  <div key={comp.id} className="flex items-center justify-between border rounded-lg p-3">
+                    <div>
+                      <p className="text-sm font-medium">{comp.name}</p>
+                      {comp.website && <p className="text-xs text-muted-foreground">{comp.website}</p>}
+                      {comp.notes && <p className="text-xs text-muted-foreground mt-0.5">{comp.notes}</p>}
+                      {vis && vis.totalQueries > 0 && (
+                        <p className="text-xs text-muted-foreground mt-1">
+                          {vis.mentions}/{vis.totalQueries} mentions | Avg position: {vis.avgPosition ?? "N/A"}
+                        </p>
+                      )}
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </CardContent>
         </Card>

@@ -10,7 +10,7 @@ import {
   insertCompetitorSchema, insertAlertSchema, insertLocationSchema,
 } from "@shared/schema";
 import { sql } from "drizzle-orm";
-import { runScan, testApiKey, generateScanQueries, detectCompetitors, setAnalysisKeys, PROVIDER_COST_PER_CALL, type BusinessContext } from "./ai-providers";
+import { runScan, testApiKey, generateScanQueries, detectCompetitors, setAnalysisKeys, detectHallucinations, PROVIDER_COST_PER_CALL, type BusinessContext } from "./ai-providers";
 import { generateDemoData, clearDemoData } from "./demo-data";
 import { requireAuth, requireAdmin, createSession, deleteSession, getSession } from "./auth";
 import bcrypt from "bcryptjs";
@@ -151,6 +151,24 @@ async function autoScanBusiness(businessId: number) {
       if (result.confidence === "low") issues.push("Low confidence analysis");
       if (result.crossValidated === false) issues.push("Outlier: disagrees with other platforms");
 
+      // Hallucination detection — only when business is mentioned
+      let hallucinationCount = 0;
+      if (result.mentioned && result.responseText) {
+        try {
+          const halCheck = await detectHallucinations(
+            { name: biz.name, location: biz.location ?? null, website: biz.website ?? null, services: (biz as any).services ?? null },
+            result.responseText,
+            result.platform
+          );
+          if (halCheck.hasHallucinations) {
+            hallucinationCount = halCheck.issues.length;
+            issues.push(...halCheck.issues.map(i => `Hallucination: ${i}`));
+          }
+        } catch (err: any) {
+          console.error(`[Auto-Scan] Hallucination check failed:`, err.message);
+        }
+      }
+
       if (result.responseText) {
         await storage.createAiSnapshot({
           businessId,
@@ -159,7 +177,8 @@ async function autoScanBusiness(businessId: number) {
           responseText: result.responseText,
           sentiment: result.sentiment,
           mentionedAccurate: result.mentioned ? 1 : 0,
-          flaggedIssues: issues.length > 0 ? issues.join("; ") : null,
+          flaggedIssues: issues.length > 0 ? JSON.stringify(issues) : null,
+          hallucinationCount,
           date: dateStr,
         });
       }
@@ -174,6 +193,57 @@ async function autoScanBusiness(businessId: number) {
     });
 
     console.log(`[Auto-Scan] Finished "${biz.name}": ${completed} queries, ${mentionCount} mentions`);
+
+    // ── Competitor scanning ──────────────────────────────────────────────────
+    const comps = await storage.getCompetitors(businessId);
+    const compSubset = comps.slice(0, 5); // limit to 5 competitors
+    const compQueries = queries.slice(0, 8); // use first 8 representative queries
+
+    for (const comp of compSubset) {
+      console.log(`[Auto-Scan] Scanning competitor "${comp.name}" for "${biz.name}"`);
+      try {
+        for await (const result of runScan(comp.name, compQueries, keyInputs, [])) {
+          const platformId = platformMap[result.platform] ?? 1;
+          const dateStr = new Date().toISOString().split("T")[0];
+
+          await storage.createSearchRecord({
+            businessId,
+            platformId,
+            query: result.query,
+            mentioned: result.mentioned ? 1 : 0,
+            position: result.position,
+            sentiment: result.sentiment,
+            confidence: result.confidence,
+            sourceType: result.sourceType,
+            crossValidated: result.crossValidated === null ? null : result.crossValidated ? 1 : 0,
+            competitorId: comp.id,
+            date: dateStr,
+          });
+
+          // Track API cost for competitor scans too
+          const providerKey = keyInputs.find(k => {
+            const pMap: Record<string, string> = { openai: "ChatGPT", anthropic: "Claude", google: "Google Gemini", perplexity: "Perplexity" };
+            return pMap[k.provider] === result.platform;
+          });
+          if (providerKey) {
+            const baseCost = PROVIDER_COST_PER_CALL[providerKey.provider] ?? 0.005;
+            const analysisCost = 0.001;
+            const cost = baseCost + analysisCost;
+            db.insert(apiUsage).values({
+              provider: providerKey.provider,
+              estimatedCost: cost.toFixed(6),
+              date: dateStr,
+              timestamp: new Date().toISOString(),
+            }).run();
+          }
+          // Skip AI snapshots for competitor scans (saves API cost)
+        }
+        console.log(`[Auto-Scan] Finished competitor "${comp.name}" for "${biz.name}"`);
+      } catch (compErr: any) {
+        console.error(`[Auto-Scan] Error scanning competitor "${comp.name}":`, compErr.message);
+      }
+    }
+
   } catch (err: any) {
     console.error(`[Auto-Scan] Error for business ${businessId}:`, err.message);
   }
@@ -303,6 +373,7 @@ export async function registerRoutes(
   try { db.run(sql`ALTER TABLE search_records ADD COLUMN confidence TEXT`); } catch (_e) { /* exists */ }
   try { db.run(sql`ALTER TABLE search_records ADD COLUMN source_type TEXT`); } catch (_e) { /* exists */ }
   try { db.run(sql`ALTER TABLE search_records ADD COLUMN cross_validated INTEGER`); } catch (_e) { /* exists */ }
+  try { db.run(sql`ALTER TABLE search_records ADD COLUMN competitor_id INTEGER`); } catch (_e) { /* exists */ }
 
   db.run(sql`CREATE TABLE IF NOT EXISTS optimized_prompts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -867,6 +938,80 @@ export async function registerRoutes(
     res.json(result);
   });
 
+  app.get("/api/businesses/:id/competitor-visibility", async (req, res) => {
+    const businessId = parseInt(req.params.id);
+    const allPlatforms = await storage.getPlatforms();
+    const platformMap = Object.fromEntries(allPlatforms.map((p) => [p.id, p]));
+    const comps = await storage.getCompetitors(businessId);
+
+    // Fetch all competitor search records for this business
+    const rows = db.select({
+      competitorId: sql<number>`competitor_id`,
+      platformId: searchRecords.platformId,
+      total: sql<number>`count(*)`,
+      mentions: sql<number>`sum(case when mentioned = 1 then 1 else 0 end)`,
+      avgPosition: sql<number>`avg(case when mentioned = 1 then position end)`,
+    })
+      .from(searchRecords)
+      .where(sql`business_id = ${businessId} AND competitor_id IS NOT NULL`)
+      .groupBy(sql`competitor_id, platform_id`)
+      .all();
+
+    // Group by competitor
+    const compMap = new Map<number, {
+      competitorId: number;
+      competitorName: string;
+      totalQueries: number;
+      mentions: number;
+      platformBreakdown: { platformName: string; mentionRate: number; color: string }[];
+      positionSum: number;
+      positionCount: number;
+    }>();
+
+    for (const comp of comps) {
+      compMap.set(comp.id, {
+        competitorId: comp.id,
+        competitorName: comp.name,
+        totalQueries: 0,
+        mentions: 0,
+        platformBreakdown: [],
+        positionSum: 0,
+        positionCount: 0,
+      });
+    }
+
+    for (const row of rows) {
+      const entry = compMap.get(row.competitorId);
+      if (!entry) continue;
+      entry.totalQueries += row.total;
+      entry.mentions += row.mentions;
+      if (row.avgPosition) {
+        entry.positionSum += row.avgPosition * row.mentions;
+        entry.positionCount += row.mentions;
+      }
+      const plat = platformMap[row.platformId];
+      if (plat) {
+        entry.platformBreakdown.push({
+          platformName: plat.name,
+          mentionRate: row.total > 0 ? Math.round((row.mentions / row.total) * 100) : 0,
+          color: plat.color,
+        });
+      }
+    }
+
+    const result = Array.from(compMap.values()).map((e) => ({
+      competitorId: e.competitorId,
+      competitorName: e.competitorName,
+      mentionRate: e.totalQueries > 0 ? Math.round((e.mentions / e.totalQueries) * 100) : 0,
+      avgPosition: e.positionCount > 0 ? Math.round((e.positionSum / e.positionCount) * 10) / 10 : null,
+      totalQueries: e.totalQueries,
+      mentions: e.mentions,
+      platformBreakdown: e.platformBreakdown.sort((a, b) => b.mentionRate - a.mentionRate),
+    }));
+
+    res.json(result);
+  });
+
   app.post("/api/businesses/:id/competitors", async (req, res) => {
     const businessId = parseInt(req.params.id);
     const parsed = insertCompetitorSchema.safeParse({ ...req.body, businessId });
@@ -1366,6 +1511,24 @@ Extract real information from the content. If a field isn't clear from the websi
         if (result.confidence === "low") issues.push("Low confidence analysis");
         if (result.crossValidated === false) issues.push("Outlier: disagrees with other platforms");
 
+        // Hallucination detection — only when business is mentioned
+        let hallucinationCount = 0;
+        if (result.mentioned && result.responseText) {
+          try {
+            const halCheck = await detectHallucinations(
+              { name: business.name, location: business.location ?? null, website: business.website ?? null, services: (business as any).services ?? null },
+              result.responseText,
+              result.platform
+            );
+            if (halCheck.hasHallucinations) {
+              hallucinationCount = halCheck.issues.length;
+              issues.push(...halCheck.issues.map(i => `Hallucination: ${i}`));
+            }
+          } catch (err: any) {
+            console.error(`[Scan] Hallucination check failed:`, err.message);
+          }
+        }
+
         if (result.responseText) {
           await storage.createAiSnapshot({
             businessId,
@@ -1374,7 +1537,8 @@ Extract real information from the content. If a field isn't clear from the websi
             responseText: result.responseText,
             sentiment: result.sentiment,
             mentionedAccurate: result.mentioned ? 1 : 0,
-            flaggedIssues: issues.length > 0 ? issues.join("; ") : null,
+            flaggedIssues: issues.length > 0 ? JSON.stringify(issues) : null,
+            hallucinationCount,
             date: dateStr,
           });
         }
