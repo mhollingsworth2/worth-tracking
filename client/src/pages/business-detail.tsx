@@ -14,6 +14,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Switch as SwitchUI } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import {
   ArrowLeft, Eye, TrendingUp, Hash, Layers, Trash2,
   CheckCircle, XCircle, Lightbulb, Target, MapPin, MessageSquare, Star, Search,
@@ -425,6 +426,23 @@ export default function BusinessDetail() {
     },
   });
 
+  // Diagnostic test state
+  const [diagOpen, setDiagOpen] = useState(false);
+  const [diagResults, setDiagResults] = useState<any>(null);
+  const diagMutation = useMutation({
+    mutationFn: async () => {
+      const res = await apiRequest("GET", `/api/businesses/${id}/diagnostic`);
+      return res.json();
+    },
+    onSuccess: (data) => {
+      setDiagResults(data);
+      setDiagOpen(true);
+    },
+    onError: (err: any) => {
+      toast({ title: "Diagnostic failed", description: err.message, variant: "destructive" });
+    },
+  });
+
   const getPlatformName = (platformId: number) =>
     allPlatforms?.find((p) => p.id === platformId)?.name ?? "Unknown";
 
@@ -493,6 +511,15 @@ export default function BusinessDetail() {
             >
               {scanMutation.isPending ? <Loader2 className="w-4 h-4 mr-1.5 animate-spin" /> : <Zap className="w-4 h-4 mr-1.5" />}
               {scanMutation.isPending ? "Scanning..." : "Run AI Scan"}
+            </Button>
+            <Button
+              variant="outline" size="sm"
+              onClick={() => diagMutation.mutate()}
+              disabled={diagMutation.isPending}
+              data-testid="button-diagnostic"
+            >
+              {diagMutation.isPending ? <Loader2 className="w-4 h-4 mr-1.5 animate-spin" /> : <Search className="w-4 h-4 mr-1.5" />}
+              {diagMutation.isPending ? "Testing..." : "Test Visibility"}
             </Button>
             <Button
               variant="outline" size="sm"
@@ -1286,6 +1313,95 @@ export default function BusinessDetail() {
           onOpenChange={setSnippetOpen}
         />
       )}
+
+      {/* Diagnostic results dialog */}
+      <Dialog open={diagOpen} onOpenChange={setDiagOpen}>
+        <DialogContent className="max-w-3xl max-h-[80vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>Visibility Diagnostic</DialogTitle>
+            <DialogDescription>
+              Live test showing what each AI platform returns when asked about your business.
+              This is exactly what a real user would see.
+            </DialogDescription>
+          </DialogHeader>
+          {diagResults && (
+            <div className="space-y-6">
+              <div className="text-sm text-muted-foreground">
+                Platforms tested: <span className="font-medium text-foreground">{diagResults.platformsConfigured?.join(", ")}</span>
+              </div>
+
+              {/* Direct query results */}
+              <div>
+                <h3 className="font-semibold text-sm mb-1">Direct Query (asked about your business by name)</h3>
+                <p className="text-xs text-muted-foreground mb-3 italic">"{diagResults.directQuery?.query}"</p>
+                <div className="space-y-3">
+                  {diagResults.directQuery?.results?.map((r: any, i: number) => (
+                    <Card key={i} className={r.mentioned ? "border-green-500/50 bg-green-500/5" : "border-red-500/50 bg-red-500/5"}>
+                      <CardContent className="p-3">
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="font-medium text-sm">{r.platform}</span>
+                          <div className="flex items-center gap-2">
+                            {r.nameFoundInResponse ? (
+                              <Badge variant="outline" className="text-green-600 border-green-600"><CheckCircle className="w-3 h-3 mr-1" /> Name Found</Badge>
+                            ) : (
+                              <Badge variant="outline" className="text-red-600 border-red-600"><XCircle className="w-3 h-3 mr-1" /> Name Not Found</Badge>
+                            )}
+                            {r.mentioned ? (
+                              <Badge className="bg-green-600">Mentioned</Badge>
+                            ) : (
+                              <Badge variant="destructive">Not Mentioned</Badge>
+                            )}
+                          </div>
+                        </div>
+                        <p className="text-xs text-muted-foreground leading-relaxed whitespace-pre-wrap">{r.responsePreview}{r.responseLength > 500 ? "..." : ""}</p>
+                        <p className="text-[10px] text-muted-foreground mt-1">{r.responseLength} chars total</p>
+                      </CardContent>
+                    </Card>
+                  ))}
+                </div>
+              </div>
+
+              {/* Discovery query results */}
+              <div>
+                <h3 className="font-semibold text-sm mb-1">Discovery Query (didn't mention your business name)</h3>
+                <p className="text-xs text-muted-foreground mb-3 italic">"{diagResults.discoveryQuery?.query}"</p>
+                <div className="space-y-3">
+                  {diagResults.discoveryQuery?.results?.map((r: any, i: number) => (
+                    <Card key={i} className={r.mentioned ? "border-green-500/50 bg-green-500/5" : "border-red-500/50 bg-red-500/5"}>
+                      <CardContent className="p-3">
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="font-medium text-sm">{r.platform}</span>
+                          <div className="flex items-center gap-2">
+                            {r.nameFoundInResponse ? (
+                              <Badge variant="outline" className="text-green-600 border-green-600"><CheckCircle className="w-3 h-3 mr-1" /> Name Found</Badge>
+                            ) : (
+                              <Badge variant="outline" className="text-red-600 border-red-600"><XCircle className="w-3 h-3 mr-1" /> Name Not Found</Badge>
+                            )}
+                            {r.mentioned ? (
+                              <Badge className="bg-green-600">Mentioned</Badge>
+                            ) : (
+                              <Badge variant="destructive">Not Mentioned</Badge>
+                            )}
+                          </div>
+                        </div>
+                        <p className="text-xs text-muted-foreground leading-relaxed whitespace-pre-wrap">{r.responsePreview}{r.responseLength > 500 ? "..." : ""}</p>
+                        <p className="text-[10px] text-muted-foreground mt-1">{r.responseLength} chars total</p>
+                      </CardContent>
+                    </Card>
+                  ))}
+                </div>
+              </div>
+
+              <div className="text-xs text-muted-foreground border-t pt-3">
+                <strong>How to read this:</strong> The "Direct Query" asks about your business by name — most platforms should mention you here.
+                The "Discovery Query" asks for the best businesses in your industry without naming you — this tests whether AI platforms independently recommend you.
+                <br /><br />
+                <strong>Search variants checked:</strong> {diagResults.directQuery?.results?.[0]?.searchVariantsUsed?.map((v: string) => `"${v}"`).join(", ")}
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
     </ScrollArea>
   );
 }
