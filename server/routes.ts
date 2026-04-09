@@ -1231,7 +1231,6 @@ Extract real information from the content. If a field isn't clear from the websi
         timestamp: new Date().toISOString(),
       }).run();
 
-      res.json({
       // If AI didn't return competitors, try dedicated competitor detection
       let competitorsStr = result.competitors || "";
       if (!competitorsStr && result.name && result.industry) {
