@@ -257,9 +257,68 @@ export async function testApiKey(provider: string, apiKey: string): Promise<{ su
   }
 }
 
-export function generateScanQueries(businessName: string, industry: string, location: string | null): string[] {
+export interface ScanQueryContext {
+  serviceCategories?: string | null;  // JSON array string or comma-separated
+  targetAudience?: string | null;
+  keyDifferentiators?: string | null;
+  customQueries?: Array<{ query: string; priority?: string | null; category?: string | null }>;
+  serviceAreas?: Array<{ primaryMarket?: string | null; regionalSpecialties?: string | null }>;
+  contentInventory?: Array<{ title?: string | null; keywords?: string | null; contentType?: string | null }>;
+}
+
+export function generateScanQueries(
+  businessName: string,
+  industry: string,
+  location: string | null,
+  context: ScanQueryContext = {}
+): string[] {
   const ind = industry.toLowerCase();
   const loc = location ?? null;
+
+  // ── Custom queries (highest priority — user-defined) ─────────────────────
+  // Sort by priority: high → medium → low → undefined
+  const priorityOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
+  const sortedCustom = [...(context.customQueries ?? [])].sort((a, b) => {
+    const pa = priorityOrder[a.priority ?? ""] ?? 3;
+    const pb = priorityOrder[b.priority ?? ""] ?? 3;
+    return pa - pb;
+  });
+  const custom: string[] = sortedCustom.map((cq) => cq.query);
+
+  // ── Parse service categories for targeted queries ─────────────────────────
+  let serviceList: string[] = [];
+  if (context.serviceCategories) {
+    try {
+      const parsed = JSON.parse(context.serviceCategories);
+      if (Array.isArray(parsed)) serviceList = parsed.map(String).filter(Boolean);
+    } catch {
+      // Treat as comma-separated plain text
+      serviceList = context.serviceCategories.split(",").map((s) => s.trim()).filter(Boolean);
+    }
+  }
+
+  // ── Service-specific queries ──────────────────────────────────────────────
+  const serviceSpecific: string[] = serviceList.slice(0, 3).flatMap((svc) => [
+    `best ${svc} services${loc ? ` in ${loc}` : ""}`,
+    `${businessName} ${svc} — is it good?`,
+  ]);
+
+  // ── Target-audience queries ───────────────────────────────────────────────
+  const audienceQueries: string[] = [];
+  if (context.targetAudience) {
+    audienceQueries.push(
+      `best ${ind} for ${context.targetAudience}`,
+      `${ind} services recommended for ${context.targetAudience}`,
+    );
+  }
+
+  // ── Differentiator queries ────────────────────────────────────────────────
+  const differentiatorQueries: string[] = [];
+  if (context.keyDifferentiators) {
+    differentiatorQueries.push(
+      `${ind} companies known for ${context.keyDifferentiators}`,
+    );
+  }
 
   // ── Discovery queries (intent: find options) ──────────────────────────────
   const discovery: string[] = [
@@ -300,6 +359,26 @@ export function generateScanQueries(businessName: string, industry: string, loca
         `Local ${ind} providers with good reviews`,
       ];
 
+  // ── Service-area queries for multi-location businesses ────────────────────
+  const serviceAreaQueries: string[] = (context.serviceAreas ?? [])
+    .filter((sa) => sa.primaryMarket)
+    .slice(0, 3)
+    .map((sa) => `best ${ind} in ${sa.primaryMarket}`);
+
+  // ── Content-gap queries based on inventory keywords ───────────────────────
+  const contentGapQueries: string[] = [];
+  for (const item of (context.contentInventory ?? []).slice(0, 5)) {
+    if (!item.keywords) continue;
+    try {
+      const kws: string[] = JSON.parse(item.keywords);
+      if (Array.isArray(kws) && kws.length > 0) {
+        contentGapQueries.push(`${kws[0]} — best options and recommendations`);
+      }
+    } catch {
+      // skip malformed JSON
+    }
+  }
+
   // ── Long-tail queries (3+ words, specific intent) ─────────────────────────
   const longTail: string[] = [
     `affordable ${ind} services with good customer support`,
@@ -317,8 +396,14 @@ export function generateScanQueries(businessName: string, industry: string, loca
     `${businessName} — is it still a good choice in ${currentYear}?`,
   ];
 
-  // Combine all categories, deduplicate, and cap at 20
+  // Combine: custom queries first (they are highest priority), then auto-generated
   const all = [
+    ...custom,
+    ...serviceSpecific,
+    ...audienceQueries,
+    ...differentiatorQueries,
+    ...serviceAreaQueries,
+    ...contentGapQueries,
     ...discovery,
     ...comparison,
     ...review,
@@ -338,5 +423,6 @@ export function generateScanQueries(businessName: string, industry: string, loca
     }
   }
 
-  return unique.slice(0, 20);
+  // Cap at 25 to allow room for custom queries without crowding out auto-generated ones
+  return unique.slice(0, 25);
 }
