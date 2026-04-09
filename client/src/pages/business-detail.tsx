@@ -93,8 +93,24 @@ const contentTypeLabel: Record<string, string> = {
 
 const priorityOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
 
-function KPICard({ label, value, subtitle, icon: Icon, loading, tooltip }: {
-  label: string; value: string | number; subtitle?: string; icon: any; loading: boolean; tooltip?: string;
+function getGrade(rate: number): { grade: string; color: string; label: string } {
+  if (rate >= 90) return { grade: "A+", color: "text-emerald-600", label: "Excellent" };
+  if (rate >= 80) return { grade: "A", color: "text-emerald-600", label: "Great" };
+  if (rate >= 70) return { grade: "B+", color: "text-emerald-500", label: "Good" };
+  if (rate >= 60) return { grade: "B", color: "text-blue-600", label: "Above Average" };
+  if (rate >= 50) return { grade: "C+", color: "text-amber-500", label: "Average" };
+  if (rate >= 40) return { grade: "C", color: "text-amber-600", label: "Below Average" };
+  if (rate >= 25) return { grade: "D", color: "text-orange-600", label: "Poor" };
+  return { grade: "F", color: "text-destructive", label: "Critical" };
+}
+
+function TrafficLight({ rate }: { rate: number }) {
+  const color = rate >= 70 ? "bg-emerald-500" : rate >= 40 ? "bg-amber-500" : "bg-destructive";
+  return <span className={`inline-block w-2.5 h-2.5 rounded-full ${color}`} />;
+}
+
+function KPICard({ label, value, subtitle, icon: Icon, loading, tooltip, trafficLightRate }: {
+  label: string; value: string | number; subtitle?: string; icon: any; loading: boolean; tooltip?: string; trafficLightRate?: number;
 }) {
   return (
     <Card>
@@ -106,7 +122,10 @@ function KPICard({ label, value, subtitle, icon: Icon, loading, tooltip }: {
           <span className="text-xs text-muted-foreground font-medium">{label}{tooltip && <InfoTip text={tooltip} />}</span>
         </div>
         {loading ? <Skeleton className="h-7 w-20" /> : (
-          <p className="text-lg font-semibold" data-testid={`text-kpi-${label.toLowerCase().replace(/\s/g, "-")}`}>{value}</p>
+          <p className="text-lg font-semibold flex items-center gap-2" data-testid={`text-kpi-${label.toLowerCase().replace(/\s/g, "-")}`}>
+            {value}
+            {trafficLightRate !== undefined && <TrafficLight rate={trafficLightRate} />}
+          </p>
         )}
         {subtitle && <p className="text-xs text-muted-foreground mt-0.5">{subtitle}</p>}
       </CardContent>
@@ -521,10 +540,10 @@ export default function BusinessDetail() {
 
         {/* KPIs */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          <KPICard label="Total Searches" value={stats?.totalSearches ?? 0} icon={Search} loading={statsLoading} tooltip="How many times AI platforms were queried with searches relevant to your business." />
-          <KPICard label="AI Mentions" value={stats?.totalMentions ?? 0} icon={Eye} loading={statsLoading} tooltip="How many of those searches resulted in the AI actually mentioning your business by name." />
-          <KPICard label="Mention Rate" value={`${stats?.mentionRate ?? 0}%`} icon={TrendingUp} loading={statsLoading} subtitle="Of all searches" tooltip="The percentage of AI searches where your business was mentioned. Higher is better — aim for 50%+." />
-          <KPICard label="Avg Position" value={stats?.avgPosition ?? "N/A"} icon={Hash} loading={statsLoading} subtitle="When mentioned" tooltip="When your business is mentioned, where it appears in the AI's response. 1 means you're mentioned first." />
+          <KPICard label="Total Searches" value={stats?.totalSearches ?? 0} icon={Search} loading={statsLoading} tooltip="How many times AI platforms were queried with searches relevant to your business." subtitle={`Your business was tested across ${stats?.totalSearches ?? 0} AI queries`} />
+          <KPICard label="AI Mentions" value={stats?.totalMentions ?? 0} icon={Eye} loading={statsLoading} tooltip="How many of those searches resulted in the AI actually mentioning your business by name." subtitle={`Your business was recommended ${stats?.totalMentions ?? 0} times across all AI platforms`} />
+          <KPICard label="AI Visibility Score" value={`${stats?.mentionRate ?? 0}%`} icon={TrendingUp} loading={statsLoading} subtitle={`This means ${Math.round((stats?.mentionRate ?? 0) / 10)} out of every 10 AI users see your business`} tooltip="The percentage of AI search queries where your business is mentioned. Higher is better — top businesses typically score 60%+." trafficLightRate={stats?.mentionRate ?? 0} />
+          <KPICard label="Avg Position" value={stats?.avgPosition ?? "N/A"} icon={Hash} loading={statsLoading} subtitle={stats?.avgPosition ? `When mentioned, you typically appear #${stats.avgPosition} in the response` : "Not yet mentioned"} tooltip="When AI mentions your business, this is where you typically appear in the response. #1 means you're mentioned first." />
         </div>
 
         <Tabs defaultValue="overview">
@@ -560,6 +579,29 @@ export default function BusinessDetail() {
 
           {/* ========== OVERVIEW TAB ========== */}
           <TabsContent value="overview" className="space-y-6 mt-4">
+            {/* Executive Summary */}
+            {stats && (
+              <Card className="border-primary/20 bg-primary/5">
+                <CardContent className="p-5">
+                  <div className="flex items-center gap-3 mb-2">
+                    <span className={`text-3xl font-bold ${getGrade(stats.mentionRate ?? 0).color}`}>
+                      {getGrade(stats.mentionRate ?? 0).grade}
+                    </span>
+                    <div>
+                      <p className="text-sm font-semibold">Your AI Visibility Score</p>
+                      <p className="text-xs text-muted-foreground">{stats.mentionRate ?? 0}% mention rate across all platforms</p>
+                    </div>
+                  </div>
+                  <p className="text-sm text-muted-foreground leading-relaxed">
+                    {(stats.mentionRate ?? 0) >= 70
+                      ? `Great news! Your business appears in ${stats.mentionRate}% of AI searches. That means most people asking AI assistants about your industry will see your name.`
+                      : (stats.mentionRate ?? 0) >= 40
+                      ? `Your business shows up in ${stats.mentionRate}% of AI searches — that's ${(stats.mentionRate ?? 0) >= 50 ? "about average" : "below average"}. There's room to improve your visibility so more potential customers find you.`
+                      : `Your business only appears in ${stats.mentionRate ?? 0}% of AI searches. Most people asking AI about your industry won't see your name. Focus on the recommendations below to improve.`}
+                  </p>
+                </CardContent>
+              </Card>
+            )}
             <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
               <Card className="lg:col-span-3">
                 <CardHeader className="pb-2">
@@ -650,7 +692,7 @@ export default function BusinessDetail() {
                 <CardHeader className="pb-2">
                   <CardTitle className="text-sm font-medium">
                     Platform Visibility Scores
-                    <InfoTip text="Composite score: 50% mention rate + 20% position + 15% cross-validation + 15% source reliability. Grounded (web search) platforms are weighted higher than knowledge-only." />
+                    <InfoTip text="Composite score: 50% visibility rate + 20% position + 15% cross-platform verification + 15% source reliability. Live web results are weighted higher than AI memory-only responses." />
                   </CardTitle>
                 </CardHeader>
                 <CardContent>
@@ -669,7 +711,7 @@ export default function BusinessDetail() {
                                 {v.isGrounded ? (
                                   <span className="text-[9px] px-1 py-0.5 rounded bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400 font-medium">LIVE WEB</span>
                                 ) : (
-                                  <span className="text-[9px] px-1 py-0.5 rounded bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400 font-medium">KNOWLEDGE</span>
+                                  <span className="text-[9px] px-1 py-0.5 rounded bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400 font-medium">AI MEMORY</span>
                                 )}
                               </div>
                               <span className="text-lg font-bold tabular-nums" style={{ color: v.color }}>{v.score}</span>
@@ -717,11 +759,11 @@ export default function BusinessDetail() {
                         <th className="pb-2 pr-4 font-medium">Query</th>
                         <th className="pb-2 pr-4 font-medium text-center">Runs</th>
                         <th className="pb-2 pr-4 font-medium text-center">Mentions</th>
-                        <th className="pb-2 pr-4 font-medium text-center">Rate</th>
-                        <th className="pb-2 pr-4 font-medium text-center">Avg Pos</th>
-                        <th className="pb-2 pr-4 font-medium text-center">Sentiment</th>
-                        <th className="pb-2 pr-4 font-medium text-center">Confidence</th>
-                        <th className="pb-2 pr-4 font-medium text-center">Validation</th>
+                        <th className="pb-2 pr-4 font-medium text-center">Rate<InfoTip text="The percentage of times your business was mentioned for this query. 100% means every AI platform mentioned you." /></th>
+                        <th className="pb-2 pr-4 font-medium text-center">Avg Pos<InfoTip text="Your average ranking position when mentioned. #1 means you're the first business the AI recommends." /></th>
+                        <th className="pb-2 pr-4 font-medium text-center">How AI Describes You</th>
+                        <th className="pb-2 pr-4 font-medium text-center">Confidence<InfoTip text="How sure we are about this result. High = very reliable, Medium = likely accurate, Low = take with a grain of salt." /></th>
+                        <th className="pb-2 pr-4 font-medium text-center">Verified<InfoTip text="Whether multiple AI platforms agreed on this result. A checkmark means platforms gave consistent answers." /></th>
                         <th className="pb-2 font-medium text-center">Platforms</th>
                       </tr>
                     </thead>
@@ -785,7 +827,7 @@ export default function BusinessDetail() {
                           <td className="py-2 pr-4 text-center">
                             <div className="flex items-center justify-center gap-1">
                               {q.crossValidated > 0 && (
-                                <span className="text-xs px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400" title="Cross-validated (platforms agree)">
+                                <span className="text-xs px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400" title="Verified (multiple platforms agree)">
                                   {q.crossValidated}<CheckCircle className="w-3 h-3 inline ml-0.5" />
                                 </span>
                               )}
@@ -803,8 +845,8 @@ export default function BusinessDetail() {
                             <div className="flex items-center justify-center gap-1">
                               <span className="tabular-nums">{q.platformsCovered}</span>
                               {q.groundedRuns > 0 && (
-                                <span className="text-[9px] px-1 py-0.5 rounded bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400" title={`${q.groundedRuns} grounded, ${q.knowledgeRuns} knowledge-only`}>
-                                  {q.groundedRuns}G
+                                <span className="text-[9px] px-1 py-0.5 rounded bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400" title={`${q.groundedRuns} live web results, ${q.knowledgeRuns} AI memory-only`}>
+                                  {q.groundedRuns}W
                                 </span>
                               )}
                             </div>
@@ -1329,7 +1371,7 @@ function QueryTrendsSection({ businessId }: { businessId: number }) {
                 tick={{ fontSize: 11 }}
                 domain={[0, 100]}
                 tickFormatter={(v: number) => `${v}%`}
-                label={{ value: "Mention Rate", angle: -90, position: "insideLeft", style: { fontSize: 11, fill: "hsl(var(--muted-foreground))" } }}
+                label={{ value: "AI Visibility Score", angle: -90, position: "insideLeft", style: { fontSize: 11, fill: "hsl(var(--muted-foreground))" } }}
               />
               {selectedQuery !== "__all__" && (
                 <YAxis
@@ -1344,7 +1386,7 @@ function QueryTrendsSection({ businessId }: { businessId: number }) {
               <Tooltip
                 contentStyle={{ fontSize: 12 }}
                 formatter={(value: number, name: string) => {
-                  if (name === "mentionRate") return [`${value}%`, "Mention Rate"];
+                  if (name === "mentionRate") return [`${value}%`, "AI Visibility Score"];
                   if (name === "avgPosition") return [value, "Avg Position"];
                   return [value, name];
                 }}
@@ -1459,7 +1501,7 @@ function CompetitorsSection({ businessId, competitors, stats }: { businessId: nu
       {competitors.length > 0 && (
         <Card>
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium">Mention Rate Comparison<InfoTip text="Side-by-side comparison of how often each competitor gets mentioned versus your business. If a competitor has a higher rate, they're more visible to AI users." /></CardTitle>
+            <CardTitle className="text-sm font-medium">AI Visibility Comparison<InfoTip text="Side-by-side comparison of how often each competitor gets mentioned versus your business. If a competitor has a higher score, they're more visible to AI users." /></CardTitle>
             <CardDescription className="text-xs">Your mention rate vs competitors across AI platforms</CardDescription>
           </CardHeader>
           <CardContent>
@@ -1837,7 +1879,7 @@ function CompetitorPromptIntel({ businessId }: { businessId: number }) {
                     {q.myAvgPosition && <span>Your avg position: #{q.myAvgPosition}</span>}
                     {q.mySentiment && (
                       <span className={q.mySentiment === "positive" ? "text-emerald-600" : q.mySentiment === "negative" ? "text-destructive" : ""}>
-                        Sentiment: {q.mySentiment}
+                        AI tone: {q.mySentiment}
                       </span>
                     )}
                   </div>
