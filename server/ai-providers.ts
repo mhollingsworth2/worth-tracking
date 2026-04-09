@@ -60,25 +60,6 @@ interface AnalysisResult {
   position: number | null;
 }
 
-const ANALYSIS_PROMPT = (businessName: string, query: string, responseText: string, businessContext?: { location?: string | null; website?: string | null; services?: string | null }) => {
-  const locHint = businessContext?.location ? ` in/near ${businessContext.location}` : "";
-  return `Does this AI response mention "${businessName}"${locHint}?
-
-Rules:
-- Count it as mentioned if the business name appears ANYWHERE in the response, even partially (e.g. "Helping Hands" counts for "Helping Hands Cleaning Services")
-- Count it as mentioned if the response discusses or recommends this business, even without using the exact full name
-- Do NOT require a website match or services match — just the name and approximate location
-- If the response is a generic "I can't help" or "search Google" message that doesn't mention the business specifically, mark as NOT mentioned
-
-Response to analyze:
-"""
-${responseText.slice(0, 3000)}
-"""
-
-Return ONLY valid JSON:
-{"mentioned": true/false, "position": number or null, "sentiment": "positive"/"neutral"/"negative", "confidence": "high"/"medium"/"low"}`;
-};
-
 // Keys available for analysis calls (populated from active API keys)
 let analysisKeys: { provider: string; apiKey: string }[] = [];
 
@@ -86,148 +67,87 @@ export function setAnalysisKeys(keys: { provider: string; apiKey: string }[]) {
   analysisKeys = keys;
 }
 
-async function analyzeWithAI(businessName: string, query: string, responseText: string, businessContext?: { location?: string | null; website?: string | null; services?: string | null }): Promise<AnalysisResult> {
-  // Try to use the cheapest available model for analysis
-  // Priority: Google (cheapest) > OpenAI > Anthropic > Perplexity
-  const priority = ["google", "openai", "anthropic", "perplexity"];
-  const sortedKeys = [...analysisKeys].sort((a, b) => {
-    return priority.indexOf(a.provider) - priority.indexOf(b.provider);
-  });
-
-  const prompt = ANALYSIS_PROMPT(businessName, query, responseText, businessContext);
-
-  for (const key of sortedKeys) {
-    try {
-      let analysisText = "";
-
-      if (key.provider === "google") {
-        const res = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key.apiKey}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            systemInstruction: { parts: [{ text: "You are a precise JSON-only analysis tool. Respond with valid JSON only, no markdown, no explanation." }] },
-            contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: { temperature: 0 },
-          }),
-        });
-        if (!res.ok) continue;
-        const data = await res.json();
-        analysisText = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-      } else if (key.provider === "openai") {
-        const res = await fetchWithRetry("https://api.openai.com/v1/chat/completions", {
-          method: "POST",
-          headers: { "Authorization": `Bearer ${key.apiKey}`, "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: "gpt-4o-mini",
-            max_completion_tokens: 256,
-            temperature: 0,
-            messages: [
-              { role: "system", content: "You are a precise JSON-only analysis tool. Respond with valid JSON only, no markdown, no explanation." },
-              { role: "user", content: prompt },
-            ],
-          }),
-        });
-        if (!res.ok) continue;
-        const data = await res.json();
-        analysisText = data.choices?.[0]?.message?.content ?? "";
-      } else if (key.provider === "anthropic") {
-        const res = await fetchWithRetry("https://api.anthropic.com/v1/messages", {
-          method: "POST",
-          headers: { "x-api-key": key.apiKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: "claude-haiku-4-5-20251001",
-            max_tokens: 256,
-            temperature: 0,
-            system: "You are a precise JSON-only analysis tool. Respond with valid JSON only, no markdown, no explanation.",
-            messages: [{ role: "user", content: prompt }],
-          }),
-        });
-        if (!res.ok) continue;
-        const data = await res.json();
-        analysisText = Array.isArray(data.content)
-          ? data.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("")
-          : "";
-      } else if (key.provider === "perplexity") {
-        const res = await fetchWithRetry("https://api.perplexity.ai/chat/completions", {
-          method: "POST",
-          headers: { "Authorization": `Bearer ${key.apiKey}`, "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: "sonar",
-            max_tokens: 256,
-            temperature: 0,
-            messages: [
-              { role: "system", content: "You are a precise JSON-only analysis tool. Respond with valid JSON only, no markdown, no explanation." },
-              { role: "user", content: prompt },
-            ],
-          }),
-        });
-        if (!res.ok) continue;
-        const data = await res.json();
-        analysisText = data.choices?.[0]?.message?.content ?? "";
-      }
-
-      // Parse JSON from response (strip markdown code fences if present)
-      const cleaned = analysisText.replace(/```json?\s*/gi, "").replace(/```/g, "").trim();
-      const parsed = JSON.parse(cleaned);
-
-      const result = {
-        mentioned: !!parsed.mentioned,
-        sentiment: ["positive", "neutral", "negative"].includes(parsed.sentiment) ? parsed.sentiment : "neutral",
-        confidence: ["high", "medium", "low"].includes(parsed.confidence) ? parsed.confidence : "medium",
-        position: typeof parsed.position === "number" ? parsed.position : null,
-      };
-
-      // Sanity check: if the business name literally appears in the response but AI said "not mentioned", override
-      const responseLower = responseText.toLowerCase();
-      const nameWords = businessName.toLowerCase().split(/\s+/).filter(w => w.length > 2);
-      const nameInResponse = responseLower.includes(businessName.toLowerCase()) ||
-        (nameWords.length >= 2 && nameWords.filter(w => responseLower.includes(w)).length >= Math.min(2, nameWords.length));
-
-      if (!result.mentioned && nameInResponse) {
-        console.log(`[AI Analysis] Override: "${businessName}" found in response text but analyzer said not mentioned — correcting to mentioned`);
-        result.mentioned = true;
-        result.confidence = "medium";
-      }
-
-      return result;
-    } catch (err: any) {
-      console.error(`[AI Analysis] ${key.provider} failed:`, err.message);
-      continue;
-    }
-  }
-
-  // Fallback: if all AI analysis calls fail, use basic heuristic
-  console.warn("[AI Analysis] All providers failed — using basic fallback");
-  return fallbackAnalysis(businessName, responseText);
-}
-
-// Minimal fallback if no AI provider is available for analysis
-function fallbackAnalysis(businessName: string, responseText: string): AnalysisResult {
+// ── Deterministic text-based analysis ──────────────────────────────────────
+// No more AI-analyzing-AI. Mention detection and position are done with
+// reliable text matching. Only sentiment uses simple keyword heuristics.
+function analyzeWithAI(businessName: string, _query: string, responseText: string, _businessContext?: any): AnalysisResult {
   const lower = responseText.toLowerCase();
   const nameLower = businessName.toLowerCase();
 
-  // Check if the business name (or a significant portion of it) appears in the response
+  // Build search variants: full name, and partial names (2+ word combos)
   const nameWords = nameLower.split(/\s+/).filter(w => w.length > 2);
-  const fullNameMatch = lower.includes(nameLower);
-  // Partial match: if 2+ significant words from the business name appear close together
-  const partialMatch = nameWords.length >= 2 && nameWords.filter(w => lower.includes(w)).length >= Math.min(2, nameWords.length);
-  const mentioned = fullNameMatch || partialMatch;
+  const searchVariants: string[] = [nameLower];
 
-  let position: number | null = null;
-  if (mentioned) {
-    const sentences = responseText.split(/[.!?\n]+/).filter(s => s.trim().length > 0);
-    for (let i = 0; i < sentences.length; i++) {
-      if (sentences[i].toLowerCase().includes(nameLower)) { position = i + 1; break; }
+  // Add partial variants: first N words for N >= 2
+  // e.g. "Helping Hands Cleaning Services" → "helping hands cleaning", "helping hands"
+  if (nameWords.length >= 2) {
+    for (let len = nameWords.length; len >= 2; len--) {
+      searchVariants.push(nameWords.slice(0, len).join(" "));
     }
   }
 
-  const posWords = ["recommend", "great", "excellent", "best", "quality", "trusted", "leading", "reliable"];
-  const negWords = ["avoid", "poor", "issues", "complaints", "problems", "disappointing", "unreliable"];
-  const pos = posWords.filter(w => lower.includes(w)).length;
-  const neg = negWords.filter(w => lower.includes(w)).length;
-  const sentiment = pos > neg ? "positive" : neg > pos ? "negative" : "neutral";
+  // Check for any variant match in the response
+  const mentioned = searchVariants.some(v => lower.includes(v));
 
-  return { mentioned, sentiment, confidence: "low", position };
+  // Determine position: find where in a numbered/bulleted list the business appears
+  let position: number | null = null;
+  if (mentioned) {
+    // Look for numbered list patterns: "1. Business Name", "1) Business Name", "#1: Business Name"
+    const lines = responseText.split("\n");
+    let listIndex = 0;
+    for (const line of lines) {
+      const listMatch = line.match(/^[\s]*(?:(\d+)[.\):\-]|\*|\-|•)\s/);
+      if (listMatch) {
+        listIndex++;
+        const lineLower = line.toLowerCase();
+        if (searchVariants.some(v => lineLower.includes(v))) {
+          position = listMatch[1] ? parseInt(listMatch[1]) : listIndex;
+          break;
+        }
+      }
+    }
+  }
+
+  // Determine sentiment from surrounding context
+  let sentiment: "positive" | "neutral" | "negative" = "neutral";
+  if (mentioned) {
+    const positiveWords = ["recommend", "excellent", "great", "best", "top", "outstanding", "highly rated",
+      "trusted", "reliable", "professional", "quality", "reputable", "well-known", "popular",
+      "favorite", "praised", "strong", "exceptional", "impressive", "thorough"];
+    const negativeWords = ["complaint", "avoid", "poor", "bad", "worst", "unreliable", "overpriced",
+      "unprofessional", "disappointing", "warning", "beware", "issues", "problem", "negative reviews"];
+
+    // Check sentiment words near the business name mention
+    const nameIndex = lower.indexOf(searchVariants.find(v => lower.includes(v))!);
+    const context = lower.slice(Math.max(0, nameIndex - 200), Math.min(lower.length, nameIndex + 500));
+
+    const posCount = positiveWords.filter(w => context.includes(w)).length;
+    const negCount = negativeWords.filter(w => context.includes(w)).length;
+
+    if (posCount > negCount && posCount >= 2) sentiment = "positive";
+    else if (negCount > posCount && negCount >= 2) sentiment = "negative";
+    else if (posCount > 0) sentiment = "positive";
+    else if (negCount > 0) sentiment = "negative";
+  }
+
+  // Confidence based on match quality
+  let confidence: "high" | "medium" | "low" = "medium";
+  if (mentioned && lower.includes(nameLower)) {
+    confidence = "high"; // Full exact name match
+  } else if (mentioned) {
+    confidence = "medium"; // Partial match
+  } else {
+    // Check if it's a generic refusal vs genuinely not mentioned
+    const isGeneric = ["i don't have", "i cannot", "search google", "check yelp", "i'm not able",
+      "i recommend checking", "you might want to search"].some(p => lower.includes(p));
+    confidence = isGeneric ? "low" : "high";
+  }
+
+  if (mentioned) {
+    console.log(`[Analysis] "${businessName}" FOUND in response (position: ${position}, sentiment: ${sentiment}, confidence: ${confidence})`);
+  }
+
+  return { mentioned, sentiment, confidence, position };
 }
 
 // ── Response Fingerprinting ──────────────────────────────────────────────
