@@ -524,6 +524,20 @@ export default function BusinessDetail() {
                 {activeScan.completedQueries} / {activeScan.totalQueries} queries completed — data updates live
               </p>
             </div>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-xs text-muted-foreground hover:text-destructive"
+              onClick={async () => {
+                try {
+                  await apiRequest("POST", `/api/businesses/${id}/cancel-scan`);
+                  queryClient.invalidateQueries({ queryKey: ["/api/businesses", id, "scan-jobs"] });
+                  toast({ title: "Scan cancelled" });
+                } catch {}
+              }}
+            >
+              <X className="w-3 h-3 mr-1" /> Cancel
+            </Button>
           </div>
         )}
 

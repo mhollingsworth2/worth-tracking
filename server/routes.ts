@@ -849,6 +849,17 @@ export async function registerRoutes(
     throw userErr;
   }
 
+  // Clean up stale scan jobs on startup (e.g. server crashed mid-scan)
+  try {
+    const staleJobs = db.select().from(scanJobs).where(sql`status = 'running'`).all();
+    for (const j of staleJobs) {
+      db.update(scanJobs).set({ status: "failed", error: "Server restarted while scan was running", completedAt: new Date().toISOString() }).where(sql`id = ${j.id}`).run();
+      console.log(`[init] Marked stale scan job #${j.id} as failed`);
+    }
+  } catch (e) {
+    console.error("[init] Failed to clean stale scan jobs:", e);
+  }
+
   // === AUTH ROUTES (no auth required) ===
   app.post("/api/auth/login", async (req, res) => {
     const parsed = loginSchema.safeParse(req.body);
@@ -2360,7 +2371,29 @@ Extract real information from the content. If a field isn't clear from the websi
   app.get("/api/businesses/:id/scan-jobs", async (req, res) => {
     const id = parseInt(req.params.id);
     const jobs = await storage.getScanJobs(id);
+    // Auto-expire running jobs older than 10 minutes
+    const now = Date.now();
+    for (const j of jobs) {
+      if (j.status === "running" && j.startedAt) {
+        const elapsed = now - new Date(j.startedAt).getTime();
+        if (elapsed > 10 * 60 * 1000) {
+          await storage.updateScanJob(j.id, { status: "failed", error: "Scan timed out after 10 minutes", completedAt: new Date().toISOString() });
+          j.status = "failed";
+          j.error = "Scan timed out after 10 minutes";
+        }
+      }
+    }
     res.json(jobs);
+  });
+
+  // Cancel a stuck scan job
+  app.post("/api/businesses/:id/cancel-scan", async (req, res) => {
+    const id = parseInt(req.params.id);
+    const jobs = await storage.getScanJobs(id);
+    const running = jobs.find(j => j.status === "running");
+    if (!running) return res.json({ message: "No running scan to cancel" });
+    await storage.updateScanJob(running.id, { status: "failed", error: "Cancelled by user", completedAt: new Date().toISOString() });
+    res.json({ message: "Scan cancelled", jobId: running.id });
   });
 
   // === MANUAL LOG SEARCH ===
