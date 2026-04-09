@@ -327,6 +327,7 @@ export interface BusinessContext {
   targetAudience: string | null;
   uniqueSellingPoints: string | null;
   competitors: string | null;
+  customQueries: string | null;
 }
 
 // Parse comma-separated field into trimmed non-empty strings
@@ -414,8 +415,16 @@ export function generateScanQueries(ctx: BusinessContext): string[] {
     `${name} — is it still a good choice in ${currentYear}?`,
   ];
 
-  // Combine all categories, deduplicate, and cap at 25
+  // ── Custom queries (user-provided, highest priority) ───────────────────────
+  const custom: string[] = [];
+  if (ctx.customQueries) {
+    const lines = ctx.customQueries.split("\n").map(s => s.trim()).filter(Boolean);
+    custom.push(...lines);
+  }
+
+  // Custom queries first (they're the user's priority), then auto-generated
   const all = [
+    ...custom,
     ...discovery,
     ...serviceQueries,
     ...keywordQueries,
@@ -437,5 +446,7 @@ export function generateScanQueries(ctx: BusinessContext): string[] {
     }
   }
 
-  return unique.slice(0, 25);
+  // Higher cap when custom queries are provided
+  const cap = custom.length > 0 ? Math.max(25, custom.length + 10) : 25;
+  return unique.slice(0, cap);
 }

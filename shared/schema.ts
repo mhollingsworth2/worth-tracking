@@ -17,6 +17,7 @@ export const businesses = sqliteTable("businesses", {
   targetAudience: text("target_audience"), // who the business serves
   uniqueSellingPoints: text("unique_selling_points"), // what makes them different
   competitors: text("known_competitors"), // comma-separated competitor names
+  customQueries: text("custom_queries"), // newline-separated custom search queries to track
 });
 
 export const insertBusinessSchema = createInsertSchema(businesses).omit({ id: true });

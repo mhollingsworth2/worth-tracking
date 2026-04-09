@@ -55,6 +55,7 @@ function toBizContext(biz: any): BusinessContext {
     targetAudience: biz.targetAudience ?? biz.target_audience ?? null,
     uniqueSellingPoints: biz.uniqueSellingPoints ?? biz.unique_selling_points ?? null,
     competitors: biz.competitors ?? biz.known_competitors ?? null,
+    customQueries: biz.customQueries ?? biz.custom_queries ?? null,
   };
 }
 
@@ -265,6 +266,7 @@ export async function registerRoutes(
   try { db.run(sql`ALTER TABLE businesses ADD COLUMN target_audience TEXT`); } catch (_e) { /* exists */ }
   try { db.run(sql`ALTER TABLE businesses ADD COLUMN unique_selling_points TEXT`); } catch (_e) { /* exists */ }
   try { db.run(sql`ALTER TABLE businesses ADD COLUMN known_competitors TEXT`); } catch (_e) { /* exists */ }
+  try { db.run(sql`ALTER TABLE businesses ADD COLUMN custom_queries TEXT`); } catch (_e) { /* exists */ }
 
   db.run(sql`CREATE TABLE IF NOT EXISTS platforms (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

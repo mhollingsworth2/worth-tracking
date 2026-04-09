@@ -1302,7 +1302,10 @@ function AIContextSettings({ businessId, business }: { businessId: number; busin
   const [targetAudience, setTargetAudience] = useState((business as any).targetAudience ?? (business as any).target_audience ?? "");
   const [uniqueSellingPoints, setUniqueSellingPoints] = useState((business as any).uniqueSellingPoints ?? (business as any).unique_selling_points ?? "");
   const [knownCompetitors, setKnownCompetitors] = useState((business as any).competitors ?? (business as any).known_competitors ?? "");
+  const [customQueries, setCustomQueries] = useState((business as any).customQueries ?? (business as any).custom_queries ?? "");
   const { toast } = useToast();
+
+  const queryCount = customQueries.split("\n").filter((l: string) => l.trim()).length;
 
   const mutation = useMutation({
     mutationFn: async () => {
@@ -1312,6 +1315,7 @@ function AIContextSettings({ businessId, business }: { businessId: number; busin
         targetAudience: targetAudience || null,
         uniqueSellingPoints: uniqueSellingPoints || null,
         competitors: knownCompetitors || null,
+        customQueries: customQueries || null,
       });
     },
     onSuccess: () => {
@@ -1381,6 +1385,18 @@ function AIContextSettings({ businessId, business }: { businessId: number; busin
               className="mt-1"
             />
             <p className="text-[10px] text-muted-foreground mt-0.5">We'll include comparison queries against these names</p>
+          </div>
+
+          <div>
+            <Label className="text-xs">Custom Search Queries ({queryCount})</Label>
+            <Textarea
+              value={customQueries}
+              onChange={(e) => setCustomQueries(e.target.value)}
+              placeholder={"Move out cleaning\nHome deep clean\nHouse cleaning tips\nWhat is the best house cleaning service in Elmhurst IL\n..."}
+              rows={8}
+              className="mt-1 font-mono text-xs"
+            />
+            <p className="text-[10px] text-muted-foreground mt-0.5">One query per line. These exact queries will be sent to each AI platform during every scan. They run first, before auto-generated queries.</p>
           </div>
         </div>
 

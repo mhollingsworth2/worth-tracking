@@ -151,6 +151,7 @@ export class DatabaseStorage implements IStorage {
     if (data.targetAudience !== undefined) updates.targetAudience = data.targetAudience;
     if (data.uniqueSellingPoints !== undefined) updates.uniqueSellingPoints = data.uniqueSellingPoints;
     if (data.competitors !== undefined) updates.competitors = data.competitors;
+    if (data.customQueries !== undefined) updates.customQueries = data.customQueries;
 
     if (Object.keys(updates).length === 0) {
       return this.getBusiness(id);
