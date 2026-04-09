@@ -42,13 +42,10 @@ async function fetchWithRetry(url: string, options: RequestInit, maxRetries = 2)
 }
 
 // Build a focused system instruction that constrains AI responses to the right industry
-// Minimal system prompt — simulate what a real user would get, no coaching.
-// Other AI visibility trackers (Otterly, Peec, Profound) query with NO system
-// prompt at all. We use a minimal one just to set conversational tone without
-// biasing the AI toward mentioning any particular business.
-function buildSystemInstruction(_businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }): string {
-  return `Answer the user's question helpfully and concisely.`;
-}
+// NO system prompt for scan queries — this matches what real users see.
+// Industry-standard AI visibility trackers (Peec, Profound, Otterly) all
+// query platforms without system prompts because real users don't have them.
+// Any system prompt biases the AI and produces results your customers never see.
 
 // ── AI-Powered Response Analysis ──────────────────────────────────────────
 // Instead of fragile string matching, we send a follow-up call to a cheap AI
@@ -426,6 +423,8 @@ async function queryOpenAI(apiKey: string, query: string, businessName: string, 
 async function queryAnthropic(apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }): Promise<AIQueryResult> {
   const startTime = Date.now();
   try {
+    // Use Claude's web search tool — matches what real users see on claude.ai
+    // No system prompt — real users don't have one
     const res = await fetchWithRetry("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -434,10 +433,9 @@ async function queryAnthropic(apiKey: string, query: string, businessName: strin
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
+        model: "claude-sonnet-4-20250514",
         max_tokens: 1024,
-        temperature: 0,
-        system: buildSystemInstruction(businessContext),
+        tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 5 }],
         messages: [{ role: "user", content: query }],
       }),
     });
@@ -448,13 +446,14 @@ async function queryAnthropic(apiKey: string, query: string, businessName: strin
     }
 
     const data = await res.json();
+    // Extract text blocks from response (may contain tool_use and text blocks)
     const responseText = Array.isArray(data.content)
       ? data.content.filter((block: any) => block.type === "text").map((block: any) => block.text).join("\n")
       : "";
     const analysis = analyzeWithAI(businessName, query, responseText, businessContext);
 
     healthCallback?.("anthropic", "success", Date.now() - startTime);
-    return { platform: "Claude", query, responseText, ...analysis, sourceType: "knowledge" as const, crossValidated: null };
+    return { platform: "Claude", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null };
   } catch (err: any) {
     healthCallback?.("anthropic", "error", Date.now() - startTime, err.message);
     throw err;
@@ -464,15 +463,14 @@ async function queryAnthropic(apiKey: string, query: string, businessName: strin
 async function queryGemini(apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }): Promise<AIQueryResult> {
   const startTime = Date.now();
   try {
-    // Enable Google Search grounding so Gemini can find real local businesses
+    // Google Search grounding — matches what real Gemini users see
+    // No system instruction — real users don't have one
     const res = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: buildSystemInstruction(businessContext) }] },
         contents: [{ parts: [{ text: query }] }],
         tools: [{ google_search: {} }],
-        generationConfig: { temperature: 0 },
       }),
     });
 
@@ -498,6 +496,8 @@ async function queryGemini(apiKey: string, query: string, businessName: string, 
 async function queryPerplexity(apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }): Promise<AIQueryResult> {
   const startTime = Date.now();
   try {
+    // Perplexity Sonar — web search is built-in, matches real Perplexity UI
+    // No system prompt — real users don't have one
     const res = await fetchWithRetry("https://api.perplexity.ai/chat/completions", {
       method: "POST",
       headers: {
@@ -505,11 +505,9 @@ async function queryPerplexity(apiKey: string, query: string, businessName: stri
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "sonar",
+        model: "sonar-pro",
         max_tokens: 1024,
-        temperature: 0,
         messages: [
-          { role: "system", content: buildSystemInstruction(businessContext) },
           { role: "user", content: query },
         ],
       }),
@@ -549,10 +547,10 @@ const PROVIDER_PLATFORM: Record<string, string> = {
 // Estimated cost per API call (input + output for ~1024 tokens)
 // These are conservative estimates based on 2026 pricing
 export const PROVIDER_COST_PER_CALL: Record<string, number> = {
-  openai: 0.005,      // gpt-4o-mini + web_search_preview
-  anthropic: 0.004,   // claude-3-5-haiku (knowledge only — no web search API yet)
-  google: 0.003,      // gemini-2.0-flash + google_search grounding
-  perplexity: 0.005,  // sonar (web search built-in)
+  openai: 0.025,      // gpt-4o-mini + web_search_preview ($25/1K calls)
+  anthropic: 0.008,   // claude-sonnet-4 + web_search tool
+  google: 0.004,      // gemini-2.0-flash + google_search grounding (~$14-35/1K)
+  perplexity: 0.005,  // sonar-pro (web search built-in)
 };
 
 // ── Cross-Platform Validation ──────────────────────────────────────────────
