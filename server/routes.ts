@@ -61,6 +61,99 @@ function toBizContext(biz: any): BusinessContext {
   };
 }
 
+// ── AI SEO Prompt Generation ────────────────────────────────────────────────
+// After a scan, analyze which queries performed well/poorly and generate
+// optimized prompts with actionable tips.
+async function generateOptimizedPrompts(businessId: number) {
+  try {
+    const biz = await storage.getBusiness(businessId);
+    if (!biz) return;
+
+    const today = new Date().toISOString().split("T")[0];
+    const records = db.select().from(searchRecords)
+      .where(sql`business_id = ${businessId} AND date = ${today} AND competitor_id IS NULL`)
+      .all();
+
+    if (records.length === 0) return;
+
+    // Clear old prompts for this business and regenerate
+    db.delete(optimizedPrompts).where(sql`business_id = ${businessId}`).run();
+
+    // Group records by query
+    const queryMap = new Map<string, { mentioned: number; total: number; positions: number[]; sentiments: string[] }>();
+    for (const r of records) {
+      if (!queryMap.has(r.query)) queryMap.set(r.query, { mentioned: 0, total: 0, positions: [], sentiments: [] });
+      const q = queryMap.get(r.query)!;
+      q.total++;
+      if (r.mentioned) {
+        q.mentioned++;
+        if (r.position) q.positions.push(r.position);
+      }
+      if (r.sentiment) q.sentiments.push(r.sentiment);
+    }
+
+    const prompts: { prompt: string; category: string; score: number; tip: string }[] = [];
+
+    for (const [query, data] of queryMap) {
+      const mentionRate = Math.round((data.mentioned / data.total) * 100);
+      const avgPos = data.positions.length > 0
+        ? Math.round((data.positions.reduce((a, b) => a + b, 0) / data.positions.length) * 10) / 10
+        : null;
+      const mainSentiment = data.sentiments.length > 0
+        ? (data.sentiments.filter(s => s === "positive").length >= data.sentiments.length / 2 ? "positive" : data.sentiments.filter(s => s === "negative").length >= data.sentiments.length / 2 ? "negative" : "neutral")
+        : "neutral";
+
+      // Determine category from query content
+      const lq = query.toLowerCase();
+      let category = "discovery";
+      if (lq.includes("vs ") || lq.includes("compare") || lq.includes("versus")) category = "comparison";
+      else if (lq.includes("best") || lq.includes("recommend") || lq.includes("top")) category = "recommendation";
+      else if (lq.includes("near") || lq.includes("in ") || (biz.location && lq.includes(biz.location.toLowerCase()))) category = "local";
+      else if (lq.includes("review") || lq.includes("reputation") || lq.includes("worth")) category = "review";
+
+      // Generate actionable tip based on performance
+      let tip: string;
+      if (mentionRate >= 75) {
+        tip = mainSentiment === "positive"
+          ? "Strong performance! Maintain your online presence and encourage fresh reviews to keep this ranking."
+          : "You're being mentioned often but sentiment could improve. Focus on customer experience and review management.";
+      } else if (mentionRate >= 40) {
+        if (category === "local") {
+          tip = `Moderate local visibility. Ensure your Google Business Profile is complete, add location-specific content to your website, and build local citations.`;
+        } else if (category === "comparison") {
+          tip = `You show up in some comparisons. Create detailed comparison content on your site highlighting your unique advantages over competitors.`;
+        } else {
+          tip = `Room for improvement. Add structured data (schema markup) to your website, publish relevant blog content, and ensure your business info is consistent across directories.`;
+        }
+      } else if (mentionRate > 0) {
+        tip = `Low visibility for this query type. Create dedicated content targeting "${query.replace(/"/g, '')}" on your website. Add FAQ pages and ensure your business details are on major directories (Yelp, BBB, industry-specific sites).`;
+      } else {
+        tip = `Not appearing for this query. This is a content gap — create a dedicated page or blog post addressing "${query.replace(/"/g, '')}". Ensure your website mentions relevant keywords and services.`;
+      }
+
+      prompts.push({ prompt: query, category, score: mentionRate, tip });
+    }
+
+    // Sort: worst-performing first (biggest opportunities), limit to 20
+    prompts.sort((a, b) => a.score - b.score);
+    const topPrompts = prompts.slice(0, 20);
+
+    for (const p of topPrompts) {
+      db.insert(optimizedPrompts).values({
+        businessId,
+        prompt: p.prompt,
+        category: p.category,
+        score: p.score,
+        tip: p.tip,
+      }).run();
+    }
+
+    console.log(`[Prompts] Generated ${topPrompts.length} optimized prompts for business #${businessId}`);
+  } catch (err: any) {
+    console.error(`[Prompts] Error generating prompts for business #${businessId}:`, err.message);
+  }
+}
+
 // ── Ranking Drop Alert System ────────────────────────────────────────────────
 // After a scan completes, compare current results to previous scan and generate
 // alerts for mention rate drops, competitor overtaking, and platform issues.
@@ -490,6 +583,7 @@ async function autoScanBusiness(businessId: number) {
 
     // Generate alerts based on scan results
     await generateScanAlerts(businessId);
+    await generateOptimizedPrompts(businessId);
 
   } catch (err: any) {
     console.error(`[Auto-Scan] Error for business ${businessId}:`, err.message);
@@ -2354,6 +2448,7 @@ Extract real information from the content. If a field isn't clear from the websi
 
       // Generate alerts based on scan results
       await generateScanAlerts(businessId);
+    await generateOptimizedPrompts(businessId);
 
       res.json({
         jobId: job.id,
