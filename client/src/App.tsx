@@ -19,6 +19,7 @@ import Optimizer from "@/pages/optimizer";
 import Alerts from "@/pages/alerts";
 import ApiKeys from "@/pages/api-keys";
 import Admin from "@/pages/admin";
+import Agency from "@/pages/agency";
 import Login from "@/pages/login";
 import NotFound from "@/pages/not-found";
 
@@ -61,6 +62,7 @@ function AppRouter() {
       <Route path="/alerts" component={Alerts} />
       {isAdmin && <Route path="/api-keys" component={ApiKeys} />}
       {isAdmin && <Route path="/admin" component={Admin} />}
+      {isAdmin && <Route path="/agency" component={Agency} />}
       <Route path="/business/:id" component={BusinessDetail} />
       <Route component={NotFound} />
     </Switch>

@@ -6,7 +6,7 @@ import {
   businesses, platforms, searchRecords, optimizedPrompts, referrals,
   competitors, aiSnapshots, alerts, contentGaps, locations,
   apiKeys, scanJobs, apiUsage, apiSettings, clickEvents,
-  users, userBusinesses, loginSchema,
+  users, userBusinesses, agencySettings, loginSchema,
   insertBusinessSchema, insertSearchRecordSchema,
   insertCompetitorSchema, insertAlertSchema, insertLocationSchema,
 } from "@shared/schema";
@@ -59,6 +59,171 @@ function toBizContext(biz: any): BusinessContext {
     competitors: biz.competitors ?? biz.known_competitors ?? null,
     customQueries: biz.customQueries ?? biz.custom_queries ?? null,
   };
+}
+
+// ── Ranking Drop Alert System ────────────────────────────────────────────────
+// After a scan completes, compare current results to previous scan and generate
+// alerts for mention rate drops, competitor overtaking, and platform issues.
+async function generateScanAlerts(businessId: number) {
+  const today = new Date().toISOString().split("T")[0];
+
+  // Helper: check if an alert with same type+message+date already exists
+  function alertExists(type: string, message: string, date: string): boolean {
+    const existing = db
+      .select()
+      .from(alerts)
+      .where(sql`business_id = ${businessId} AND type = ${type} AND message = ${message} AND date = ${date}`)
+      .get();
+    return !!existing;
+  }
+
+  try {
+    // Get the most recent previous scan date (before today)
+    const prevDateRow = db
+      .select({ date: searchRecords.date })
+      .from(searchRecords)
+      .where(sql`business_id = ${businessId} AND competitor_id IS NULL AND date < ${today}`)
+      .orderBy(sql`date DESC`)
+      .limit(1)
+      .get();
+
+    // Get today's business records
+    const todayRecords = db
+      .select()
+      .from(searchRecords)
+      .where(sql`business_id = ${businessId} AND competitor_id IS NULL AND date = ${today}`)
+      .all();
+
+    if (todayRecords.length === 0) return; // no scan results today
+
+    // ── (a) Mention rate drop ────────────────────────────────────────────────
+    if (prevDateRow) {
+      const prevDate = prevDateRow.date;
+      const prevRecords = db
+        .select()
+        .from(searchRecords)
+        .where(sql`business_id = ${businessId} AND competitor_id IS NULL AND date = ${prevDate}`)
+        .all();
+
+      if (prevRecords.length > 0) {
+        const prevMentionRate = prevRecords.filter((r) => r.mentioned === 1).length / prevRecords.length;
+        const todayMentionRate = todayRecords.filter((r) => r.mentioned === 1).length / todayRecords.length;
+
+        if (prevMentionRate > 0) {
+          const dropPct = ((prevMentionRate - todayMentionRate) / prevMentionRate) * 100;
+
+          if (dropPct > 30) {
+            const msg = `Mention rate dropped ${Math.round(dropPct)}% (from ${Math.round(prevMentionRate * 100)}% to ${Math.round(todayMentionRate * 100)}%) since ${prevDate}`;
+            if (!alertExists("mention_drop", msg, today)) {
+              await storage.createAlert({ businessId, type: "mention_drop", message: msg, severity: "critical", date: today });
+              console.log(`[Alerts] Created critical mention_drop alert for business ${businessId}`);
+            }
+          } else if (dropPct > 15) {
+            const msg = `Mention rate dropped ${Math.round(dropPct)}% (from ${Math.round(prevMentionRate * 100)}% to ${Math.round(todayMentionRate * 100)}%) since ${prevDate}`;
+            if (!alertExists("mention_drop", msg, today)) {
+              await storage.createAlert({ businessId, type: "mention_drop", message: msg, severity: "warning", date: today });
+              console.log(`[Alerts] Created warning mention_drop alert for business ${businessId}`);
+            }
+          }
+        }
+
+        // ── (c) Platform-specific issues ───────────────────────────────────────
+        // Check if any platform that previously had mentions now has 0 across all queries
+        const prevByPlatform = new Map<number, { total: number; mentioned: number }>();
+        for (const r of prevRecords) {
+          const entry = prevByPlatform.get(r.platformId) ?? { total: 0, mentioned: 0 };
+          entry.total++;
+          if (r.mentioned === 1) entry.mentioned++;
+          prevByPlatform.set(r.platformId, entry);
+        }
+
+        const todayByPlatform = new Map<number, { total: number; mentioned: number }>();
+        for (const r of todayRecords) {
+          const entry = todayByPlatform.get(r.platformId) ?? { total: 0, mentioned: 0 };
+          entry.total++;
+          if (r.mentioned === 1) entry.mentioned++;
+          todayByPlatform.set(r.platformId, entry);
+        }
+
+        // Look up platform names
+        const allPlatforms = await storage.getPlatforms();
+        const platformNameMap = Object.fromEntries(allPlatforms.map((p) => [p.id, p.name]));
+
+        for (const [platformId, prev] of prevByPlatform) {
+          if (prev.mentioned > 0) {
+            const todayStats = todayByPlatform.get(platformId);
+            if (todayStats && todayStats.total > 0 && todayStats.mentioned === 0) {
+              const platformName = platformNameMap[platformId] ?? `Platform #${platformId}`;
+              const msg = `${platformName} returned 0 mentions across all queries today (previously had ${prev.mentioned}/${prev.total})`;
+              if (!alertExists("platform_missing", msg, today)) {
+                await storage.createAlert({ businessId, type: "platform_missing", message: msg, severity: "info", date: today });
+                console.log(`[Alerts] Created platform_missing alert for business ${businessId}: ${platformName}`);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // ── (b) Competitor overtaking ──────────────────────────────────────────────
+    // Compare competitor mention rates vs business mention rates per query today
+    const comps = await storage.getCompetitors(businessId);
+    if (comps.length > 0 && prevDateRow) {
+      const prevDate = prevDateRow.date;
+
+      for (const comp of comps) {
+        // Get today's competitor records
+        const todayCompRecords = db
+          .select()
+          .from(searchRecords)
+          .where(sql`business_id = ${businessId} AND competitor_id = ${comp.id} AND date = ${today}`)
+          .all();
+
+        // Get previous competitor records
+        const prevCompRecords = db
+          .select()
+          .from(searchRecords)
+          .where(sql`business_id = ${businessId} AND competitor_id = ${comp.id} AND date = ${prevDate}`)
+          .all();
+
+        // Build per-query mention lookup for today and previous
+        const todayBizByQuery = new Map<string, boolean>();
+        for (const r of todayRecords) todayBizByQuery.set(r.query, r.mentioned === 1);
+
+        const prevBizByQuery = new Map<string, boolean>();
+        const prevBizRecords = db
+          .select()
+          .from(searchRecords)
+          .where(sql`business_id = ${businessId} AND competitor_id IS NULL AND date = ${prevDate}`)
+          .all();
+        for (const r of prevBizRecords) prevBizByQuery.set(r.query, r.mentioned === 1);
+
+        const prevCompByQuery = new Map<string, boolean>();
+        for (const r of prevCompRecords) prevCompByQuery.set(r.query, r.mentioned === 1);
+
+        const todayCompByQuery = new Map<string, boolean>();
+        for (const r of todayCompRecords) todayCompByQuery.set(r.query, r.mentioned === 1);
+
+        // Find queries where: previously business was mentioned & competitor was not,
+        // but now competitor is mentioned & business is not
+        for (const [query, bizMentionedToday] of todayBizByQuery) {
+          const compMentionedToday = todayCompByQuery.get(query) ?? false;
+          const bizMentionedPrev = prevBizByQuery.get(query) ?? false;
+          const compMentionedPrev = prevCompByQuery.get(query) ?? false;
+
+          if (bizMentionedPrev && !compMentionedPrev && compMentionedToday && !bizMentionedToday) {
+            const msg = `${comp.name} overtook your business on "${query}" — they are now mentioned while you are not`;
+            if (!alertExists("competitor_outrank", msg, today)) {
+              await storage.createAlert({ businessId, type: "competitor_outrank", message: msg, severity: "warning", date: today });
+              console.log(`[Alerts] Created competitor_outrank alert for business ${businessId}: ${comp.name} on "${query}"`);
+            }
+          }
+        }
+      }
+    }
+  } catch (err: any) {
+    console.error(`[Alerts] Error generating alerts for business ${businessId}:`, err.message);
+  }
 }
 
 async function autoScanBusiness(businessId: number) {
@@ -244,6 +409,9 @@ async function autoScanBusiness(businessId: number) {
         console.error(`[Auto-Scan] Error scanning competitor "${comp.name}":`, compErr.message);
       }
     }
+
+    // Generate alerts based on scan results
+    await generateScanAlerts(businessId);
 
   } catch (err: any) {
     console.error(`[Auto-Scan] Error for business ${businessId}:`, err.message);
@@ -515,6 +683,17 @@ export async function registerRoutes(
     timestamp TEXT NOT NULL
   )`);
 
+  db.run(sql`CREATE TABLE IF NOT EXISTS agency_settings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    agency_name TEXT NOT NULL,
+    logo_url TEXT,
+    primary_color TEXT DEFAULT '#6366f1',
+    custom_domain TEXT,
+    footer_text TEXT,
+    created_at TEXT NOT NULL
+  )`);
+
   console.log("[init] Core tables created successfully");
 
   // === DATABASE INDEXES for query performance ===
@@ -761,6 +940,125 @@ export async function registerRoutes(
     res.json(ids);
   });
 
+  // === AGENCY / WHITE-LABEL ROUTES ===
+  app.get("/api/agency/settings", requireAdmin, async (req, res) => {
+    const settings = await storage.getAgencySettings(req.user!.userId);
+    res.json(settings ?? null);
+  });
+
+  app.put("/api/agency/settings", requireAdmin, async (req, res) => {
+    const { agencyName, logoUrl, primaryColor, customDomain, footerText } = req.body;
+    if (!agencyName) return res.status(400).json({ error: "agencyName is required" });
+    const settings = await storage.upsertAgencySettings(req.user!.userId, {
+      agencyName,
+      logoUrl: logoUrl ?? null,
+      primaryColor: primaryColor ?? "#6366f1",
+      customDomain: customDomain ?? null,
+      footerText: footerText ?? null,
+    });
+    res.json(settings);
+  });
+
+  app.get("/api/agency/clients", requireAdmin, async (_req, res) => {
+    const allUsers = await storage.getUsers();
+    const clients = allUsers.filter((u) => u.role === "customer");
+    const result = [];
+    for (const client of clients) {
+      const bizIds = await storage.getUserBusinessIds(client.id);
+      result.push({ ...client, assignedBusinessCount: bizIds.length, assignedBusinessIds: bizIds });
+    }
+    res.json(result);
+  });
+
+  app.post("/api/agency/clients", requireAdmin, async (req, res) => {
+    const { username, password, displayName, businessIds } = req.body;
+    if (!username || !password || !displayName) {
+      return res.status(400).json({ error: "username, password, and displayName required" });
+    }
+    const existing = await storage.getUserByUsername(username);
+    if (existing) return res.status(400).json({ error: "Username already exists" });
+    const user = await storage.createUser({ username, password, displayName, role: "customer" });
+    // Assign businesses if provided
+    if (Array.isArray(businessIds)) {
+      for (const bizId of businessIds) {
+        await storage.assignBusiness(user.id, bizId);
+      }
+    }
+    const { passwordHash, ...safe } = user;
+    res.json(safe);
+  });
+
+  app.get("/api/agency/client-report/:businessId", requireAdmin, async (req, res) => {
+    const businessId = parseInt(req.params.businessId as string);
+    const biz = await storage.getBusiness(businessId);
+    if (!biz) return res.status(404).json({ error: "Business not found" });
+
+    const records = await storage.getSearchRecords(businessId);
+    const allPlatforms = await storage.getPlatforms();
+    const platformMap = Object.fromEntries(allPlatforms.map((p) => [p.id, p.name]));
+
+    // Calculate mention rate
+    const totalRecords = records.length;
+    const mentioned = records.filter((r) => r.mentioned === 1);
+    const mentionRate = totalRecords > 0 ? Math.round((mentioned.length / totalRecords) * 100) : 0;
+
+    // Average position among mentioned results
+    const positions = mentioned.filter((r) => r.position != null).map((r) => r.position!);
+    const avgPosition = positions.length > 0 ? Math.round((positions.reduce((a, b) => a + b, 0) / positions.length) * 10) / 10 : 0;
+
+    // Top platform
+    const platformCounts: Record<string, number> = {};
+    for (const r of mentioned) {
+      const pName = platformMap[r.platformId] || "Unknown";
+      platformCounts[pName] = (platformCounts[pName] || 0) + 1;
+    }
+    const topPlatform = Object.entries(platformCounts).sort((a, b) => b[1] - a[1])[0]?.[0] ?? "N/A";
+
+    // Trend: compare last 7 days vs previous 7 days
+    const now = new Date();
+    const sevenDaysAgo = new Date(now.getTime() - 7 * 86400000).toISOString().split("T")[0];
+    const fourteenDaysAgo = new Date(now.getTime() - 14 * 86400000).toISOString().split("T")[0];
+    const recentRecords = records.filter((r) => r.date >= sevenDaysAgo);
+    const prevRecords = records.filter((r) => r.date >= fourteenDaysAgo && r.date < sevenDaysAgo);
+    const recentMentionRate = recentRecords.length > 0 ? (recentRecords.filter((r) => r.mentioned === 1).length / recentRecords.length) * 100 : 0;
+    const prevMentionRate = prevRecords.length > 0 ? (prevRecords.filter((r) => r.mentioned === 1).length / prevRecords.length) * 100 : 0;
+    const diff = recentMentionRate - prevMentionRate;
+    const trend = diff > 0 ? "up" : diff < 0 ? "down" : "stable";
+    const weekOverWeek = diff > 0 ? `+${Math.round(diff)}%` : `${Math.round(diff)}%`;
+
+    // Top queries by mention rate
+    const queryMap: Record<string, { total: number; mentioned: number }> = {};
+    for (const r of records) {
+      if (!queryMap[r.query]) queryMap[r.query] = { total: 0, mentioned: 0 };
+      queryMap[r.query].total++;
+      if (r.mentioned === 1) queryMap[r.query].mentioned++;
+    }
+    const topQueries = Object.entries(queryMap)
+      .map(([query, stats]) => ({ query, mentionRate: Math.round((stats.mentioned / stats.total) * 100) }))
+      .sort((a, b) => b.mentionRate - a.mentionRate)
+      .slice(0, 5);
+
+    // Simple recommendations based on data
+    const recommendations: string[] = [];
+    if (mentionRate < 50) recommendations.push("Mention rate is below 50% -- consider optimizing your business listings and online presence.");
+    if (avgPosition > 3) recommendations.push("Average position is low -- focus on building authority through quality content and backlinks.");
+    if (topQueries.some((q) => q.mentionRate < 30)) recommendations.push("Some key queries have very low visibility -- create targeted content for those topics.");
+    if (trend === "down") recommendations.push("Visibility is trending down -- review recent AI platform changes and adjust your strategy.");
+    if (recommendations.length === 0) recommendations.push("Visibility is strong -- keep maintaining your current strategy.");
+
+    res.json({
+      business: { name: biz.name, industry: biz.industry },
+      mentionRate,
+      avgPosition,
+      topPlatform,
+      trend,
+      weekOverWeek,
+      topQueries,
+      recommendations,
+      generatedAt: new Date().toISOString(),
+    });
+  });
+
   // === BUSINESSES ===
   app.get("/api/businesses", async (req, res) => {
     const allBiz = await storage.getBusinesses();
@@ -860,6 +1158,62 @@ export async function registerRoutes(
     const id = parseInt(req.params.id);
     const rows = await storage.getQueryPerformance(id);
     res.json(rows);
+  });
+
+  // === QUERY TRENDS (historical per-query tracking) ===
+  app.get("/api/businesses/:id/query-trends", async (req, res) => {
+    const id = parseInt(req.params.id);
+    const days = parseInt((req.query.days as string) ?? "30") || 30;
+    const queryFilter = req.query.query as string | undefined;
+
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - days);
+    const cutoffStr = cutoff.toISOString().slice(0, 10);
+
+    let rows: any[];
+    if (queryFilter) {
+      rows = db.select({
+        query: searchRecords.query,
+        date: searchRecords.date,
+        total: sql<number>`count(*)`,
+        mentions: sql<number>`sum(case when ${searchRecords.mentioned} = 1 then 1 else 0 end)`,
+        avgPosition: sql<number>`avg(case when ${searchRecords.mentioned} = 1 then ${searchRecords.position} end)`,
+      })
+        .from(searchRecords)
+        .where(sql`${searchRecords.businessId} = ${id} AND ${searchRecords.competitorId} IS NULL AND ${searchRecords.date} >= ${cutoffStr} AND ${searchRecords.query} = ${queryFilter}`)
+        .groupBy(searchRecords.query, searchRecords.date)
+        .orderBy(searchRecords.date)
+        .all();
+    } else {
+      rows = db.select({
+        query: searchRecords.query,
+        date: searchRecords.date,
+        total: sql<number>`count(*)`,
+        mentions: sql<number>`sum(case when ${searchRecords.mentioned} = 1 then 1 else 0 end)`,
+        avgPosition: sql<number>`avg(case when ${searchRecords.mentioned} = 1 then ${searchRecords.position} end)`,
+      })
+        .from(searchRecords)
+        .where(sql`${searchRecords.businessId} = ${id} AND ${searchRecords.competitorId} IS NULL AND ${searchRecords.date} >= ${cutoffStr}`)
+        .groupBy(searchRecords.query, searchRecords.date)
+        .orderBy(searchRecords.date)
+        .all();
+    }
+
+    // Group rows by query
+    const grouped: Record<string, any[]> = {};
+    for (const row of rows) {
+      if (!grouped[row.query]) grouped[row.query] = [];
+      const mentionRate = row.total > 0 ? Math.round((row.mentions / row.total) * 100) : 0;
+      grouped[row.query].push({
+        date: row.date,
+        mentionRate,
+        avgPosition: row.avgPosition != null ? Math.round(row.avgPosition * 10) / 10 : null,
+        total: row.total,
+      });
+    }
+
+    const trends = Object.entries(grouped).map(([query, dataPoints]) => ({ query, dataPoints }));
+    res.json({ trends });
   });
 
   // === VISIBILITY SCORES ===
@@ -1182,6 +1536,160 @@ export async function registerRoutes(
         losing: queries.filter(q => q.status === "losing").length,
         tied: queries.filter(q => q.status === "tied").length,
       },
+    });
+  });
+
+  // === CONTENT BRIEF GENERATION ===
+  // Generates an actionable content brief for a given search query
+  app.post("/api/businesses/:id/content-brief", async (req, res) => {
+    const businessId = parseInt(req.params.id);
+    const { query } = req.body;
+    if (!query || typeof query !== "string") {
+      return res.status(400).json({ error: "query is required" });
+    }
+
+    const business = await storage.getBusiness(businessId);
+    if (!business) return res.status(404).json({ error: "Business not found" });
+
+    // Get API keys
+    const keys = await storage.getApiKeys();
+    const activeKeys = keys.filter((k) => k.isActive);
+    if (activeKeys.length === 0) {
+      return res.status(400).json({ error: "No API keys configured. Add one in Settings first." });
+    }
+
+    const prompt = `You are an SEO content strategist. Generate a detailed content brief for the following business to help them rank for a specific search query.
+
+Business details:
+- Name: ${business.name}
+- Industry: ${business.industry || "Not specified"}
+- Services: ${business.services || "Not specified"}
+- Location: ${business.location || "Not specified"}
+- Target Audience: ${business.targetAudience || "Not specified"}
+- Description: ${business.description || "Not specified"}
+
+Target search query: "${query}"
+
+Return ONLY valid JSON with this exact structure:
+{
+  "title": "SEO-optimized title for the content piece",
+  "contentType": "blog_post" or "faq" or "landing_page" or "guide" or "comparison" or "case_study",
+  "wordCount": number between 800 and 3000,
+  "outline": [
+    { "heading": "Section heading", "points": ["Key point 1", "Key point 2"] }
+  ],
+  "keywords": ["keyword1", "keyword2", "keyword3"],
+  "callToAction": "Suggested call to action for the content",
+  "rationale": "Brief explanation of why this content will help rank for the query"
+}
+
+Include 3-6 sections in the outline, each with 2-4 bullet points. Include 5-10 keywords. Make the content brief specific and actionable.`;
+
+    // Try providers in cost order
+    const priority = ["google", "openai", "anthropic", "perplexity"];
+    const sortedKeys = [...activeKeys].sort((a, b) => {
+      return priority.indexOf(a.provider) - priority.indexOf(b.provider);
+    });
+
+    let result: any = null;
+
+    for (const key of sortedKeys) {
+      try {
+        let responseText = "";
+
+        if (key.provider === "google") {
+          const apiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key.apiKey}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              systemInstruction: { parts: [{ text: "You are an SEO content strategist. Return only valid JSON, no markdown or explanation." }] },
+              contents: [{ parts: [{ text: prompt }] }],
+            }),
+          });
+          if (!apiRes.ok) continue;
+          const data = await apiRes.json();
+          responseText = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+        } else if (key.provider === "openai") {
+          const apiRes = await fetch("https://api.openai.com/v1/chat/completions", {
+            method: "POST",
+            headers: { "Authorization": `Bearer ${key.apiKey}`, "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: "gpt-4o-mini",
+              max_completion_tokens: 2048,
+              messages: [
+                { role: "system", content: "You are an SEO content strategist. Return only valid JSON, no markdown or explanation." },
+                { role: "user", content: prompt },
+              ],
+            }),
+          });
+          if (!apiRes.ok) continue;
+          const data = await apiRes.json();
+          responseText = data.choices?.[0]?.message?.content ?? "";
+        } else if (key.provider === "anthropic") {
+          const apiRes = await fetch("https://api.anthropic.com/v1/messages", {
+            method: "POST",
+            headers: { "x-api-key": key.apiKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: "claude-haiku-4-5-20251001",
+              max_tokens: 2048,
+              system: "You are an SEO content strategist. Return only valid JSON, no markdown or explanation.",
+              messages: [{ role: "user", content: prompt }],
+            }),
+          });
+          if (!apiRes.ok) continue;
+          const data = await apiRes.json();
+          responseText = Array.isArray(data.content)
+            ? data.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("")
+            : "";
+        } else if (key.provider === "perplexity") {
+          const apiRes = await fetch("https://api.perplexity.ai/chat/completions", {
+            method: "POST",
+            headers: { "Authorization": `Bearer ${key.apiKey}`, "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: "sonar",
+              max_tokens: 2048,
+              messages: [
+                { role: "system", content: "You are an SEO content strategist. Return only valid JSON, no markdown or explanation." },
+                { role: "user", content: prompt },
+              ],
+            }),
+          });
+          if (!apiRes.ok) continue;
+          const data = await apiRes.json();
+          responseText = data.choices?.[0]?.message?.content ?? "";
+        }
+
+        // Parse the JSON response
+        const jsonCleaned = responseText.replace(/```json?\s*/gi, "").replace(/```/g, "").trim();
+        result = JSON.parse(jsonCleaned);
+        break; // success, stop trying providers
+      } catch (err: any) {
+        console.error(`[ContentBrief] ${key.provider} failed:`, err.message);
+        continue;
+      }
+    }
+
+    if (!result) {
+      return res.status(500).json({ error: "Could not generate content brief. Try again later." });
+    }
+
+    // Track API cost
+    const dateStr = new Date().toISOString().split("T")[0];
+    db.insert(apiUsage).values({
+      provider: sortedKeys[0]?.provider ?? "unknown",
+      estimatedCost: "0.003",
+      date: dateStr,
+      timestamp: new Date().toISOString(),
+    }).run();
+
+    res.json({
+      title: result.title || "",
+      contentType: result.contentType || "blog_post",
+      wordCount: result.wordCount || 1500,
+      outline: Array.isArray(result.outline) ? result.outline : [],
+      keywords: Array.isArray(result.keywords) ? result.keywords : [],
+      callToAction: result.callToAction || "",
+      rationale: result.rationale || "",
     });
   });
 
@@ -1725,6 +2233,9 @@ Extract real information from the content. If a field isn't clear from the websi
         completedAt: new Date().toISOString(),
       });
 
+      // Generate alerts based on scan results
+      await generateScanAlerts(businessId);
+
       res.json({
         jobId: job.id,
         totalQueries: completed,
@@ -2183,6 +2694,163 @@ Extract real information from the content. If a field isn't clear from the websi
       bySource,
       lastClickAt: lastClick?.timestamp ?? null,
     });
+  });
+
+  // POST /api/businesses/:id/schema-recommendations — generate structured data recommendations
+  app.post("/api/businesses/:id/schema-recommendations", async (req, res) => {
+    const businessId = parseInt(req.params.id);
+    const biz = await storage.getBusiness(businessId);
+    if (!biz) return res.status(404).json({ message: "Business not found" });
+
+    const industryTypeMap: Record<string, string> = {
+      restaurant: "Restaurant",
+      healthcare: "MedicalBusiness",
+      legal: "LegalService",
+      "real estate": "RealEstateAgent",
+      fitness: "HealthClub",
+      beauty: "BeautySalon",
+      automotive: "AutoRepair",
+    };
+
+    const industry = (biz.industry || "").toLowerCase();
+    const schemaOrgType = industryTypeMap[industry] || "LocalBusiness";
+
+    const name = biz.name || "Your Business";
+    const description = biz.description || `${name} — a trusted ${biz.industry || "local"} business.`;
+    const website = biz.website || "https://www.example.com";
+    const location = biz.location || "";
+    const services = (biz as any).services || "";
+    const targetAudience = (biz as any).targetAudience || (biz as any).target_audience || "";
+    const uniqueSellingPoints = (biz as any).uniqueSellingPoints || (biz as any).unique_selling_points || "";
+
+    const recommendations: any[] = [];
+
+    // 1. LocalBusiness (always, high priority)
+    const localBusinessSchema = {
+      "@context": "https://schema.org",
+      "@type": schemaOrgType,
+      name,
+      description,
+      url: website,
+      ...(location ? { address: { "@type": "PostalAddress", streetAddress: location } } : {}),
+      ...(services ? { makesOffer: services.split(",").map((s: string) => ({ "@type": "Offer", itemOffered: { "@type": "Service", name: s.trim() } })) } : {}),
+    };
+    recommendations.push({
+      schemaType: "LocalBusiness",
+      description: `Helps AI assistants find and recommend your business for local searches. Uses the specific schema.org type "${schemaOrgType}" based on your industry.`,
+      priority: "high",
+      code: `<script type="application/ld+json">\n${JSON.stringify(localBusinessSchema, null, 2)}\n</script>`,
+      implemented: false,
+    });
+
+    // 2. Organization (always, high priority)
+    const orgSchema = {
+      "@context": "https://schema.org",
+      "@type": "Organization",
+      name,
+      url: website,
+      description,
+      ...(location ? { address: { "@type": "PostalAddress", streetAddress: location } } : {}),
+    };
+    recommendations.push({
+      schemaType: "Organization",
+      description: "Establishes your brand identity for AI systems and knowledge graphs. This helps AI assistants confidently reference your organization.",
+      priority: "high",
+      code: `<script type="application/ld+json">\n${JSON.stringify(orgSchema, null, 2)}\n</script>`,
+      implemented: false,
+    });
+
+    // 3. Service (if services exist, one per service)
+    if (services) {
+      const serviceList = services.split(",").map((s: string) => s.trim()).filter(Boolean);
+      for (const svc of serviceList) {
+        const svcSchema = {
+          "@context": "https://schema.org",
+          "@type": "Service",
+          name: svc,
+          provider: { "@type": "Organization", name },
+          ...(location ? { areaServed: location } : {}),
+          ...(description ? { description: `${svc} provided by ${name}.` } : {}),
+        };
+        recommendations.push({
+          schemaType: "Service",
+          description: `Helps AI assistants understand and recommend your "${svc}" service when users ask about it.`,
+          priority: "high",
+          code: `<script type="application/ld+json">\n${JSON.stringify(svcSchema, null, 2)}\n</script>`,
+          implemented: false,
+        });
+      }
+    }
+
+    // 4. FAQ (always recommend, medium priority)
+    const faqSchema = {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      mainEntity: [
+        {
+          "@type": "Question",
+          name: `What services does ${name} offer?`,
+          acceptedAnswer: { "@type": "Answer", text: services || `${name} offers a range of professional ${biz.industry || ""} services. Visit ${website} for details.` },
+        },
+        {
+          "@type": "Question",
+          name: `Where is ${name} located?`,
+          acceptedAnswer: { "@type": "Answer", text: location || `Visit ${website} for location and contact information.` },
+        },
+        {
+          "@type": "Question",
+          name: `Why choose ${name}?`,
+          acceptedAnswer: { "@type": "Answer", text: uniqueSellingPoints || `${name} is a trusted ${biz.industry || "local"} business committed to quality service.` },
+        },
+      ],
+    };
+    recommendations.push({
+      schemaType: "FAQ",
+      description: "FAQ schema makes your answers directly quotable by AI assistants. Create a dedicated FAQ page and add this markup.",
+      priority: "medium",
+      code: `<script type="application/ld+json">\n${JSON.stringify(faqSchema, null, 2)}\n</script>`,
+      implemented: false,
+    });
+
+    // 5. AggregateRating / Review (always recommend, medium priority)
+    const reviewSchema = {
+      "@context": "https://schema.org",
+      "@type": schemaOrgType,
+      name,
+      aggregateRating: {
+        "@type": "AggregateRating",
+        ratingValue: "4.8",
+        reviewCount: "50",
+        bestRating: "5",
+      },
+    };
+    recommendations.push({
+      schemaType: "Review",
+      description: "Aggregate rating schema helps AI assistants highlight your star ratings and review count, boosting trust signals.",
+      priority: "medium",
+      code: `<script type="application/ld+json">\n${JSON.stringify(reviewSchema, null, 2)}\n</script>\n\n<!-- NOTE: Replace ratingValue and reviewCount with your actual values -->`,
+      implemented: false,
+    });
+
+    // 6. BreadcrumbList (always, low priority)
+    const breadcrumbSchema = {
+      "@context": "https://schema.org",
+      "@type": "BreadcrumbList",
+      itemListElement: [
+        { "@type": "ListItem", position: 1, name: "Home", item: website },
+        { "@type": "ListItem", position: 2, name: "Services", item: `${website}/services` },
+        { "@type": "ListItem", position: 3, name: "About", item: `${website}/about` },
+      ],
+    };
+    recommendations.push({
+      schemaType: "BreadcrumbList",
+      description: "Helps AI crawlers understand your site structure and navigate between pages, improving overall discoverability.",
+      priority: "low",
+      code: `<script type="application/ld+json">\n${JSON.stringify(breadcrumbSchema, null, 2)}\n</script>`,
+      implemented: false,
+    });
+
+    res.json({ recommendations });
   });
 
   // Start nightly 2 AM scan scheduler

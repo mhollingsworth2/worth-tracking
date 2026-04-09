@@ -1,4 +1,4 @@
-import { BarChart3, Building2, Lightbulb, Plus, Bell, Search, KeyRound, Shield, LogOut } from "lucide-react";
+import { BarChart3, Building2, Lightbulb, Plus, Bell, Search, KeyRound, Shield, Palette, LogOut } from "lucide-react";
 import { Link, useLocation } from "wouter";
 import {
   Sidebar,
@@ -91,6 +91,16 @@ export function AppSidebar() {
                     <Link href="/admin" data-testid="link-admin">
                       <Shield className="w-4 h-4" />
                       <span>Admin Panel</span>
+                    </Link>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              )}
+              {isAdmin && (
+                <SidebarMenuItem>
+                  <SidebarMenuButton asChild isActive={location === "/agency"}>
+                    <Link href="/agency" data-testid="link-agency">
+                      <Palette className="w-4 h-4" />
+                      <span>Agency</span>
                     </Link>
                   </SidebarMenuButton>
                 </SidebarMenuItem>

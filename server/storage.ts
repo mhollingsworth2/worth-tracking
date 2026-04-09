@@ -13,6 +13,7 @@ import {
   type ScanJob, type InsertScanJob, scanJobs,
   type User, type SafeUser, users,
   type UserBusiness, userBusinesses,
+  type AgencySettings, type InsertAgencySettings, agencySettings,
 } from "@shared/schema";
 import bcrypt from "bcryptjs";
 import { drizzle } from "drizzle-orm/better-sqlite3";
@@ -122,6 +123,10 @@ export interface IStorage {
   unassignBusiness(userId: number, businessId: number): Promise<void>;
   getUserBusinessIds(userId: number): Promise<number[]>;
   getBusinessUsers(businessId: number): Promise<SafeUser[]>;
+
+  // Agency Settings
+  getAgencySettings(userId: number): Promise<AgencySettings | undefined>;
+  upsertAgencySettings(userId: number, data: Partial<InsertAgencySettings>): Promise<AgencySettings>;
 }
 
 export class DatabaseStorage implements IStorage {
@@ -826,6 +831,36 @@ export class DatabaseStorage implements IStorage {
       }
     }
     return result;
+  }
+
+  // === AGENCY SETTINGS ===
+  async getAgencySettings(userId: number): Promise<AgencySettings | undefined> {
+    return db.select().from(agencySettings).where(eq(agencySettings.userId, userId)).get();
+  }
+
+  async upsertAgencySettings(userId: number, data: Partial<InsertAgencySettings>): Promise<AgencySettings> {
+    const existing = await this.getAgencySettings(userId);
+    if (existing) {
+      const updates: any = {};
+      if (data.agencyName !== undefined) updates.agencyName = data.agencyName;
+      if (data.logoUrl !== undefined) updates.logoUrl = data.logoUrl;
+      if (data.primaryColor !== undefined) updates.primaryColor = data.primaryColor;
+      if (data.customDomain !== undefined) updates.customDomain = data.customDomain;
+      if (data.footerText !== undefined) updates.footerText = data.footerText;
+      db.update(agencySettings).set(updates).where(eq(agencySettings.id, existing.id)).run();
+      return (await this.getAgencySettings(userId))!;
+    } else {
+      const row = db.insert(agencySettings).values({
+        userId,
+        agencyName: data.agencyName || "My Agency",
+        logoUrl: data.logoUrl ?? null,
+        primaryColor: data.primaryColor ?? "#6366f1",
+        customDomain: data.customDomain ?? null,
+        footerText: data.footerText ?? null,
+        createdAt: new Date().toISOString(),
+      }).returning().get();
+      return row;
+    }
   }
 }
 

@@ -261,6 +261,22 @@ export const insertClickEventSchema = createInsertSchema(clickEvents).omit({ id:
 export type InsertClickEvent = z.infer<typeof insertClickEventSchema>;
 export type ClickEvent = typeof clickEvents.$inferSelect;
 
+// Agency Settings (white-label branding)
+export const agencySettings = sqliteTable("agency_settings", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  userId: integer("user_id").notNull(), // the admin/agency owner
+  agencyName: text("agency_name").notNull(),
+  logoUrl: text("logo_url"),
+  primaryColor: text("primary_color").default("#6366f1"),
+  customDomain: text("custom_domain"),
+  footerText: text("footer_text"),
+  createdAt: text("created_at").notNull(),
+});
+
+export const insertAgencySettingsSchema = createInsertSchema(agencySettings).omit({ id: true });
+export type InsertAgencySettings = z.infer<typeof insertAgencySettingsSchema>;
+export type AgencySettings = typeof agencySettings.$inferSelect;
+
 // API Budget Settings
 export const apiSettings = sqliteTable("api_settings", {
   id: integer("id").primaryKey({ autoIncrement: true }),

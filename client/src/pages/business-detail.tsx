@@ -121,6 +121,108 @@ function formatDuration(seconds: number): string {
   return `${m}m ${s}s`;
 }
 
+// ── Schema Markup Recommendations Component ──────────────────────────────────
+function SchemaRecommendations({ businessId }: { businessId: number }) {
+  const { toast } = useToast();
+  const [expandedCards, setExpandedCards] = useState<Set<number>>(new Set());
+
+  const { data, isLoading } = useQuery<{ recommendations: Array<{
+    schemaType: string;
+    description: string;
+    priority: "high" | "medium" | "low";
+    code: string;
+    implemented: boolean;
+  }> }>({
+    queryKey: ["/api/businesses", businessId, "schema-recommendations"],
+    queryFn: async () => {
+      const res = await apiRequest("POST", `/api/businesses/${businessId}/schema-recommendations`);
+      return res.json();
+    },
+  });
+
+  const toggleExpand = (index: number) => {
+    setExpandedCards(prev => {
+      const next = new Set(prev);
+      if (next.has(index)) next.delete(index);
+      else next.add(index);
+      return next;
+    });
+  };
+
+  const copyCode = async (code: string) => {
+    try {
+      await navigator.clipboard.writeText(code);
+      toast({ title: "Copied!", description: "Schema markup copied to clipboard." });
+    } catch {
+      toast({ title: "Copy failed", description: "Could not copy to clipboard.", variant: "destructive" });
+    }
+  };
+
+  const priorityBadge: Record<string, string> = {
+    high: "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400",
+    medium: "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400",
+    low: "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400",
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-sm font-medium flex items-center gap-2">
+          <Code2 className="w-4 h-4 text-primary" />
+          Schema Markup &amp; Structured Data Recommendations
+        </CardTitle>
+        <p className="text-xs text-muted-foreground mt-1">
+          Add these JSON-LD snippets to your website's &lt;head&gt; to improve AI discoverability.
+        </p>
+      </CardHeader>
+      <CardContent>
+        {isLoading ? (
+          <div className="space-y-3">
+            <Skeleton className="h-20 w-full" />
+            <Skeleton className="h-20 w-full" />
+          </div>
+        ) : data?.recommendations && data.recommendations.length > 0 ? (
+          <div className="space-y-4">
+            {data.recommendations.map((rec, idx) => (
+              <div key={idx} className="border rounded-lg p-4 space-y-3">
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <div className="flex items-center gap-2">
+                    <Code2 className="w-4 h-4 text-muted-foreground" />
+                    <span className="text-sm font-medium">{rec.schemaType}</span>
+                    <Badge variant="outline" className={`text-[10px] px-1.5 py-0 ${priorityBadge[rec.priority]}`}>
+                      {rec.priority}
+                    </Badge>
+                  </div>
+                  <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => copyCode(rec.code)}>
+                    <Copy className="w-3.5 h-3.5 mr-1" />
+                    Copy
+                  </Button>
+                </div>
+                <p className="text-xs text-muted-foreground">{rec.description}</p>
+                <Collapsible open={expandedCards.has(idx)} onOpenChange={() => toggleExpand(idx)}>
+                  <CollapsibleTrigger asChild>
+                    <Button variant="outline" size="sm" className="h-7 text-xs w-full justify-between">
+                      {expandedCards.has(idx) ? "Hide Code" : "View Code"}
+                      {expandedCards.has(idx) ? <ChevronUp className="w-3.5 h-3.5 ml-1" /> : <ChevronDown className="w-3.5 h-3.5 ml-1" />}
+                    </Button>
+                  </CollapsibleTrigger>
+                  <CollapsibleContent>
+                    <pre className="mt-2 p-3 bg-muted/50 rounded-md text-[11px] font-mono overflow-x-auto whitespace-pre-wrap break-all">
+                      {rec.code}
+                    </pre>
+                  </CollapsibleContent>
+                </Collapsible>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="text-sm text-muted-foreground py-4 text-center">No schema recommendations available.</p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 export default function BusinessDetail() {
   const [, params] = useRoute("/business/:id");
   const [, navigate] = useLocation();
@@ -428,6 +530,10 @@ export default function BusinessDetail() {
         <Tabs defaultValue="overview">
           <TabsList className="flex-wrap h-auto gap-1" data-testid="tabs-nav">
             <TabsTrigger value="overview" data-testid="tab-overview">Overview</TabsTrigger>
+            <TabsTrigger value="trends" className="gap-1.5" data-testid="tab-trends">
+              <TrendingUp className="w-3.5 h-3.5" />
+              Trends
+            </TabsTrigger>
             <TabsTrigger value="referrals" data-testid="tab-referrals">
               <MousePointerClick className="w-3.5 h-3.5 mr-1.5" />
               Referrals
@@ -964,6 +1070,9 @@ export default function BusinessDetail() {
                 ) : <p className="text-sm text-muted-foreground py-4 text-center">No optimized prompts generated yet</p>}
               </CardContent>
             </Card>
+
+            {/* Schema Markup Recommendations */}
+            <SchemaRecommendations businessId={id} />
           </TabsContent>
 
           {/* ========== RECORDS TAB ========== */}
@@ -1077,6 +1186,11 @@ export default function BusinessDetail() {
             </Card>
           </TabsContent>
 
+          {/* ========== TRENDS TAB ========== */}
+          <TabsContent value="trends" className="space-y-6 mt-4">
+            <QueryTrendsSection businessId={id} />
+          </TabsContent>
+
           {/* ========== SETTINGS TAB ========== */}
           <TabsContent value="settings" className="space-y-6 mt-4">
             <AIContextSettings businessId={id} business={business} />
@@ -1116,6 +1230,157 @@ export default function BusinessDetail() {
         />
       )}
     </ScrollArea>
+  );
+}
+
+/* ============ QUERY TRENDS SECTION ============ */
+function QueryTrendsSection({ businessId }: { businessId: number }) {
+  const [selectedQuery, setSelectedQuery] = useState<string>("__all__");
+  const [days, setDays] = useState(30);
+
+  const { data, isLoading } = useQuery<{
+    trends: { query: string; dataPoints: { date: string; mentionRate: number; avgPosition: number | null; total: number }[] }[];
+  }>({
+    queryKey: ["/api/businesses", businessId, "query-trends", { days }],
+    queryFn: async () => {
+      const res = await fetch(`/api/businesses/${businessId}/query-trends?days=${days}`);
+      if (!res.ok) throw new Error("Failed to fetch query trends");
+      return res.json();
+    },
+  });
+
+  const trends = data?.trends ?? [];
+  const queryOptions = trends.map((t) => t.query);
+
+  // Build chart data
+  let chartData: { date: string; mentionRate: number; avgPosition?: number | null }[] = [];
+  if (selectedQuery === "__all__" && trends.length > 0) {
+    const dateMap: Record<string, { totalMentionRate: number; count: number }> = {};
+    for (const t of trends) {
+      for (const dp of t.dataPoints) {
+        if (!dateMap[dp.date]) dateMap[dp.date] = { totalMentionRate: 0, count: 0 };
+        dateMap[dp.date].totalMentionRate += dp.mentionRate;
+        dateMap[dp.date].count += 1;
+      }
+    }
+    chartData = Object.entries(dateMap)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, v]) => ({ date, mentionRate: Math.round(v.totalMentionRate / v.count) }));
+  } else {
+    const match = trends.find((t) => t.query === selectedQuery);
+    chartData = match?.dataPoints ?? [];
+  }
+
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        <CardTitle className="text-sm font-medium flex items-center gap-2">
+          <TrendingUp className="w-4 h-4 text-primary" />
+          Query Trends Over Time
+        </CardTitle>
+        <CardDescription className="text-xs">Track how your mention rate and position change over time for each query.</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="flex flex-wrap gap-3">
+          <Select value={selectedQuery} onValueChange={setSelectedQuery}>
+            <SelectTrigger className="w-[300px]">
+              <SelectValue placeholder="Select a query" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__all__">All Queries (aggregate)</SelectItem>
+              {queryOptions.map((q) => (
+                <SelectItem key={q} value={q}>{q}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Select value={String(days)} onValueChange={(v) => setDays(parseInt(v))}>
+            <SelectTrigger className="w-[140px]">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="7">Last 7 days</SelectItem>
+              <SelectItem value="14">Last 14 days</SelectItem>
+              <SelectItem value="30">Last 30 days</SelectItem>
+              <SelectItem value="60">Last 60 days</SelectItem>
+              <SelectItem value="90">Last 90 days</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+
+        {isLoading ? (
+          <Skeleton className="h-[300px] w-full" />
+        ) : chartData.length === 0 ? (
+          <p className="text-sm text-muted-foreground py-8 text-center">No trend data available for the selected period.</p>
+        ) : (
+          <ResponsiveContainer width="100%" height={300}>
+            <AreaChart data={chartData} margin={{ top: 5, right: 20, bottom: 5, left: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
+              <XAxis
+                dataKey="date"
+                tick={{ fontSize: 11 }}
+                tickFormatter={(v: string) => {
+                  const d = new Date(v + "T00:00:00");
+                  return `${d.getMonth() + 1}/${d.getDate()}`;
+                }}
+              />
+              <YAxis
+                yAxisId="left"
+                tick={{ fontSize: 11 }}
+                domain={[0, 100]}
+                tickFormatter={(v: number) => `${v}%`}
+                label={{ value: "Mention Rate", angle: -90, position: "insideLeft", style: { fontSize: 11, fill: "hsl(var(--muted-foreground))" } }}
+              />
+              {selectedQuery !== "__all__" && (
+                <YAxis
+                  yAxisId="right"
+                  orientation="right"
+                  tick={{ fontSize: 11 }}
+                  reversed
+                  domain={[1, "auto"]}
+                  label={{ value: "Avg Position", angle: 90, position: "insideRight", style: { fontSize: 11, fill: "hsl(var(--muted-foreground))" } }}
+                />
+              )}
+              <Tooltip
+                contentStyle={{ fontSize: 12 }}
+                formatter={(value: number, name: string) => {
+                  if (name === "mentionRate") return [`${value}%`, "Mention Rate"];
+                  if (name === "avgPosition") return [value, "Avg Position"];
+                  return [value, name];
+                }}
+                labelFormatter={(label: string) => {
+                  const d = new Date(label + "T00:00:00");
+                  return d.toLocaleDateString();
+                }}
+              />
+              <Area
+                yAxisId="left"
+                type="monotone"
+                dataKey="mentionRate"
+                stroke="hsl(var(--primary))"
+                fill="hsl(var(--primary))"
+                fillOpacity={0.15}
+                strokeWidth={2}
+                dot={{ r: 3 }}
+                name="mentionRate"
+              />
+              {selectedQuery !== "__all__" && (
+                <Area
+                  yAxisId="right"
+                  type="monotone"
+                  dataKey="avgPosition"
+                  stroke="hsl(var(--chart-2, 220 70% 50%))"
+                  fill="hsl(var(--chart-2, 220 70% 50%))"
+                  fillOpacity={0.08}
+                  strokeWidth={2}
+                  dot={{ r: 3 }}
+                  name="avgPosition"
+                />
+              )}
+            </AreaChart>
+          </ResponsiveContainer>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 
@@ -1294,8 +1559,97 @@ function CompetitorsSection({ businessId, competitors, stats }: { businessId: nu
 }
 
 /* ============ COMPETITIVE PROMPT INTELLIGENCE ============ */
+type ContentBrief = {
+  title: string;
+  contentType: string;
+  wordCount: number;
+  outline: { heading: string; points: string[] }[];
+  keywords: string[];
+  callToAction: string;
+  rationale: string;
+};
+
+function ContentBriefCard({ brief }: { brief: ContentBrief }) {
+  const contentTypeLabels: Record<string, string> = {
+    blog_post: "Blog Post", faq: "FAQ Page", landing_page: "Landing Page",
+    guide: "Guide", comparison: "Comparison", case_study: "Case Study",
+  };
+
+  return (
+    <div className="mt-2 border rounded-lg p-4 bg-muted/30 space-y-3">
+      <div className="flex items-start justify-between gap-2">
+        <h4 className="text-sm font-semibold">{brief.title}</h4>
+        <div className="flex gap-1.5 shrink-0">
+          <Badge variant="secondary" className="text-[10px]">{contentTypeLabels[brief.contentType] || brief.contentType}</Badge>
+          <Badge variant="outline" className="text-[10px]">{brief.wordCount} words</Badge>
+        </div>
+      </div>
+
+      <div>
+        <p className="text-xs font-medium mb-1.5">Outline</p>
+        <div className="space-y-2">
+          {brief.outline.map((section, j) => (
+            <div key={j}>
+              <p className="text-xs font-medium text-primary">{section.heading}</p>
+              <ul className="list-disc list-inside ml-2">
+                {section.points.map((point, k) => (
+                  <li key={k} className="text-[11px] text-muted-foreground">{point}</li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div>
+        <p className="text-xs font-medium mb-1">Keywords</p>
+        <div className="flex flex-wrap gap-1">
+          {brief.keywords.map((kw) => (
+            <Badge key={kw} variant="outline" className="text-[10px]">{kw}</Badge>
+          ))}
+        </div>
+      </div>
+
+      <div>
+        <p className="text-xs font-medium mb-0.5">Call to Action</p>
+        <p className="text-xs text-muted-foreground">{brief.callToAction}</p>
+      </div>
+
+      <div className="border-t pt-2">
+        <p className="text-xs font-medium mb-0.5">Why This Will Help</p>
+        <p className="text-xs text-muted-foreground">{brief.rationale}</p>
+      </div>
+    </div>
+  );
+}
+
 function CompetitorPromptIntel({ businessId }: { businessId: number }) {
   const [filter, setFilter] = useState<"all" | "losing" | "winning" | "tied">("all");
+  const [briefs, setBriefs] = useState<Record<string, ContentBrief>>({});
+  const [expandedBriefs, setExpandedBriefs] = useState<Record<string, boolean>>({});
+  const [loadingBriefs, setLoadingBriefs] = useState<Record<string, boolean>>({});
+
+  const generateBrief = async (query: string) => {
+    setLoadingBriefs((prev) => ({ ...prev, [query]: true }));
+    try {
+      const res = await fetch(`/api/businesses/${businessId}/content-brief`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query }),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error || "Failed to generate brief");
+      }
+      const brief: ContentBrief = await res.json();
+      setBriefs((prev) => ({ ...prev, [query]: brief }));
+      setExpandedBriefs((prev) => ({ ...prev, [query]: true }));
+    } catch (err: any) {
+      console.error("Content brief generation failed:", err.message);
+    } finally {
+      setLoadingBriefs((prev) => ({ ...prev, [query]: false }));
+    }
+  };
 
   const { data, isLoading } = useQuery<{
     queries: {
@@ -1350,6 +1704,37 @@ function CompetitorPromptIntel({ businessId }: { businessId: number }) {
                     ))}
                   </div>
                   <p className="text-xs text-muted-foreground leading-relaxed">{rec.tip}</p>
+                  <div className="flex items-center gap-2 pt-1">
+                    {briefs[rec.query] ? (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 text-xs gap-1"
+                        onClick={() => setExpandedBriefs((prev) => ({ ...prev, [rec.query]: !prev[rec.query] }))}
+                      >
+                        <FileText className="w-3.5 h-3.5" />
+                        {expandedBriefs[rec.query] ? "Hide Brief" : "Show Brief"}
+                        {expandedBriefs[rec.query] ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                      </Button>
+                    ) : (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-7 text-xs gap-1"
+                        disabled={loadingBriefs[rec.query]}
+                        onClick={() => generateBrief(rec.query)}
+                      >
+                        {loadingBriefs[rec.query] ? (
+                          <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Generating...</>
+                        ) : (
+                          <><Sparkles className="w-3.5 h-3.5" /> Generate Brief</>
+                        )}
+                      </Button>
+                    )}
+                  </div>
+                  {briefs[rec.query] && expandedBriefs[rec.query] && (
+                    <ContentBriefCard brief={briefs[rec.query]} />
+                  )}
                 </div>
               ))}
             </div>
