@@ -45,7 +45,7 @@ async function fetchWithRetry(url: string, options: RequestInit, maxRetries = 2)
 // Models are told to explicitly decline rather than fabricate business details.
 // System instruction: be helpful and natural — we WANT to see what AI actually says
 // about businesses. The hallucination detector catches fabrications after the fact.
-const SYSTEM_INSTRUCTION = "You are a helpful assistant answering questions about local businesses and services. Provide your best, most useful recommendations based on what you know. Include specific business names, locations, and details when you can. Be thorough and give actionable recommendations.";
+const SYSTEM_INSTRUCTION = "You are a knowledgeable local guide helping someone find and evaluate businesses in their area. Always give direct, specific answers with real business names. Never say you can't help, don't have access, or suggest the user search elsewhere — just answer the question with your best knowledge. Be concise and recommend specific businesses by name.";
 
 // ── AI-Powered Response Analysis ──────────────────────────────────────────
 // Instead of fragile string matching, we send a follow-up call to a cheap AI
@@ -790,101 +790,101 @@ export function generateScanQueries(ctx: BusinessContext): string[] {
   // ── Discovery queries (intent: find options) ──────────────────────────────
   const discovery: string[] = loc
     ? [
-        `What are the best ${ind} businesses in ${loc}?`,
-        `Top rated ${ind} companies in ${loc} area`,
-        `Which ${ind} provider should I choose in ${loc}?`,
-        `Most recommended ${ind} options near ${loc}`,
+        `I need a good ${ind} company in ${loc}. Who do you recommend?`,
+        `What are the best ${ind} businesses in the ${loc} area? Give me your top picks.`,
+        `I'm looking for a reliable ${ind} provider near ${loc}. Who should I call?`,
+        `Which ${ind} companies in ${loc} have the best reputation?`,
       ]
     : [
-        `What are the best ${ind} businesses?`,
-        `Top rated ${ind} companies to consider this year`,
-        `Which ${ind} provider should I choose?`,
-        `Most recommended ${ind} options available right now`,
+        `I need a good ${ind} company. Who do you recommend?`,
+        `What are the best ${ind} businesses right now? Give me your top picks.`,
+        `I'm looking for a reliable ${ind} provider. Who should I call?`,
+        `Which ${ind} companies have the best reputation?`,
       ];
 
   // ── Service-specific queries ──────────────────────────────────────────────
   const serviceQueries: string[] = [];
   for (const svc of servicesList.slice(0, 4)) {
-    serviceQueries.push(`best ${svc} services${loc ? ` in ${loc}` : ""}`);
-    serviceQueries.push(`who offers ${svc}${loc ? ` near ${loc}` : ""}?`);
+    serviceQueries.push(`I need ${svc} services${loc ? ` in ${loc}` : ""}. Who's the best?`);
+    serviceQueries.push(`Who offers the best ${svc}${loc ? ` near ${loc}` : ""}? Give me specific names.`);
   }
 
   // ── Keyword-driven queries ────────────────────────────────────────────────
   const keywordQueries: string[] = [];
   for (const kw of keywordsList.slice(0, 4)) {
-    keywordQueries.push(`${kw} ${ind}${loc ? ` in ${loc}` : ""}`);
+    keywordQueries.push(`I'm looking for ${kw} ${ind}${loc ? ` in ${loc}` : ""}. Who do you recommend?`);
   }
 
   // ── Audience-specific queries ─────────────────────────────────────────────
   const audienceQueries: string[] = [];
   for (const aud of audienceList.slice(0, 3)) {
-    audienceQueries.push(`best ${ind} for ${aud}${loc ? ` in ${loc}` : ""}`);
+    audienceQueries.push(`What's the best ${ind} for ${aud}${loc ? ` in ${loc}` : ""}?`);
   }
 
   // ── Competitor comparison queries ─────────────────────────────────────────
   const competitorQueries: string[] = loc
     ? [
-        `Compare ${name} to other ${ind} options in ${loc}`,
-        `${name} vs competitors in ${loc} — which is better?`,
+        `How does ${name} compare to other ${ind} companies in ${loc}?`,
+        `I'm deciding between ${name} and other ${ind} options in ${loc}. Which one should I pick?`,
       ]
     : [
-        `Compare ${name} to other ${ind} options`,
-        `${name} vs competitors — which is better?`,
+        `How does ${name} compare to other ${ind} companies?`,
+        `I'm deciding between ${name} and other ${ind} options. Which one should I pick?`,
       ];
   for (const comp of competitorsList.slice(0, 3)) {
-    competitorQueries.push(`${name} vs ${comp}${loc ? ` in ${loc}` : ""} — which is better?`);
+    competitorQueries.push(`I'm choosing between ${name} and ${comp}${loc ? ` in ${loc}` : ""}. Which one is better and why?`);
   }
 
   // ── Review / reputation queries (intent: validate trust) ─────────────────
   const review: string[] = loc
     ? [
-        `${name} in ${loc} reviews and reputation`,
-        `Is ${name} in ${loc} worth it?`,
-        `What do customers say about ${name} in ${loc}?`,
-        `Problems or complaints about ${name} ${loc}`,
+        `I'm thinking about hiring ${name} in ${loc}. What do you know about them? Are they any good?`,
+        `Is ${name} in ${loc} worth the money? What's their reputation like?`,
+        `Tell me about ${name} in ${loc} — are they reliable? What are they known for?`,
+        `Have there been any complaints about ${name} in ${loc}? Should I be worried about anything?`,
       ]
     : [
-        `${name} reviews and reputation`,
-        `Is ${name} worth it?`,
-        `What do customers say about ${name}?`,
-        `Problems or complaints about ${name}`,
+        `I'm thinking about hiring ${name}. What do you know about them? Are they any good?`,
+        `Is ${name} worth the money? What's their reputation like?`,
+        `Tell me about ${name} — are they reliable?`,
+        `Have there been any complaints about ${name}?`,
       ];
 
   // ── Local queries (intent: find nearby) ──────────────────────────────────
   const local: string[] = loc
     ? [
-        `Best ${ind} near ${loc}`,
-        `Top rated ${ind} in ${loc}`,
-        `Highly reviewed ${ind} services in ${loc}`,
+        `Who's the best ${ind} company near ${loc}? I need someone local.`,
+        `Can you recommend a top-rated ${ind} service in ${loc}?`,
+        `I live in ${loc} and need ${ind} services. Who do people recommend?`,
       ]
     : [
-        `${ind} businesses near me`,
-        `Local ${ind} providers with good reviews`,
+        `I need a local ${ind} company. Who's good in my area?`,
+        `Can you recommend a ${ind} provider with great reviews near me?`,
       ];
 
   // ── Long-tail / intent queries ────────────────────────────────────────────
   const longTail: string[] = loc
     ? [
-        `affordable ${ind} services in ${loc} with good customer support`,
-        `how to choose a reliable ${ind} business in ${loc}`,
-        `${ind} services in ${loc} that are worth the price`,
+        `I want an affordable but good ${ind} service in ${loc}. Any suggestions?`,
+        `What should I look for when hiring a ${ind} company in ${loc}? Who do you recommend?`,
+        `Which ${ind} services in ${loc} give you the best value for money?`,
       ]
     : [
-        `affordable ${ind} services with good customer support`,
-        `how to choose a reliable ${ind} business`,
-        `${ind} services that are worth the price`,
+        `I want an affordable but good ${ind} service. Any suggestions?`,
+        `What should I look for when hiring a ${ind} company? Who do you recommend?`,
+        `Which ${ind} services give you the best value for money?`,
       ];
 
   // ── Seasonal / trending ───────────────────────────────────────────────────
   const currentYear = new Date().getFullYear();
   const seasonal: string[] = loc
     ? [
-        `best ${ind} businesses in ${loc} in ${currentYear}`,
-        `${name} in ${loc} — is it still a good choice in ${currentYear}?`,
+        `What are the best ${ind} companies in ${loc} for ${currentYear}?`,
+        `Is ${name} in ${loc} still good in ${currentYear}? Or are there better options now?`,
       ]
     : [
-        `best ${ind} businesses in ${currentYear}`,
-        `${name} — is it still a good choice in ${currentYear}?`,
+        `What are the best ${ind} companies for ${currentYear}?`,
+        `Is ${name} still good in ${currentYear}? Or are there better options now?`,
       ];
 
   // ── Custom queries (user-provided, highest priority) ───────────────────────
