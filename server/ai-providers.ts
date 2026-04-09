@@ -42,12 +42,12 @@ async function fetchWithRetry(url: string, options: RequestInit, maxRetries = 2)
 }
 
 // Build a focused system instruction that constrains AI responses to the right industry
-function buildSystemInstruction(businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }): string {
-  const industry = businessContext?.industry;
-  const location = businessContext?.location;
-  const industryClause = industry ? ` Focus ONLY on ${industry} businesses and services.` : "";
-  const locationClause = location ? ` Focus on businesses in or near ${location}.` : "";
-  return `You are a knowledgeable local guide helping someone find and evaluate businesses.${industryClause}${locationClause} Always give direct, specific answers with real business names. Never say you can't help, don't have access, or suggest the user search elsewhere — just answer the question with your best knowledge. Be concise. Do NOT mention businesses from unrelated industries.`;
+// Minimal system prompt — simulate what a real user would get, no coaching.
+// Other AI visibility trackers (Otterly, Peec, Profound) query with NO system
+// prompt at all. We use a minimal one just to set conversational tone without
+// biasing the AI toward mentioning any particular business.
+function buildSystemInstruction(_businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }): string {
+  return `Answer the user's question helpfully and concisely.`;
 }
 
 // ── AI-Powered Response Analysis ──────────────────────────────────────────
@@ -381,7 +381,8 @@ export function setHealthCallback(cb: typeof healthCallback) {
 async function queryOpenAI(apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }): Promise<AIQueryResult> {
   const startTime = Date.now();
   try {
-    const res = await fetchWithRetry("https://api.openai.com/v1/chat/completions", {
+    // Use OpenAI Responses API with web search tool for real-world results
+    const res = await fetchWithRetry("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${apiKey}`,
@@ -389,12 +390,8 @@ async function queryOpenAI(apiKey: string, query: string, businessName: string, 
       },
       body: JSON.stringify({
         model: "gpt-4o-mini",
-        max_completion_tokens: 1024,
-        temperature: 0,
-        messages: [
-          { role: "system", content: buildSystemInstruction(businessContext) },
-          { role: "user", content: query },
-        ],
+        tools: [{ type: "web_search_preview" }],
+        input: query,
       }),
     });
 
@@ -404,11 +401,22 @@ async function queryOpenAI(apiKey: string, query: string, businessName: string, 
     }
 
     const data = await res.json();
-    const responseText = data.choices?.[0]?.message?.content ?? "";
-    const analysis = await analyzeWithAI(businessName, query, responseText, businessContext);
+    // Responses API returns output array — extract text from message items
+    let responseText = "";
+    if (Array.isArray(data.output)) {
+      for (const item of data.output) {
+        if (item.type === "message" && Array.isArray(item.content)) {
+          for (const block of item.content) {
+            if (block.type === "output_text") responseText += block.text;
+          }
+        }
+      }
+    }
+    if (!responseText) responseText = data.output_text ?? "";
+    const analysis = analyzeWithAI(businessName, query, responseText, businessContext);
 
     healthCallback?.("openai", "success", Date.now() - startTime);
-    return { platform: "ChatGPT", query, responseText, ...analysis, sourceType: "knowledge" as const, crossValidated: null };
+    return { platform: "ChatGPT", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null };
   } catch (err: any) {
     healthCallback?.("openai", "error", Date.now() - startTime, err.message);
     throw err;
@@ -443,7 +451,7 @@ async function queryAnthropic(apiKey: string, query: string, businessName: strin
     const responseText = Array.isArray(data.content)
       ? data.content.filter((block: any) => block.type === "text").map((block: any) => block.text).join("\n")
       : "";
-    const analysis = await analyzeWithAI(businessName, query, responseText, businessContext);
+    const analysis = analyzeWithAI(businessName, query, responseText, businessContext);
 
     healthCallback?.("anthropic", "success", Date.now() - startTime);
     return { platform: "Claude", query, responseText, ...analysis, sourceType: "knowledge" as const, crossValidated: null };
@@ -456,12 +464,14 @@ async function queryAnthropic(apiKey: string, query: string, businessName: strin
 async function queryGemini(apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }): Promise<AIQueryResult> {
   const startTime = Date.now();
   try {
-    const res = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
+    // Enable Google Search grounding so Gemini can find real local businesses
+    const res = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: buildSystemInstruction(businessContext) }] },
         contents: [{ parts: [{ text: query }] }],
+        tools: [{ google_search: {} }],
         generationConfig: { temperature: 0 },
       }),
     });
@@ -472,8 +482,10 @@ async function queryGemini(apiKey: string, query: string, businessName: string, 
     }
 
     const data = await res.json();
-    const responseText = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-    const analysis = await analyzeWithAI(businessName, query, responseText, businessContext);
+    // Gemini may return multiple parts when grounded; concatenate all text parts
+    const parts = data.candidates?.[0]?.content?.parts ?? [];
+    const responseText = parts.filter((p: any) => p.text).map((p: any) => p.text).join("\n") || "";
+    const analysis = analyzeWithAI(businessName, query, responseText, businessContext);
 
     healthCallback?.("google", "success", Date.now() - startTime);
     return { platform: "Google Gemini", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null };
@@ -510,7 +522,7 @@ async function queryPerplexity(apiKey: string, query: string, businessName: stri
 
     const data = await res.json();
     const responseText = data.choices?.[0]?.message?.content ?? "";
-    const analysis = await analyzeWithAI(businessName, query, responseText, businessContext);
+    const analysis = analyzeWithAI(businessName, query, responseText, businessContext);
 
     healthCallback?.("perplexity", "success", Date.now() - startTime);
     return { platform: "Perplexity", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null };
@@ -537,10 +549,10 @@ const PROVIDER_PLATFORM: Record<string, string> = {
 // Estimated cost per API call (input + output for ~1024 tokens)
 // These are conservative estimates based on 2026 pricing
 export const PROVIDER_COST_PER_CALL: Record<string, number> = {
-  openai: 0.003,      // gpt-4o-mini: ~$0.15/1M input + $0.60/1M output
-  anthropic: 0.004,   // claude-3-5-haiku: ~$0.25/1M input + $1.25/1M output
-  google: 0.001,      // gemini-2.0-flash: ~$0.10/1M input + $0.40/1M output
-  perplexity: 0.005,  // sonar: ~$1/1M input + $1/1M output
+  openai: 0.005,      // gpt-4o-mini + web_search_preview
+  anthropic: 0.004,   // claude-3-5-haiku (knowledge only — no web search API yet)
+  google: 0.003,      // gemini-2.0-flash + google_search grounding
+  perplexity: 0.005,  // sonar (web search built-in)
 };
 
 // ── Cross-Platform Validation ──────────────────────────────────────────────
