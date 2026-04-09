@@ -11,6 +11,8 @@ export const businesses = sqliteTable("businesses", {
   website: text("website"),
   location: text("location"),
   ga4Id: text("ga4_id"),
+  websiteLastScraped: text("website_last_scraped"),
+  competitorsLastDiscovered: text("competitors_last_discovered"),
 });
 
 export const insertBusinessSchema = createInsertSchema(businesses).omit({ id: true });
@@ -239,3 +241,34 @@ export const apiSettings = sqliteTable("api_settings", {
 export const insertApiSettingsSchema = createInsertSchema(apiSettings).omit({ id: true });
 export type InsertApiSettings = z.infer<typeof insertApiSettingsSchema>;
 export type ApiSettings = typeof apiSettings.$inferSelect;
+
+// Automation Jobs — tracks background automation task runs
+export const automationJobs = sqliteTable("automation_jobs", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  businessId: integer("business_id").notNull(),
+  jobType: text("job_type").notNull(), // e.g. "scrape_website", "discover_competitors", "news_monitor", etc.
+  status: text("status").notNull().default("pending"), // pending | running | completed | failed
+  lastRun: text("last_run"),
+  nextRun: text("next_run"),
+  errorMessage: text("error_message"),
+});
+
+export const insertAutomationJobSchema = createInsertSchema(automationJobs).omit({ id: true });
+export type InsertAutomationJob = z.infer<typeof insertAutomationJobSchema>;
+export type AutomationJob = typeof automationJobs.$inferSelect;
+
+// Automation Settings — per-business configuration for automations
+export const automationSettings = sqliteTable("automation_settings", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  businessId: integer("business_id").notNull().unique(),
+  ga4PropertyId: text("ga4_property_id"),
+  ga4ApiKey: text("ga4_api_key"),
+  newsEnabled: integer("news_enabled").notNull().default(1),
+  pricingEnabled: integer("pricing_enabled").notNull().default(1),
+  scraperEnabled: integer("scraper_enabled").notNull().default(1),
+  competitorDiscoveryEnabled: integer("competitor_discovery_enabled").notNull().default(1),
+});
+
+export const insertAutomationSettingsSchema = createInsertSchema(automationSettings).omit({ id: true });
+export type InsertAutomationSettings = z.infer<typeof insertAutomationSettingsSchema>;
+export type AutomationSettings = typeof automationSettings.$inferSelect;

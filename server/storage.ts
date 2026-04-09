@@ -13,6 +13,8 @@ import {
   type ScanJob, type InsertScanJob, scanJobs,
   type User, type SafeUser, users,
   type UserBusiness, userBusinesses,
+  type AutomationJob, type InsertAutomationJob, automationJobs,
+  type AutomationSettings, type InsertAutomationSettings, automationSettings,
 } from "@shared/schema";
 import bcrypt from "bcryptjs";
 import { drizzle } from "drizzle-orm/better-sqlite3";
@@ -122,6 +124,14 @@ export interface IStorage {
   unassignBusiness(userId: number, businessId: number): Promise<void>;
   getUserBusinessIds(userId: number): Promise<number[]>;
   getBusinessUsers(businessId: number): Promise<SafeUser[]>;
+
+  // Automation Jobs
+  getAutomationJobs(businessId: number): Promise<AutomationJob[]>;
+  upsertAutomationJob(businessId: number, jobType: string, status: string, errorMessage?: string): Promise<void>;
+
+  // Automation Settings
+  getAutomationSettings(businessId: number): Promise<AutomationSettings | undefined>;
+  upsertAutomationSettings(businessId: number, data: Partial<InsertAutomationSettings>): Promise<AutomationSettings>;
 }
 
 export class DatabaseStorage implements IStorage {
@@ -146,6 +156,8 @@ export class DatabaseStorage implements IStorage {
     if (data.industry !== undefined) updates.industry = data.industry;
     if (data.website !== undefined) updates.website = data.website;
     if (data.location !== undefined) updates.location = data.location;
+    if (data.websiteLastScraped !== undefined) updates.websiteLastScraped = data.websiteLastScraped;
+    if (data.competitorsLastDiscovered !== undefined) updates.competitorsLastDiscovered = data.competitorsLastDiscovered;
 
     if (Object.keys(updates).length === 0) {
       return this.getBusiness(id);
@@ -766,6 +778,61 @@ export class DatabaseStorage implements IStorage {
       }
     }
     return result;
+  }
+
+  // === AUTOMATION JOBS ===
+  async getAutomationJobs(businessId: number): Promise<AutomationJob[]> {
+    return db.select().from(automationJobs)
+      .where(eq(automationJobs.businessId, businessId))
+      .all();
+  }
+
+  async upsertAutomationJob(
+    businessId: number,
+    jobType: string,
+    status: string,
+    errorMessage?: string
+  ): Promise<void> {
+    const now = new Date().toISOString();
+    const existing = db.select().from(automationJobs)
+      .where(sql`${automationJobs.businessId} = ${businessId} AND ${automationJobs.jobType} = ${jobType}`)
+      .get();
+
+    if (existing) {
+      db.update(automationJobs)
+        .set({ status, lastRun: now, errorMessage: errorMessage ?? null })
+        .where(eq(automationJobs.id, existing.id))
+        .run();
+    } else {
+      db.insert(automationJobs)
+        .values({ businessId, jobType, status, lastRun: now })
+        .run();
+    }
+  }
+
+  // === AUTOMATION SETTINGS ===
+  async getAutomationSettings(businessId: number): Promise<AutomationSettings | undefined> {
+    return db.select().from(automationSettings)
+      .where(eq(automationSettings.businessId, businessId))
+      .get();
+  }
+
+  async upsertAutomationSettings(
+    businessId: number,
+    data: Partial<InsertAutomationSettings>
+  ): Promise<AutomationSettings> {
+    const existing = await this.getAutomationSettings(businessId);
+    if (existing) {
+      return db.update(automationSettings)
+        .set(data)
+        .where(eq(automationSettings.businessId, businessId))
+        .returning()
+        .get();
+    }
+    return db.insert(automationSettings)
+      .values({ businessId, ...data })
+      .returning()
+      .get();
   }
 }
 
