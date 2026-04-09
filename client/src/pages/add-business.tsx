@@ -2,6 +2,7 @@ import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation } from "@tanstack/react-query";
 import { useLocation } from "wouter";
+import { useState } from "react";
 import { insertBusinessSchema, type InsertBusiness } from "@shared/schema";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
@@ -11,7 +12,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage, FormDescription } from "@/components/ui/form";
-import { ArrowLeft, Loader2 } from "lucide-react";
+import { ArrowLeft, Loader2, Globe, Sparkles } from "lucide-react";
 import { Link } from "wouter";
 
 const industries = [
@@ -36,6 +37,7 @@ const industries = [
 export default function AddBusiness() {
   const [, navigate] = useLocation();
   const { toast } = useToast();
+  const [scraping, setScraping] = useState(false);
 
   const form = useForm<InsertBusiness>({
     resolver: zodResolver(insertBusinessSchema),
@@ -68,6 +70,51 @@ export default function AddBusiness() {
     },
   });
 
+  const handleAutoFill = async () => {
+    const url = form.getValues("website");
+    if (!url || !url.trim()) {
+      toast({ title: "Enter a website URL first", variant: "destructive" });
+      return;
+    }
+    setScraping(true);
+    try {
+      const res = await fetch("/api/tools/scrape-website", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: url.trim() }),
+        credentials: "include",
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        toast({ title: "Auto-fill failed", description: data.error || "Could not analyze website", variant: "destructive" });
+        return;
+      }
+
+      // Only fill empty fields — don't overwrite user input
+      const fields: (keyof InsertBusiness)[] = ["name", "industry", "description", "location", "services", "keywords", "targetAudience", "uniqueSellingPoints", "competitors"];
+      let filled = 0;
+      for (const field of fields) {
+        const current = form.getValues(field);
+        const scraped = data[field];
+        if (scraped && (!current || !current.toString().trim())) {
+          form.setValue(field, scraped, { shouldValidate: true });
+          filled++;
+        }
+      }
+      // Always update website to the normalized URL
+      if (data.website) form.setValue("website", data.website);
+
+      toast({
+        title: "Auto-fill complete",
+        description: `Filled ${filled} field${filled !== 1 ? "s" : ""} from ${url}. Review and adjust as needed.`,
+      });
+    } catch (err: any) {
+      toast({ title: "Auto-fill failed", description: err.message, variant: "destructive" });
+    } finally {
+      setScraping(false);
+    }
+  };
+
   return (
     <div className="p-6 max-w-2xl">
       <Link href="/">
@@ -78,12 +125,52 @@ export default function AddBusiness() {
       </Link>
 
       <h1 className="text-xl font-semibold mb-1" data-testid="text-page-title">Add a Business</h1>
-      <p className="text-sm text-muted-foreground mb-6">The more detail you provide, the better we can track your AI visibility with targeted queries.</p>
+      <p className="text-sm text-muted-foreground mb-6">Enter your website below and we'll auto-fill the rest, or fill in the details manually.</p>
 
       <Card>
         <CardContent className="p-6">
           <Form {...form}>
             <form onSubmit={form.handleSubmit((d) => mutation.mutate(d))} className="space-y-5">
+
+              {/* ── Website + Auto-fill (top of form) ────── */}
+              <div className="rounded-lg border bg-muted/30 p-4 space-y-3">
+                <div className="flex items-center gap-2 mb-1">
+                  <Globe className="w-4 h-4 text-muted-foreground" />
+                  <span className="text-sm font-medium">Quick Start — Enter your website</span>
+                </div>
+                <FormField
+                  control={form.control}
+                  name="website"
+                  render={({ field }) => (
+                    <FormItem>
+                      <div className="flex gap-2">
+                        <FormControl>
+                          <Input
+                            placeholder="https://yourbusiness.com"
+                            {...field}
+                            value={field.value ?? ""}
+                            className="flex-1"
+                            data-testid="input-website"
+                          />
+                        </FormControl>
+                        <Button
+                          type="button"
+                          variant="default"
+                          onClick={handleAutoFill}
+                          disabled={scraping}
+                          className="shrink-0 gap-1.5"
+                          data-testid="button-autofill"
+                        >
+                          {scraping ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                          {scraping ? "Analyzing..." : "Auto-fill"}
+                        </Button>
+                      </div>
+                      <FormDescription>We'll scan your website and fill in the fields below automatically.</FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </div>
 
               {/* ── Core fields ──────────────────────────── */}
               <FormField
@@ -143,35 +230,19 @@ export default function AddBusiness() {
                 )}
               />
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <FormField
-                  control={form.control}
-                  name="website"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Website (optional)</FormLabel>
-                      <FormControl>
-                        <Input placeholder="https://..." {...field} value={field.value ?? ""} data-testid="input-website" />
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-
-                <FormField
-                  control={form.control}
-                  name="location"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Location (optional)</FormLabel>
-                      <FormControl>
-                        <Input placeholder="e.g. San Francisco, CA" {...field} value={field.value ?? ""} data-testid="input-location" />
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-              </div>
+              <FormField
+                control={form.control}
+                name="location"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Location (optional)</FormLabel>
+                    <FormControl>
+                      <Input placeholder="e.g. San Francisco, CA" {...field} value={field.value ?? ""} data-testid="input-location" />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
 
               {/* ── Rich context fields ──────────────────── */}
               <div className="border-t pt-5 mt-2">

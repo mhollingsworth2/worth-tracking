@@ -1062,6 +1062,216 @@ export async function registerRoutes(
     res.json(result);
   });
 
+  // === WEBSITE SCRAPE → AUTO-FILL ===
+  // Fetches a website, extracts text, and uses AI to parse business info
+  app.post("/api/tools/scrape-website", async (req, res) => {
+    const { url } = req.body;
+    if (!url || typeof url !== "string") {
+      return res.status(400).json({ error: "url is required" });
+    }
+
+    // Normalize URL
+    let fullUrl = url.trim();
+    if (!fullUrl.startsWith("http")) fullUrl = "https://" + fullUrl;
+
+    try {
+      // 1. Fetch the webpage
+      const pageRes = await fetch(fullUrl, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (compatible; WorthTracking/1.0; +https://worthtracking.com)",
+          "Accept": "text/html",
+        },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!pageRes.ok) {
+        return res.status(400).json({ error: `Could not fetch website (HTTP ${pageRes.status})` });
+      }
+      const html = await pageRes.text();
+
+      // 2. Extract meaningful text from HTML (strip tags, scripts, styles)
+      const cleaned = html
+        .replace(/<script[\s\S]*?<\/script>/gi, "")
+        .replace(/<style[\s\S]*?<\/style>/gi, "")
+        .replace(/<nav[\s\S]*?<\/nav>/gi, "")
+        .replace(/<footer[\s\S]*?<\/footer>/gi, "")
+        .replace(/<header[\s\S]*?<\/header>/gi, "")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/&[a-zA-Z]+;/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 6000); // limit to ~6000 chars for the AI prompt
+
+      if (cleaned.length < 50) {
+        return res.status(400).json({ error: "Could not extract enough text from the website" });
+      }
+
+      // 3. Get an API key for analysis
+      const keys = await storage.getApiKeys();
+      const activeKeys = keys.filter((k) => k.isActive);
+      if (activeKeys.length === 0) {
+        return res.status(400).json({ error: "No API keys configured. Add one in Settings → API Keys first." });
+      }
+
+      // 4. Send to AI for extraction
+      const prompt = `Analyze this website content and extract business information. Return ONLY valid JSON with these fields:
+{
+  "name": "Business name",
+  "industry": "One of: Restaurant, Technology, Healthcare, Retail, Finance, Education, Real Estate, Legal, Marketing, Fitness, Beauty, Automotive, Construction, Consulting, Cleaning Services, Other",
+  "description": "2-3 sentence business description",
+  "location": "City, State or null if not found",
+  "services": "comma-separated list of services/products offered",
+  "keywords": "comma-separated search keywords relevant to this business",
+  "targetAudience": "comma-separated target customer segments",
+  "uniqueSellingPoints": "what makes this business unique/different",
+  "competitors": "comma-separated list of 3-5 real well-known competitors in the same industry and area"
+}
+
+Website URL: ${fullUrl}
+Website content:
+"""
+${cleaned}
+"""
+
+Extract real information from the content. If a field isn't clear from the website, use your best judgment or leave it empty. For industry, pick the closest match from the list provided. For competitors, list REAL businesses that compete with this company in the same area and industry — use well-known names, not made-up ones.`;
+
+      // Try providers in cost order
+      const priority = ["google", "openai", "anthropic", "perplexity"];
+      const sortedKeys = [...activeKeys].sort((a, b) => {
+        return priority.indexOf(a.provider) - priority.indexOf(b.provider);
+      });
+
+      let result: any = null;
+
+      for (const key of sortedKeys) {
+        try {
+          let responseText = "";
+
+          if (key.provider === "google") {
+            const apiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key.apiKey}`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                systemInstruction: { parts: [{ text: "You are a precise JSON extraction tool. Return only valid JSON, no markdown or explanation." }] },
+                contents: [{ parts: [{ text: prompt }] }],
+              }),
+            });
+            if (!apiRes.ok) continue;
+            const data = await apiRes.json();
+            responseText = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+          } else if (key.provider === "openai") {
+            const apiRes = await fetch("https://api.openai.com/v1/chat/completions", {
+              method: "POST",
+              headers: { "Authorization": `Bearer ${key.apiKey}`, "Content-Type": "application/json" },
+              body: JSON.stringify({
+                model: "gpt-4o-mini",
+                max_completion_tokens: 1024,
+                messages: [
+                  { role: "system", content: "You are a precise JSON extraction tool. Return only valid JSON, no markdown or explanation." },
+                  { role: "user", content: prompt },
+                ],
+              }),
+            });
+            if (!apiRes.ok) continue;
+            const data = await apiRes.json();
+            responseText = data.choices?.[0]?.message?.content ?? "";
+          } else if (key.provider === "anthropic") {
+            const apiRes = await fetch("https://api.anthropic.com/v1/messages", {
+              method: "POST",
+              headers: { "x-api-key": key.apiKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
+              body: JSON.stringify({
+                model: "claude-haiku-4-5-20251001",
+                max_tokens: 1024,
+                system: "You are a precise JSON extraction tool. Return only valid JSON, no markdown or explanation.",
+                messages: [{ role: "user", content: prompt }],
+              }),
+            });
+            if (!apiRes.ok) continue;
+            const data = await apiRes.json();
+            responseText = Array.isArray(data.content)
+              ? data.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("")
+              : "";
+          } else if (key.provider === "perplexity") {
+            const apiRes = await fetch("https://api.perplexity.ai/chat/completions", {
+              method: "POST",
+              headers: { "Authorization": `Bearer ${key.apiKey}`, "Content-Type": "application/json" },
+              body: JSON.stringify({
+                model: "sonar",
+                max_tokens: 1024,
+                messages: [
+                  { role: "system", content: "You are a precise JSON extraction tool. Return only valid JSON, no markdown or explanation." },
+                  { role: "user", content: prompt },
+                ],
+              }),
+            });
+            if (!apiRes.ok) continue;
+            const data = await apiRes.json();
+            responseText = data.choices?.[0]?.message?.content ?? "";
+          }
+
+          // Parse the JSON response
+          const jsonCleaned = responseText.replace(/```json?\s*/gi, "").replace(/```/g, "").trim();
+          result = JSON.parse(jsonCleaned);
+          break; // success, stop trying providers
+        } catch (err: any) {
+          console.error(`[Scrape] ${key.provider} failed:`, err.message);
+          continue;
+        }
+      }
+
+      if (!result) {
+        return res.status(500).json({ error: "Could not analyze website content. Try again or fill in fields manually." });
+      }
+
+      // Track API cost
+      const dateStr = new Date().toISOString().split("T")[0];
+      db.insert(apiUsage).values({
+        provider: sortedKeys[0]?.provider ?? "unknown",
+        estimatedCost: "0.005",
+        date: dateStr,
+        timestamp: new Date().toISOString(),
+      }).run();
+
+      res.json({
+      // If AI didn't return competitors, try dedicated competitor detection
+      let competitorsStr = result.competitors || "";
+      if (!competitorsStr && result.name && result.industry) {
+        try {
+          const keyInputs = activeKeys.map((k) => ({ provider: k.provider, apiKey: k.apiKey }));
+          const detected = await detectCompetitors(
+            result.name,
+            result.industry,
+            result.location || null,
+            keyInputs
+          );
+          if (detected.length > 0) {
+            competitorsStr = detected.join(", ");
+          }
+        } catch (err: any) {
+          console.error("[Scrape] Competitor detection failed:", err.message);
+        }
+      }
+
+      res.json({
+        name: result.name || "",
+        industry: result.industry || "",
+        description: result.description || "",
+        location: result.location || "",
+        website: fullUrl,
+        services: result.services || "",
+        keywords: result.keywords || "",
+        targetAudience: result.targetAudience || result.target_audience || "",
+        uniqueSellingPoints: result.uniqueSellingPoints || result.unique_selling_points || "",
+        competitors: competitorsStr,
+      });
+    } catch (err: any) {
+      console.error("[Scrape] Error:", err.message);
+      if (err.name === "TimeoutError" || err.message?.includes("timeout")) {
+        return res.status(400).json({ error: "Website took too long to respond. Check the URL and try again." });
+      }
+      res.status(500).json({ error: err.message || "Failed to scrape website" });
+    }
+  });
+
   // === SCAN ===
   app.post("/api/businesses/:id/scan", async (req, res) => {
     const businessId = parseInt(req.params.id);
