@@ -9,12 +9,19 @@ import {
   insertBusinessSchema, insertSearchRecordSchema,
   insertCompetitorSchema, insertAlertSchema, insertLocationSchema,
 } from "@shared/schema";
-import { sql } from "drizzle-orm";
+import { sql, eq } from "drizzle-orm";
 import { runScan, testApiKey, generateScanQueries, PROVIDER_COST_PER_CALL } from "./ai-providers";
 import { requireAuth, requireAdmin, createSession, deleteSession, getSession } from "./auth";
 import bcrypt from "bcryptjs";
 import { validateSearchRecord, validateReferral, validateAiSnapshot } from "./data-validation";
 import { ensureArchiveTables, runArchival } from "./data-archival";
+import { scrapeWebsite } from "./website-scraper";
+import { discoverCompetitors } from "./competitor-discovery";
+import { monitorNews } from "./news-monitor";
+import { suggestQueries } from "./query-suggester";
+import { fetchGA4Data } from "./ga4-integration";
+import { monitorCompetitorPricing } from "./pricing-monitor";
+import { startAutomationScheduler } from "./automation-scheduler";
 
 // Seed default AI platforms
 function seedPlatforms() {
@@ -339,6 +346,35 @@ export async function registerRoutes(
     daily_budget TEXT NOT NULL DEFAULT '10.00',
     auto_pause_enabled INTEGER NOT NULL DEFAULT 1
   )`);
+
+  db.run(sql`CREATE TABLE IF NOT EXISTS automation_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    business_id INTEGER NOT NULL,
+    job_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    last_run TEXT,
+    next_run TEXT,
+    error_message TEXT
+  )`);
+
+  db.run(sql`CREATE TABLE IF NOT EXISTS automation_settings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    business_id INTEGER NOT NULL UNIQUE,
+    ga4_property_id TEXT,
+    ga4_api_key TEXT,
+    news_enabled INTEGER NOT NULL DEFAULT 1,
+    pricing_enabled INTEGER NOT NULL DEFAULT 1,
+    scraper_enabled INTEGER NOT NULL DEFAULT 1,
+    competitor_discovery_enabled INTEGER NOT NULL DEFAULT 1
+  )`);
+
+  // Add new columns to businesses table if they don't exist yet (migration)
+  try {
+    db.run(sql`ALTER TABLE businesses ADD COLUMN website_last_scraped TEXT`);
+  } catch { /* column already exists */ }
+  try {
+    db.run(sql`ALTER TABLE businesses ADD COLUMN competitors_last_discovered TEXT`);
+  } catch { /* column already exists */ }
 
   db.run(sql`CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1241,6 +1277,418 @@ export async function registerRoutes(
 
   // Start nightly 2 AM scan scheduler
   startNightlyScheduler();
+
+  // Start automation scheduler (news, GA4, pricing, scraping)
+  startAutomationScheduler();
+
+  // ── AUTOMATION API ENDPOINTS ──────────────────────────────────────────────
+
+  // POST /api/businesses/:id/scrape-website
+  app.post("/api/businesses/:id/scrape-website", async (req, res) => {
+    const id = parseInt(req.params.id);
+    const business = await storage.getBusiness(id);
+    if (!business) return res.status(404).json({ error: "Business not found" });
+    if (!business.website) return res.status(400).json({ error: "Business has no website URL" });
+
+    await storage.upsertAutomationJob(id, "scrape_website", "running");
+    try {
+      const result = await scrapeWebsite(business.website);
+      await storage.updateBusiness(id, { websiteLastScraped: new Date().toISOString() });
+      await storage.upsertAutomationJob(id, "scrape_website", "completed");
+      res.json(result);
+    } catch (err: any) {
+      await storage.upsertAutomationJob(id, "scrape_website", "failed", err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /api/businesses/:id/auto-detect-service-areas
+  app.post("/api/businesses/:id/auto-detect-service-areas", async (req, res) => {
+    const id = parseInt(req.params.id);
+    const business = await storage.getBusiness(id);
+    if (!business) return res.status(404).json({ error: "Business not found" });
+    if (!business.website) return res.status(400).json({ error: "Business has no website URL" });
+
+    try {
+      const result = await scrapeWebsite(business.website);
+      if (result.error) return res.status(422).json({ error: result.error });
+
+      // Persist detected service areas as locations
+      const existing = await storage.getLocations(id);
+      const existingNames = new Set(existing.map((l) => l.name.toLowerCase()));
+      const added: string[] = [];
+
+      for (const area of result.serviceAreas) {
+        if (!existingNames.has(area.toLowerCase())) {
+          await storage.createLocation({ businessId: id, name: area, address: area });
+          existingNames.add(area.toLowerCase());
+          added.push(area);
+        }
+      }
+
+      res.json({ serviceAreas: result.serviceAreas, added });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /api/businesses/:id/auto-discover-competitors
+  app.post("/api/businesses/:id/auto-discover-competitors", async (req, res) => {
+    const id = parseInt(req.params.id);
+    const business = await storage.getBusiness(id);
+    if (!business) return res.status(404).json({ error: "Business not found" });
+
+    const serpApiKey = req.body.serpApiKey as string | undefined;
+
+    await storage.upsertAutomationJob(id, "discover_competitors", "running");
+    try {
+      const result = await discoverCompetitors(
+        business.name,
+        business.industry,
+        business.location ?? "",
+        serpApiKey,
+      );
+
+      if (result.error) {
+        await storage.upsertAutomationJob(id, "discover_competitors", "failed", result.error);
+        return res.status(422).json({ error: result.error, queriesUsed: result.queriesUsed });
+      }
+
+      // Persist new competitors (avoid duplicates by website domain)
+      const existing = await storage.getCompetitors(id);
+      const existingDomains = new Set(
+        existing.map((c) => {
+          try { return new URL(c.website ?? "").hostname.replace(/^www\./, ""); }
+          catch { return c.website ?? ""; }
+        })
+      );
+
+      const added = [];
+      for (const comp of result.competitors) {
+        let domain = "";
+        try { domain = new URL(comp.website).hostname.replace(/^www\./, ""); }
+        catch { domain = comp.website; }
+
+        if (!existingDomains.has(domain)) {
+          const created = await storage.createCompetitor({
+            businessId: id,
+            name: comp.name,
+            website: comp.website,
+            notes: comp.snippet,
+          });
+          added.push(created);
+          existingDomains.add(domain);
+        }
+      }
+
+      await storage.updateBusiness(id, { competitorsLastDiscovered: new Date().toISOString() });
+      await storage.upsertAutomationJob(id, "discover_competitors", "completed");
+
+      res.json({ found: result.competitors, added, queriesUsed: result.queriesUsed });
+    } catch (err: any) {
+      await storage.upsertAutomationJob(id, "discover_competitors", "failed", err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /api/businesses/:id/auto-update-news
+  app.post("/api/businesses/:id/auto-update-news", async (req, res) => {
+    const id = parseInt(req.params.id);
+    const business = await storage.getBusiness(id);
+    if (!business) return res.status(404).json({ error: "Business not found" });
+
+    const newsApiKey = req.body.newsApiKey as string | undefined;
+
+    await storage.upsertAutomationJob(id, "news_monitor", "running");
+    try {
+      const result = await monitorNews(business.name, business.industry, newsApiKey);
+
+      if (result.error) {
+        await storage.upsertAutomationJob(id, "news_monitor", "failed", result.error);
+        return res.status(422).json({ error: result.error });
+      }
+
+      // Create alerts for each news item
+      const today = new Date().toISOString().split("T")[0];
+      for (const item of result.items) {
+        await storage.createAlert({
+          businessId: id,
+          type: "news_mention",
+          message: `News: "${item.title}" — ${item.source} (${item.publishedAt.slice(0, 10)})`,
+          severity: "info",
+          date: today,
+        });
+      }
+
+      await storage.upsertAutomationJob(id, "news_monitor", "completed");
+      res.json({ items: result.items, queriesUsed: result.queriesUsed });
+    } catch (err: any) {
+      await storage.upsertAutomationJob(id, "news_monitor", "failed", err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /api/businesses/:id/analyze-content-gaps
+  app.post("/api/businesses/:id/analyze-content-gaps", async (req, res) => {
+    const id = parseInt(req.params.id);
+    const business = await storage.getBusiness(id);
+    if (!business) return res.status(404).json({ error: "Business not found" });
+
+    try {
+      const records = await storage.getSearchRecords(id);
+      if (records.length === 0) {
+        return res.json({ gaps: [], message: "No scan data available yet. Run a scan first." });
+      }
+
+      // Group by query, find where business is NOT mentioned
+      const queryMap = new Map<string, { total: number; mentions: number }>();
+      for (const r of records) {
+        const s = queryMap.get(r.query) ?? { total: 0, mentions: 0 };
+        s.total++;
+        if (r.mentioned) s.mentions++;
+        queryMap.set(r.query, s);
+      }
+
+      const gaps: Array<{
+        query: string;
+        mentionRate: number;
+        category: string;
+        contentType: string;
+        priority: string;
+        recommendedContent: string;
+      }> = [];
+
+      for (const [query, stats] of queryMap.entries()) {
+        const mentionRate = stats.total > 0 ? (stats.mentions / stats.total) * 100 : 0;
+        if (mentionRate >= 50) continue; // Already performing well
+
+        // Categorise the query
+        let category = "general";
+        let contentType = "blog";
+        let priority = "medium";
+
+        if (/how\s+to|what\s+is|why\s+is|guide|tips|best\s+practices/i.test(query)) {
+          category = "question";
+          contentType = "guide";
+          priority = mentionRate < 10 ? "high" : "medium";
+        } else if (/near\s+me|in\s+[a-z]+|local|city|area/i.test(query)) {
+          category = "location";
+          contentType = "location-page";
+          priority = "high";
+        } else if (/vs|compare|alternative|competitor/i.test(query)) {
+          category = "competitor";
+          contentType = "comparison";
+          priority = "high";
+        } else if (/price|cost|rate|fee|affordable|cheap/i.test(query)) {
+          category = "pricing";
+          contentType = "faq";
+          priority = "medium";
+        } else if (/review|rating|testimonial|trust/i.test(query)) {
+          category = "reputation";
+          contentType = "case-study";
+          priority = "medium";
+        }
+
+        const recommendedContent = `Create a ${contentType} targeting "${query}" to improve visibility (currently ${Math.round(mentionRate)}% mention rate)`;
+
+        gaps.push({ query, mentionRate: Math.round(mentionRate), category, contentType, priority, recommendedContent });
+      }
+
+      // Sort by priority then mention rate ascending (worst first)
+      const priorityOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
+      gaps.sort((a, b) =>
+        (priorityOrder[a.priority] ?? 1) - (priorityOrder[b.priority] ?? 1) ||
+        a.mentionRate - b.mentionRate
+      );
+
+      // Persist top gaps to database
+      const topGaps = gaps.slice(0, 20);
+      const persisted = [];
+      for (const gap of topGaps) {
+        const created = await storage.createContentGap({
+          businessId: id,
+          query: gap.query,
+          category: gap.category,
+          currentlyRanking: 0,
+          recommendedContent: gap.recommendedContent,
+          contentType: gap.contentType,
+          priority: gap.priority,
+        });
+        persisted.push(created);
+      }
+
+      res.json({ gaps: topGaps, persisted: persisted.length, total: gaps.length });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /api/businesses/:id/suggest-queries
+  app.post("/api/businesses/:id/suggest-queries", async (req, res) => {
+    const id = parseInt(req.params.id);
+    const business = await storage.getBusiness(id);
+    if (!business) return res.status(404).json({ error: "Business not found" });
+
+    try {
+      const records = await storage.getSearchRecords(id);
+
+      // Optionally scrape website for keywords
+      let websiteKeywords: string[] = [];
+      if (business.website) {
+        try {
+          const scraped = await scrapeWebsite(business.website);
+          websiteKeywords = scraped.keywords;
+        } catch {
+          // Non-fatal — proceed without website keywords
+        }
+      }
+
+      const result = suggestQueries(
+        {
+          name: business.name,
+          industry: business.industry,
+          location: business.location,
+          description: business.description,
+        },
+        websiteKeywords,
+        records,
+      );
+
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POST /api/businesses/:id/connect-ga4
+  app.post("/api/businesses/:id/connect-ga4", async (req, res) => {
+    const id = parseInt(req.params.id);
+    const business = await storage.getBusiness(id);
+    if (!business) return res.status(404).json({ error: "Business not found" });
+
+    const { ga4PropertyId, ga4ApiKey } = req.body;
+    if (!ga4PropertyId || !ga4ApiKey) {
+      return res.status(400).json({ error: "ga4PropertyId and ga4ApiKey are required" });
+    }
+
+    const settings = await storage.upsertAutomationSettings(id, { ga4PropertyId, ga4ApiKey });
+    res.json({ success: true, ga4PropertyId: settings.ga4PropertyId });
+  });
+
+  // POST /api/businesses/:id/sync-ga4-data
+  app.post("/api/businesses/:id/sync-ga4-data", async (req, res) => {
+    const id = parseInt(req.params.id);
+    const business = await storage.getBusiness(id);
+    if (!business) return res.status(404).json({ error: "Business not found" });
+
+    const settings = await storage.getAutomationSettings(id);
+    if (!settings?.ga4PropertyId || !settings?.ga4ApiKey) {
+      return res.status(400).json({ error: "GA4 not connected. Use /connect-ga4 first." });
+    }
+
+    const dateRange = (req.body.dateRange as string) ?? "30d";
+
+    await storage.upsertAutomationJob(id, "ga4_sync", "running");
+    try {
+      const result = await fetchGA4Data(settings.ga4PropertyId, settings.ga4ApiKey, dateRange);
+      if (result.error) {
+        await storage.upsertAutomationJob(id, "ga4_sync", "failed", result.error);
+        return res.status(422).json({ error: result.error });
+      }
+      await storage.upsertAutomationJob(id, "ga4_sync", "completed");
+      res.json(result);
+    } catch (err: any) {
+      await storage.upsertAutomationJob(id, "ga4_sync", "failed", err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // GET /api/businesses/:id/referral-attribution
+  app.get("/api/businesses/:id/referral-attribution", async (req, res) => {
+    const id = parseInt(req.params.id);
+    const business = await storage.getBusiness(id);
+    if (!business) return res.status(404).json({ error: "Business not found" });
+
+    const referrals = await storage.getReferrals(id);
+    const bySource: Record<string, { visits: number; conversions: number; queries: string[] }> = {};
+
+    for (const r of referrals) {
+      const src = r.utmSource ?? "direct";
+      if (!bySource[src]) bySource[src] = { visits: 0, conversions: 0, queries: [] };
+      bySource[src].visits++;
+      if (r.converted) bySource[src].conversions++;
+      if (r.query && !bySource[src].queries.includes(r.query)) {
+        bySource[src].queries.push(r.query);
+      }
+    }
+
+    res.json({ bySource, totalReferrals: referrals.length });
+  });
+
+  // POST /api/businesses/:id/monitor-competitor-pricing
+  app.post("/api/businesses/:id/monitor-competitor-pricing", async (req, res) => {
+    const id = parseInt(req.params.id);
+    const business = await storage.getBusiness(id);
+    if (!business) return res.status(404).json({ error: "Business not found" });
+
+    await storage.upsertAutomationJob(id, "pricing_monitor", "running");
+    try {
+      const comps = await storage.getCompetitors(id);
+      const withWebsites = comps.filter((c) => c.website);
+
+      if (withWebsites.length === 0) {
+        await storage.upsertAutomationJob(id, "pricing_monitor", "completed");
+        return res.json({ results: [], message: "No competitors with websites found" });
+      }
+
+      const results = await monitorCompetitorPricing(
+        withWebsites.map((c) => ({ name: c.name, website: c.website! }))
+      );
+
+      await storage.upsertAutomationJob(id, "pricing_monitor", "completed");
+      res.json({ results });
+    } catch (err: any) {
+      await storage.upsertAutomationJob(id, "pricing_monitor", "failed", err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // GET /api/businesses/:id/automation-status
+  app.get("/api/businesses/:id/automation-status", async (req, res) => {
+    const id = parseInt(req.params.id);
+    const business = await storage.getBusiness(id);
+    if (!business) return res.status(404).json({ error: "Business not found" });
+
+    const jobs = await storage.getAutomationJobs(id);
+    const settings = await storage.getAutomationSettings(id);
+
+    res.json({
+      jobs,
+      settings: settings ?? null,
+      websiteLastScraped: business.websiteLastScraped ?? null,
+      competitorsLastDiscovered: business.competitorsLastDiscovered ?? null,
+    });
+  });
+
+  // PATCH /api/businesses/:id/automation-settings
+  app.patch("/api/businesses/:id/automation-settings", async (req, res) => {
+    const id = parseInt(req.params.id);
+    const business = await storage.getBusiness(id);
+    if (!business) return res.status(404).json({ error: "Business not found" });
+
+    const allowed = [
+      "newsEnabled", "pricingEnabled", "scraperEnabled",
+      "competitorDiscoveryEnabled", "ga4PropertyId", "ga4ApiKey",
+    ] as const;
+
+    const updates: Record<string, any> = {};
+    for (const key of allowed) {
+      if (req.body[key] !== undefined) updates[key] = req.body[key];
+    }
+
+    const settings = await storage.upsertAutomationSettings(id, updates);
+    res.json(settings);
+  });
 
   console.log("[init] registerRoutes() completed successfully — all routes registered");
   return httpServer;
