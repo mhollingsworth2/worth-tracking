@@ -229,6 +229,25 @@ export const insertApiUsageSchema = createInsertSchema(apiUsage).omit({ id: true
 export type InsertApiUsage = z.infer<typeof insertApiUsageSchema>;
 export type ApiUsage = typeof apiUsage.$inferSelect;
 
+// Click Events (raw click data from embedded snippet)
+export const clickEvents = sqliteTable("click_events", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  businessId: integer("business_id").notNull(),
+  elementText: text("element_text"),
+  elementUrl: text("element_url"),
+  referrer: text("referrer"),
+  landingPage: text("landing_page"),
+  utmSource: text("utm_source"),
+  utmMedium: text("utm_medium"),
+  utmCampaign: text("utm_campaign"),
+  deviceType: text("device_type"),
+  timestamp: text("timestamp").notNull(),
+});
+
+export const insertClickEventSchema = createInsertSchema(clickEvents).omit({ id: true });
+export type InsertClickEvent = z.infer<typeof insertClickEventSchema>;
+export type ClickEvent = typeof clickEvents.$inferSelect;
+
 // API Budget Settings
 export const apiSettings = sqliteTable("api_settings", {
   id: integer("id").primaryKey({ autoIncrement: true }),

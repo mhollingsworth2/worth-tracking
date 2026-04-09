@@ -22,11 +22,12 @@ import {
   ExternalLink, Copy, Smartphone, Monitor, Tablet,
   Phone, ShoppingCart, UserPlus, Mail, CalendarCheck,
   Info, Download, Users, Camera, AlertTriangle, Plus, X, Settings, ChevronDown, ChevronUp,
-  Zap, Loader2,
+  Zap, Loader2, Code2,
 } from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { InfoTip } from "@/components/info-tip";
+import { SnippetModal } from "@/components/SnippetModal";
 import type { Business, SearchRecord, OptimizedPrompt, Platform, Referral, Competitor, AiSnapshot, ContentGap, Location as BizLocation } from "@shared/schema";
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer,
@@ -270,6 +271,9 @@ export default function BusinessDetail() {
       }
     },
   });
+
+  // Snippet modal state
+  const [snippetOpen, setSnippetOpen] = useState(false);
 
   // Manual log search state
   const [logOpen, setLogOpen] = useState(false);
@@ -987,11 +991,41 @@ export default function BusinessDetail() {
 
           {/* ========== SETTINGS TAB ========== */}
           <TabsContent value="settings" className="space-y-6 mt-4">
+            {/* Embed Click Tracker */}
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-sm font-medium flex items-center gap-2">
+                  <Code2 className="w-4 h-4 text-primary" />
+                  Click Tracker Snippet
+                </CardTitle>
+                <CardDescription className="text-xs">
+                  Embed a lightweight JS snippet on your website to track clicks from AI search platforms.
+                  No dependencies, no personal data, async and non-blocking.
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <Button size="sm" onClick={() => setSnippetOpen(true)} className="gap-2">
+                  <Code2 className="w-4 h-4" />
+                  Embed Click Tracker
+                </Button>
+              </CardContent>
+            </Card>
+
             <GA4Settings businessId={id} currentGa4Id={business.ga4Id ?? ""} />
             <LocationsSection businessId={id} locations={locationsData ?? []} />
           </TabsContent>
         </Tabs>
       </div>
+
+      {/* Snippet modal — rendered outside ScrollArea to avoid z-index issues */}
+      {business && (
+        <SnippetModal
+          businessId={id}
+          businessName={business.name}
+          open={snippetOpen}
+          onOpenChange={setSnippetOpen}
+        />
+      )}
     </ScrollArea>
   );
 }

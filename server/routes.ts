@@ -4,7 +4,7 @@ import { storage, db } from "./storage";
 import {
   businesses, platforms, searchRecords, optimizedPrompts, referrals,
   competitors, aiSnapshots, alerts, contentGaps, locations,
-  apiKeys, scanJobs, apiUsage, apiSettings,
+  apiKeys, scanJobs, apiUsage, apiSettings, clickEvents,
   users, userBusinesses, loginSchema,
   insertBusinessSchema, insertSearchRecordSchema,
   insertCompetitorSchema, insertAlertSchema, insertLocationSchema,
@@ -356,6 +356,20 @@ export async function registerRoutes(
     business_id INTEGER NOT NULL
   )`);
 
+  db.run(sql`CREATE TABLE IF NOT EXISTS click_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    business_id INTEGER NOT NULL,
+    element_text TEXT,
+    element_url TEXT,
+    referrer TEXT,
+    landing_page TEXT,
+    utm_source TEXT,
+    utm_medium TEXT,
+    utm_campaign TEXT,
+    device_type TEXT,
+    timestamp TEXT NOT NULL
+  )`);
+
   console.log("[init] Core tables created successfully");
 
   // === DATABASE INDEXES for query performance ===
@@ -473,11 +487,15 @@ export async function registerRoutes(
   app.use("/api", (req: Request, res: Response, next: NextFunction) => {
     // Skip auth routes
     if (req.path.startsWith("/auth/")) return next();
+    // Skip click-tracking endpoint — called from external websites without a session
+    if (req.path.match(/^\/businesses\/\d+\/log-click$/) && (req.method === "POST" || req.method === "OPTIONS")) return next();
     requireAuth(req, res, next);
   });
 
   // === Business access check middleware for customer users ===
   app.use("/api/businesses/:id", async (req: Request, res: Response, next: NextFunction) => {
+    // log-click is public (called from external websites)
+    if (req.path === "/log-click" && (req.method === "POST" || req.method === "OPTIONS")) return next();
     if (!req.user) return res.status(401).json({ error: "Authentication required" });
     if (req.user.role === "admin") return next();
     const businessId = parseInt(req.params.id as string);
@@ -1237,6 +1255,261 @@ export async function registerRoutes(
   app.post("/api/data/archival-run", requireAdmin, async (_req, res) => {
     const result = runArchival();
     res.json({ success: true, ...result });
+  });
+
+  // === CLICK TRACKING (from embedded snippet) ===
+
+  // POST /api/businesses/:id/log-click — receives click data from the embedded JS snippet.
+  // This endpoint is intentionally open to cross-origin requests so the snippet can POST
+  // from any website. Business ID validation acts as the auth gate.
+  app.post("/api/businesses/:id/log-click", async (req, res) => {
+    // Allow cross-origin requests from any website (snippet is embedded externally)
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+    const businessId = parseInt(req.params.id);
+    if (isNaN(businessId)) return res.status(400).json({ error: "Invalid business ID" });
+
+    const business = await storage.getBusiness(businessId);
+    if (!business) return res.status(404).json({ error: "Business not found" });
+
+    const {
+      elementText,
+      elementUrl,
+      referrer,
+      landingPage,
+      utmSource,
+      utmMedium,
+      utmCampaign,
+      deviceType,
+      timestamp,
+    } = req.body;
+
+    const ts = timestamp || new Date().toISOString();
+
+    // Store raw click event
+    const clickEvent = db.insert(clickEvents).values({
+      businessId,
+      elementText: elementText || null,
+      elementUrl: elementUrl || null,
+      referrer: referrer || null,
+      landingPage: landingPage || null,
+      utmSource: utmSource || null,
+      utmMedium: utmMedium || null,
+      utmCampaign: utmCampaign || null,
+      deviceType: deviceType || "desktop",
+      timestamp: ts,
+    }).returning().get();
+
+    // Also create a referral entry so the click shows up in the referrals dashboard.
+    // We use platform_id = 1 (ChatGPT) as a fallback; utm_source is the real signal.
+    const allPlatforms = await storage.getPlatforms();
+    const matchedPlatform = allPlatforms.find(
+      (p) => p.name.toLowerCase().replace(/\s+/g, "-") === (utmSource || "").toLowerCase()
+        || p.name.toLowerCase() === (utmSource || "").toLowerCase()
+    ) ?? allPlatforms[0];
+
+    if (matchedPlatform) {
+      const dateStr = ts.split("T")[0] || new Date().toISOString().split("T")[0];
+      await storage.createReferral({
+        businessId,
+        platformId: matchedPlatform.id,
+        searchRecordId: null,
+        query: `[snippet-click] ${elementText || elementUrl || "unknown"}`,
+        landingPage: landingPage || "/",
+        utmSource: utmSource || null,
+        utmMedium: utmMedium || null,
+        utmCampaign: utmCampaign || null,
+        converted: 0,
+        conversionType: null,
+        sessionDuration: null,
+        pagesViewed: 1,
+        deviceType: deviceType || "desktop",
+        date: dateStr,
+        timestamp: ts,
+      });
+    }
+
+    res.json({ success: true, clickId: clickEvent.id });
+  });
+
+  // Handle CORS preflight for log-click
+  app.options("/api/businesses/:id/log-click", (req, res) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    res.sendStatus(204);
+  });
+
+  // GET /api/businesses/:id/snippet — returns the embeddable JS snippet
+  app.get("/api/businesses/:id/snippet", async (req, res) => {
+    const businessId = parseInt(req.params.id);
+    if (isNaN(businessId)) return res.status(400).json({ error: "Invalid business ID" });
+
+    const business = await storage.getBusiness(businessId);
+    if (!business) return res.status(404).json({ error: "Business not found" });
+
+    const host = req.headers.host || "your-app.railway.app";
+    const protocol = req.headers["x-forwarded-proto"] || (req.secure ? "https" : "http");
+    const apiUrl = `${protocol}://${host}/api/businesses/${businessId}/log-click`;
+
+    const snippet = `<!-- Worth Tracking Click Tracker v1.0 -->
+<!-- Tracks clicks from AI search platforms (ChatGPT, Perplexity, Gemini, etc.) -->
+<!-- No personal data collected. Respects Do Not Track. -->
+<script>
+(function() {
+  'use strict';
+
+  // Respect Do Not Track
+  if (navigator.doNotTrack === '1' || window.doNotTrack === '1') return;
+
+  var BUSINESS_ID = '${businessId}';
+  var API_URL = '${apiUrl}';
+
+  // AI search platform referrer patterns
+  var AI_REFERRERS = [
+    'chatgpt.com', 'chat.openai.com',
+    'perplexity.ai',
+    'gemini.google.com', 'bard.google.com',
+    'claude.ai',
+    'copilot.microsoft.com', 'bing.com/chat',
+    'meta.ai', 'llama',
+    'you.com', 'phind.com', 'kagi.com',
+  ];
+
+  function isAiReferrer(ref) {
+    if (!ref) return false;
+    var lower = ref.toLowerCase();
+    for (var i = 0; i < AI_REFERRERS.length; i++) {
+      if (lower.indexOf(AI_REFERRERS[i]) !== -1) return true;
+    }
+    return false;
+  }
+
+  function getDeviceType() {
+    var ua = navigator.userAgent;
+    if (/tablet|ipad|playbook|silk/i.test(ua)) return 'tablet';
+    if (/mobile|iphone|ipod|android|blackberry|mini|windows\\sce|palm/i.test(ua)) return 'mobile';
+    return 'desktop';
+  }
+
+  function getUtmParam(name) {
+    try {
+      var params = new URLSearchParams(window.location.search);
+      return params.get(name) || '';
+    } catch (e) { return ''; }
+  }
+
+  function getElementText(el) {
+    var text = (el.innerText || el.textContent || el.value || el.alt || el.title || '').trim();
+    return text.slice(0, 200);
+  }
+
+  function getElementUrl(el) {
+    return el.href || el.action || el.dataset.href || '';
+  }
+
+  function sendClick(data) {
+    try {
+      if (navigator.sendBeacon) {
+        var blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
+        navigator.sendBeacon(API_URL, blob);
+      } else {
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', API_URL, true);
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.send(JSON.stringify(data));
+      }
+    } catch (e) { /* silent fail */ }
+  }
+
+  function handleClick(e) {
+    try {
+      var el = e.target;
+      // Walk up to find the nearest link or button
+      var depth = 0;
+      while (el && el !== document.body && depth < 5) {
+        if (el.tagName === 'A' || el.tagName === 'BUTTON' || el.role === 'button') break;
+        el = el.parentElement;
+        depth++;
+      }
+      if (!el || el === document.body) return;
+
+      var referrer = document.referrer;
+      var utmSource = getUtmParam('utm_source');
+
+      // Only track if visitor came from an AI platform (via referrer or UTM)
+      if (!isAiReferrer(referrer) && !isAiReferrer(utmSource)) return;
+
+      sendClick({
+        elementText: getElementText(el),
+        elementUrl: getElementUrl(el),
+        referrer: referrer,
+        landingPage: window.location.pathname,
+        utmSource: utmSource || referrer.split('/')[2] || '',
+        utmMedium: getUtmParam('utm_medium') || 'ai-search',
+        utmCampaign: getUtmParam('utm_campaign') || 'worth-tracking',
+        deviceType: getDeviceType(),
+        timestamp: new Date().toISOString(),
+      });
+    } catch (e) { /* silent fail */ }
+  }
+
+  // Attach listener after DOM is ready
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', function() {
+      document.addEventListener('click', handleClick, true);
+    });
+  } else {
+    document.addEventListener('click', handleClick, true);
+  }
+})();
+</script>`;
+
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.send(snippet);
+  });
+
+  // GET /api/businesses/:id/snippet-status — click stats for the last 7 days
+  app.get("/api/businesses/:id/snippet-status", async (req, res) => {
+    const businessId = parseInt(req.params.id);
+    if (isNaN(businessId)) return res.status(400).json({ error: "Invalid business ID" });
+
+    const business = await storage.getBusiness(businessId);
+    if (!business) return res.status(404).json({ error: "Business not found" });
+
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+
+    const recentClicks = db.select().from(clickEvents)
+      .where(sql`business_id = ${businessId} AND timestamp >= ${sevenDaysAgo}`)
+      .all();
+
+    const totalClicks = db.select({ count: sql<number>`count(*)` })
+      .from(clickEvents)
+      .where(sql`business_id = ${businessId}`)
+      .get();
+
+    const bySource: Record<string, number> = {};
+    for (const c of recentClicks) {
+      const src = c.utmSource || "direct";
+      bySource[src] = (bySource[src] || 0) + 1;
+    }
+
+    const lastClick = db.select().from(clickEvents)
+      .where(sql`business_id = ${businessId}`)
+      .orderBy(sql`timestamp desc`)
+      .limit(1)
+      .get();
+
+    res.json({
+      businessId,
+      active: (totalClicks?.count ?? 0) > 0,
+      clicksLast7Days: recentClicks.length,
+      totalClicks: totalClicks?.count ?? 0,
+      bySource,
+      lastClickAt: lastClick?.timestamp ?? null,
+    });
   });
 
   // Start nightly 2 AM scan scheduler
