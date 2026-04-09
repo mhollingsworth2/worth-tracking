@@ -1934,9 +1934,13 @@ function SnapshotsSection({ snapshots, getPlatformName }: { snapshots: AiSnapsho
                         <span className="text-sm font-medium">{snap.query}</span>
                         <Badge className={sConfig.badge} data-testid={`badge-sentiment-${snap.id}`}>{snap.sentiment}</Badge>
                         {snap.mentionedAccurate ? (
-                          <Badge variant="outline" className="text-xs text-green-600 border-green-300">Accurate</Badge>
+                          <Badge variant="outline" className="text-xs text-green-600 border-green-300">
+                            <CheckCircle className="w-3 h-3 mr-1" />Mentioned
+                          </Badge>
                         ) : (
-                          <Badge variant="outline" className="text-xs text-red-600 border-red-300">Inaccurate</Badge>
+                          <Badge variant="outline" className="text-xs text-amber-600 border-amber-300">
+                            <XCircle className="w-3 h-3 mr-1" />Not Mentioned
+                          </Badge>
                         )}
                         <span className="text-xs text-muted-foreground ml-auto">{snap.date}</span>
                       </div>

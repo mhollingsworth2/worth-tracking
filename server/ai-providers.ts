@@ -43,7 +43,9 @@ async function fetchWithRetry(url: string, options: RequestInit, maxRetries = 2)
 
 // System instruction sent with every query to reduce hallucination.
 // Models are told to explicitly decline rather than fabricate business details.
-const SYSTEM_INSTRUCTION = "You are answering questions about real-world businesses. Base your answer only on verified, factual information. If you do not have reliable, specific information about a business being asked about, respond with 'No verified information available' and briefly explain what you do and don't know. Do not guess, fabricate details, or invent reviews, ratings, addresses, or services. It is better to say you don't know than to make something up.";
+// System instruction: be helpful and natural — we WANT to see what AI actually says
+// about businesses. The hallucination detector catches fabrications after the fact.
+const SYSTEM_INSTRUCTION = "You are a helpful assistant answering questions about local businesses and services. Provide your best, most useful recommendations based on what you know. Include specific business names, locations, and details when you can. Be thorough and give actionable recommendations.";
 
 // ── AI-Powered Response Analysis ──────────────────────────────────────────
 // Instead of fragile string matching, we send a follow-up call to a cheap AI
