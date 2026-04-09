@@ -11,6 +11,7 @@ import {
 } from "@shared/schema";
 import { sql } from "drizzle-orm";
 import { runScan, testApiKey, generateScanQueries, detectCompetitors, setAnalysisKeys, PROVIDER_COST_PER_CALL, type BusinessContext } from "./ai-providers";
+import { generateDemoData, clearDemoData } from "./demo-data";
 import { requireAuth, requireAdmin, createSession, deleteSession, getSession } from "./auth";
 import bcrypt from "bcryptjs";
 import { validateSearchRecord, validateReferral, validateAiSnapshot } from "./data-validation";
@@ -540,6 +541,47 @@ export async function registerRoutes(
     if (token) deleteSession(token);
     res.clearCookie("session");
     res.json({ success: true });
+  });
+
+  // ── Demo mode: creates a demo user + sample business with realistic data ──
+  app.post("/api/auth/demo", async (req, res) => {
+    try {
+      // Create or find demo user
+      let demoUser = await storage.getUserByUsername("demo");
+      if (!demoUser) {
+        const hash = bcrypt.hashSync("demo-viewer", 10);
+        demoUser = db.insert(users).values({
+          username: "demo",
+          passwordHash: hash,
+          displayName: "Demo Viewer",
+          role: "admin", // admin so they can see everything
+          isActive: 1,
+          createdAt: new Date().toISOString(),
+        }).returning().get();
+      }
+
+      // Generate fresh demo data
+      const { businessId } = await generateDemoData(demoUser.id);
+
+      // Create session
+      const token = createSession(demoUser.id, demoUser.role);
+      res.cookie("session", token, { httpOnly: true, sameSite: "lax", maxAge: 24 * 60 * 60 * 1000 });
+      const { passwordHash, ...safeUser } = demoUser;
+      res.json({ token, user: { ...safeUser, isDemo: true }, businessId });
+    } catch (err: any) {
+      console.error("[Demo] Error generating demo:", err.message);
+      res.status(500).json({ error: "Failed to generate demo data" });
+    }
+  });
+
+  // Clear demo data
+  app.post("/api/auth/demo/clear", async (req, res) => {
+    try {
+      await clearDemoData();
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
   app.get("/api/auth/me", (req, res) => {

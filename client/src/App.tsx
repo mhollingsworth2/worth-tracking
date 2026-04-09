@@ -8,7 +8,7 @@ import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { AppSidebar } from "@/components/app-sidebar";
 import { ThemeProvider, useTheme } from "@/components/theme-provider";
 import { AuthProvider, useAuth } from "@/components/auth-provider";
-import { Moon, Sun, Bell } from "lucide-react";
+import { Moon, Sun, Bell, Play, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -67,6 +67,30 @@ function AppRouter() {
   );
 }
 
+function DemoBanner() {
+  const { isDemo, logout } = useAuth();
+  if (!isDemo) return null;
+
+  return (
+    <div className="bg-gradient-to-r from-amber-500 to-orange-500 text-white px-4 py-2 flex items-center justify-between gap-3 text-sm shrink-0">
+      <div className="flex items-center gap-2">
+        <Play className="w-4 h-4" />
+        <span className="font-medium">Demo Mode</span>
+        <span className="hidden sm:inline opacity-90">— You're viewing sample data for a fictional dental practice. All data is generated for demonstration purposes.</span>
+      </div>
+      <Button
+        variant="ghost"
+        size="sm"
+        className="text-white hover:bg-white/20 h-7 px-2 text-xs"
+        onClick={logout}
+      >
+        <X className="w-3 h-3 mr-1" />
+        Exit Demo
+      </Button>
+    </div>
+  );
+}
+
 function AuthenticatedApp() {
   return (
     <Router hook={useHashLocation}>
@@ -74,6 +98,7 @@ function AuthenticatedApp() {
         <div className="flex h-screen w-full">
           <AppSidebar />
           <div className="flex flex-col flex-1 min-w-0">
+            <DemoBanner />
             <header className="flex items-center justify-between gap-2 p-2 border-b shrink-0">
               <SidebarTrigger data-testid="button-sidebar-toggle" />
               <div className="flex items-center gap-1">

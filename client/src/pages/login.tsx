@@ -3,15 +3,16 @@ import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Search, Loader2, AlertCircle } from "lucide-react";
+import { Search, Loader2, AlertCircle, Play } from "lucide-react";
 import { useAuth } from "@/components/auth-provider";
 
 export default function Login() {
-  const { login } = useAuth();
+  const { login, loginWithDemo } = useAuth();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [demoLoading, setDemoLoading] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -23,6 +24,18 @@ export default function Login() {
       setError(err.message || "Login failed");
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleDemo = async () => {
+    setError("");
+    setDemoLoading(true);
+    try {
+      await loginWithDemo();
+    } catch (err: any) {
+      setError(err.message || "Failed to load demo");
+    } finally {
+      setDemoLoading(false);
     }
   };
 
@@ -83,6 +96,29 @@ export default function Login() {
                 Sign In
               </Button>
             </form>
+
+            <div className="relative my-5">
+              <div className="absolute inset-0 flex items-center">
+                <span className="w-full border-t" />
+              </div>
+              <div className="relative flex justify-center text-xs">
+                <span className="bg-card px-3 text-muted-foreground">or</span>
+              </div>
+            </div>
+
+            <Button
+              variant="outline"
+              className="w-full gap-2"
+              onClick={handleDemo}
+              disabled={demoLoading}
+              data-testid="button-demo"
+            >
+              {demoLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+              {demoLoading ? "Loading demo..." : "Try Interactive Demo"}
+            </Button>
+            <p className="text-[11px] text-muted-foreground text-center mt-2">
+              See the platform in action with sample data — no account needed
+            </p>
           </CardContent>
         </Card>
 
