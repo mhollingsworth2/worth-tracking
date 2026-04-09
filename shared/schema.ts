@@ -11,6 +11,12 @@ export const businesses = sqliteTable("businesses", {
   website: text("website"),
   location: text("location"),
   ga4Id: text("ga4_id"),
+  // Enhanced profile fields
+  serviceCategories: text("service_categories"), // JSON array of service/product names
+  targetAudience: text("target_audience"),        // Who they serve
+  keyDifferentiators: text("key_differentiators"), // What makes them unique
+  recentNews: text("recent_news"),                // Recent updates, awards, partnerships
+  websiteContentSummary: text("website_content_summary"), // Key pages and topics
 });
 
 export const insertBusinessSchema = createInsertSchema(businesses).omit({ id: true });
@@ -154,6 +160,65 @@ export const locations = sqliteTable("locations", {
 export const insertLocationSchema = createInsertSchema(locations).omit({ id: true });
 export type InsertLocation = z.infer<typeof insertLocationSchema>;
 export type Location = typeof locations.$inferSelect;
+
+// Custom Queries — user-defined search phrases to track
+export const customQueries = sqliteTable("custom_queries", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  businessId: integer("business_id").notNull(),
+  query: text("query").notNull(),
+  category: text("category"), // "branded" | "service" | "question" | "long-tail"
+  priority: text("priority"), // "high" | "medium" | "low"
+  createdAt: text("created_at"),
+});
+
+export const insertCustomQuerySchema = createInsertSchema(customQueries).omit({ id: true });
+export type InsertCustomQuery = z.infer<typeof insertCustomQuerySchema>;
+export type CustomQuery = typeof customQueries.$inferSelect;
+
+// Competitive Data — positioning vs specific competitors
+export const competitiveData = sqliteTable("competitive_data", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  businessId: integer("business_id").notNull(),
+  competitorId: integer("competitor_id"), // references competitors table
+  marketPosition: text("market_position"),    // How they position vs this competitor
+  pricingComparison: text("pricing_comparison"), // Price/offering comparison
+  uniqueAdvantages: text("unique_advantages"),   // What they do better
+  lastUpdated: text("last_updated"),
+});
+
+export const insertCompetitiveDataSchema = createInsertSchema(competitiveData).omit({ id: true });
+export type InsertCompetitiveData = z.infer<typeof insertCompetitiveDataSchema>;
+export type CompetitiveData = typeof competitiveData.$inferSelect;
+
+// Content Inventory — pages and assets the business has published
+export const contentInventory = sqliteTable("content_inventory", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  businessId: integer("business_id").notNull(),
+  contentType: text("content_type"), // "blog" | "case_study" | "whitepaper" | "product_page" | "service_page"
+  title: text("title"),
+  url: text("url"),
+  keywords: text("keywords"), // JSON array of target keywords
+  publishedDate: text("published_date"),
+  lastUpdated: text("last_updated"),
+});
+
+export const insertContentInventorySchema = createInsertSchema(contentInventory).omit({ id: true });
+export type InsertContentInventory = z.infer<typeof insertContentInventorySchema>;
+export type ContentInventoryItem = typeof contentInventory.$inferSelect;
+
+// Service Areas — geographic markets for multi-location businesses
+export const serviceAreas = sqliteTable("service_areas", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  businessId: integer("business_id").notNull(),
+  locationId: integer("location_id"), // references locations table
+  serviceRadiusMiles: integer("service_radius_miles"),
+  primaryMarket: text("primary_market"),       // Primary geographic market
+  regionalSpecialties: text("regional_specialties"), // What they specialize in by region
+});
+
+export const insertServiceAreaSchema = createInsertSchema(serviceAreas).omit({ id: true });
+export type InsertServiceArea = z.infer<typeof insertServiceAreaSchema>;
+export type ServiceArea = typeof serviceAreas.$inferSelect;
 
 // Users
 export const users = sqliteTable("users", {

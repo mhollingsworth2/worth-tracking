@@ -1,6 +1,6 @@
 import type { Express, Request, Response, NextFunction } from "express";
 import { createServer, type Server } from "http";
-import { storage, db } from "./storage";
+import { storage, db, sqlite } from "./storage";
 import {
   businesses, platforms, searchRecords, optimizedPrompts, referrals,
   competitors, aiSnapshots, alerts, contentGaps, locations,
@@ -8,6 +8,8 @@ import {
   users, userBusinesses, loginSchema,
   insertBusinessSchema, insertSearchRecordSchema,
   insertCompetitorSchema, insertAlertSchema, insertLocationSchema,
+  insertCustomQuerySchema, insertCompetitiveDataSchema,
+  insertContentInventorySchema, insertServiceAreaSchema,
 } from "@shared/schema";
 import { sql } from "drizzle-orm";
 import { runScan, testApiKey, generateScanQueries, PROVIDER_COST_PER_CALL } from "./ai-providers";
@@ -45,7 +47,19 @@ async function autoScanBusiness(businessId: number, businessName: string, indust
       return;
     }
 
-    const queries = generateScanQueries(businessName, industry, location);
+    // Fetch enhanced business data and custom queries for richer query generation
+    const business = await storage.getBusiness(businessId);
+    const customQueryRows = await storage.getCustomQueries(businessId);
+    const serviceAreaRows = await storage.getServiceAreas(businessId);
+    const contentInventoryRows = await storage.getContentInventory(businessId);
+    const queries = generateScanQueries(businessName, industry, location, {
+      serviceCategories: business?.serviceCategories ?? null,
+      targetAudience: business?.targetAudience ?? null,
+      keyDifferentiators: business?.keyDifferentiators ?? null,
+      customQueries: customQueryRows,
+      serviceAreas: serviceAreaRows,
+      contentInventory: contentInventoryRows,
+    });
     const allPlatforms = await storage.getPlatforms();
     const platformMap = Object.fromEntries(allPlatforms.map((p) => [p.name, p.id]));
 
@@ -356,6 +370,61 @@ export async function registerRoutes(
     business_id INTEGER NOT NULL
   )`);
 
+  // === NEW ENHANCED PROFILE COLUMNS (idempotent — ignore if already exist) ===
+  // SQLite does not support ALTER TABLE ... ADD COLUMN IF NOT EXISTS, so we
+  // catch the "duplicate column" error and continue.
+  const addColumnIfMissing = (table: string, column: string, type: string) => {
+    try {
+      sqlite.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+    } catch (e: any) {
+      if (!e.message?.includes("duplicate column name")) throw e;
+    }
+  };
+  addColumnIfMissing("businesses", "service_categories", "TEXT");
+  addColumnIfMissing("businesses", "target_audience", "TEXT");
+  addColumnIfMissing("businesses", "key_differentiators", "TEXT");
+  addColumnIfMissing("businesses", "recent_news", "TEXT");
+  addColumnIfMissing("businesses", "website_content_summary", "TEXT");
+
+  db.run(sql`CREATE TABLE IF NOT EXISTS custom_queries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    business_id INTEGER NOT NULL,
+    query TEXT NOT NULL,
+    category TEXT,
+    priority TEXT,
+    created_at TEXT
+  )`);
+
+  db.run(sql`CREATE TABLE IF NOT EXISTS competitive_data (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    business_id INTEGER NOT NULL,
+    competitor_id INTEGER,
+    market_position TEXT,
+    pricing_comparison TEXT,
+    unique_advantages TEXT,
+    last_updated TEXT
+  )`);
+
+  db.run(sql`CREATE TABLE IF NOT EXISTS content_inventory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    business_id INTEGER NOT NULL,
+    content_type TEXT,
+    title TEXT,
+    url TEXT,
+    keywords TEXT,
+    published_date TEXT,
+    last_updated TEXT
+  )`);
+
+  db.run(sql`CREATE TABLE IF NOT EXISTS service_areas (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    business_id INTEGER NOT NULL,
+    location_id INTEGER,
+    service_radius_miles INTEGER,
+    primary_market TEXT,
+    regional_specialties TEXT
+  )`);
+
   console.log("[init] Core tables created successfully");
 
   // === DATABASE INDEXES for query performance ===
@@ -370,6 +439,14 @@ export async function registerRoutes(
     ON referrals(business_id, converted)`);
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_ai_snapshots_business_date
     ON ai_snapshots(business_id, date)`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_custom_queries_business
+    ON custom_queries(business_id)`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_competitive_data_business
+    ON competitive_data(business_id)`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_content_inventory_business
+    ON content_inventory(business_id)`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_service_areas_business
+    ON service_areas(business_id)`);
   console.log("[init] Database indexes created successfully");
 
   // Ensure archive tables exist
@@ -591,6 +668,44 @@ export async function registerRoutes(
     res.json(business);
   });
 
+
+  // === PROFILE COMPLETENESS ===
+  app.get("/api/businesses/:id/profile-completeness", async (req, res) => {
+    const id = parseInt(req.params.id);
+    const business = await storage.getBusiness(id);
+    if (!business) return res.status(404).json({ error: "Business not found" });
+
+    const fields: Record<string, boolean> = {
+      name: !!business.name,
+      description: !!business.description,
+      industry: !!business.industry,
+      website: !!business.website,
+      location: !!business.location,
+      serviceCategories: !!business.serviceCategories,
+      targetAudience: !!business.targetAudience,
+      keyDifferentiators: !!business.keyDifferentiators,
+      recentNews: !!business.recentNews,
+      websiteContentSummary: !!business.websiteContentSummary,
+    };
+
+    const customQueryCount = (await storage.getCustomQueries(id)).length;
+    const contentInventoryCount = (await storage.getContentInventory(id)).length;
+    const serviceAreaCount = (await storage.getServiceAreas(id)).length;
+
+    const filledCount = Object.values(fields).filter(Boolean).length;
+    const totalFields = Object.keys(fields).length;
+    const percentage = Math.round((filledCount / totalFields) * 100);
+
+    res.json({
+      percentage,
+      filledCount,
+      totalFields,
+      fields,
+      customQueryCount,
+      contentInventoryCount,
+      serviceAreaCount,
+    });
+  });
 
   app.delete("/api/businesses/:id", async (req, res) => {
     const id = parseInt(req.params.id);
@@ -816,6 +931,136 @@ export async function registerRoutes(
     res.json({ success: true });
   });
 
+  // === CUSTOM QUERIES ===
+  app.get("/api/businesses/:id/custom-queries", async (req, res) => {
+    const id = parseInt(req.params.id);
+    const result = await storage.getCustomQueries(id);
+    res.json(result);
+  });
+
+  app.post("/api/businesses/:id/custom-queries", async (req, res) => {
+    const businessId = parseInt(req.params.id);
+    const parsed = insertCustomQuerySchema.safeParse({
+      ...req.body,
+      businessId,
+      createdAt: req.body.createdAt ?? new Date().toISOString(),
+    });
+    if (!parsed.success) return res.status(400).json({ error: parsed.error.message });
+    const query = await storage.createCustomQuery(parsed.data);
+    res.json(query);
+  });
+
+  app.patch("/api/businesses/:id/custom-queries/:queryId", async (req, res) => {
+    const queryId = parseInt(req.params.queryId);
+    const updated = await storage.updateCustomQuery(queryId, req.body);
+    if (!updated) return res.status(404).json({ error: "Custom query not found" });
+    res.json(updated);
+  });
+
+  app.delete("/api/businesses/:id/custom-queries/:queryId", async (req, res) => {
+    const queryId = parseInt(req.params.queryId);
+    await storage.deleteCustomQuery(queryId);
+    res.json({ success: true });
+  });
+
+  // === COMPETITIVE DATA ===
+  app.get("/api/businesses/:id/competitive-data", async (req, res) => {
+    const id = parseInt(req.params.id);
+    const result = await storage.getCompetitiveData(id);
+    res.json(result);
+  });
+
+  app.post("/api/businesses/:id/competitive-data", async (req, res) => {
+    const businessId = parseInt(req.params.id);
+    const parsed = insertCompetitiveDataSchema.safeParse({
+      ...req.body,
+      businessId,
+      lastUpdated: req.body.lastUpdated ?? new Date().toISOString(),
+    });
+    if (!parsed.success) return res.status(400).json({ error: parsed.error.message });
+    const data = await storage.createCompetitiveData(parsed.data);
+    res.json(data);
+  });
+
+  app.patch("/api/businesses/:id/competitive-data/:dataId", async (req, res) => {
+    const dataId = parseInt(req.params.dataId);
+    const updated = await storage.updateCompetitiveData(dataId, {
+      ...req.body,
+      lastUpdated: new Date().toISOString(),
+    });
+    if (!updated) return res.status(404).json({ error: "Competitive data record not found" });
+    res.json(updated);
+  });
+
+  app.delete("/api/businesses/:id/competitive-data/:dataId", async (req, res) => {
+    const dataId = parseInt(req.params.dataId);
+    await storage.deleteCompetitiveData(dataId);
+    res.json({ success: true });
+  });
+
+  // === CONTENT INVENTORY ===
+  app.get("/api/businesses/:id/content-inventory", async (req, res) => {
+    const id = parseInt(req.params.id);
+    const result = await storage.getContentInventory(id);
+    res.json(result);
+  });
+
+  app.post("/api/businesses/:id/content-inventory", async (req, res) => {
+    const businessId = parseInt(req.params.id);
+    const parsed = insertContentInventorySchema.safeParse({
+      ...req.body,
+      businessId,
+      lastUpdated: req.body.lastUpdated ?? new Date().toISOString(),
+    });
+    if (!parsed.success) return res.status(400).json({ error: parsed.error.message });
+    const item = await storage.createContentInventoryItem(parsed.data);
+    res.json(item);
+  });
+
+  app.patch("/api/businesses/:id/content-inventory/:contentId", async (req, res) => {
+    const contentId = parseInt(req.params.contentId);
+    const updated = await storage.updateContentInventoryItem(contentId, {
+      ...req.body,
+      lastUpdated: new Date().toISOString(),
+    });
+    if (!updated) return res.status(404).json({ error: "Content inventory item not found" });
+    res.json(updated);
+  });
+
+  app.delete("/api/businesses/:id/content-inventory/:contentId", async (req, res) => {
+    const contentId = parseInt(req.params.contentId);
+    await storage.deleteContentInventoryItem(contentId);
+    res.json({ success: true });
+  });
+
+  // === SERVICE AREAS ===
+  app.get("/api/businesses/:id/service-areas", async (req, res) => {
+    const id = parseInt(req.params.id);
+    const result = await storage.getServiceAreas(id);
+    res.json(result);
+  });
+
+  app.post("/api/businesses/:id/service-areas", async (req, res) => {
+    const businessId = parseInt(req.params.id);
+    const parsed = insertServiceAreaSchema.safeParse({ ...req.body, businessId });
+    if (!parsed.success) return res.status(400).json({ error: parsed.error.message });
+    const area = await storage.createServiceArea(parsed.data);
+    res.json(area);
+  });
+
+  app.patch("/api/businesses/:id/service-areas/:areaId", async (req, res) => {
+    const areaId = parseInt(req.params.areaId);
+    const updated = await storage.updateServiceArea(areaId, req.body);
+    if (!updated) return res.status(404).json({ error: "Service area not found" });
+    res.json(updated);
+  });
+
+  app.delete("/api/businesses/:id/service-areas/:areaId", async (req, res) => {
+    const areaId = parseInt(req.params.areaId);
+    await storage.deleteServiceArea(areaId);
+    res.json({ success: true });
+  });
+
   // === EXPORT CSV ===
   app.get("/api/businesses/:id/export/search-csv", async (req, res) => {
     const id = parseInt(req.params.id);
@@ -950,7 +1195,18 @@ export async function registerRoutes(
       .from(apiUsage).where(sql`date = ${today}`).get();
     const currentSpend = parseFloat(todayUsage?.total ?? "0");
 
-    const queries = generateScanQueries(business.name, business.industry, business.location ?? null);
+    // Fetch enhanced data for richer query generation
+    const customQueryRows = await storage.getCustomQueries(businessId);
+    const serviceAreaRows = await storage.getServiceAreas(businessId);
+    const contentInventoryRows = await storage.getContentInventory(businessId);
+    const queries = generateScanQueries(business.name, business.industry, business.location ?? null, {
+      serviceCategories: business.serviceCategories ?? null,
+      targetAudience: business.targetAudience ?? null,
+      keyDifferentiators: business.keyDifferentiators ?? null,
+      customQueries: customQueryRows,
+      serviceAreas: serviceAreaRows,
+      contentInventory: contentInventoryRows,
+    });
     const totalQueries = queries.length * activeKeys.length;
 
     // Estimate cost of this scan

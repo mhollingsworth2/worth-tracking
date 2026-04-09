@@ -13,6 +13,10 @@ import {
   type ScanJob, type InsertScanJob, scanJobs,
   type User, type SafeUser, users,
   type UserBusiness, userBusinesses,
+  type CustomQuery, type InsertCustomQuery, customQueries,
+  type CompetitiveData, type InsertCompetitiveData, competitiveData,
+  type ContentInventoryItem, type InsertContentInventory, contentInventory,
+  type ServiceArea, type InsertServiceArea, serviceAreas,
 } from "@shared/schema";
 import bcrypt from "bcryptjs";
 import { drizzle } from "drizzle-orm/better-sqlite3";
@@ -26,7 +30,7 @@ import type { QualityReport, FreshnessStats } from "./data-quality";
 import path from "path";
 const dataDir = process.env.DATA_DIR || ".";
 const dbPath = path.join(dataDir, "data.db");
-const sqlite = new Database(dbPath);
+export const sqlite = new Database(dbPath);
 sqlite.pragma("journal_mode = WAL");
 
 export const db = drizzle(sqlite);
@@ -106,6 +110,30 @@ export interface IStorage {
   archiveOldData(daysOld: number, businessId?: number): Promise<{ archived: number }>;
   getDataFreshness(businessId: number): Promise<FreshnessStats>;
 
+  // Custom Queries
+  getCustomQueries(businessId: number): Promise<CustomQuery[]>;
+  createCustomQuery(query: InsertCustomQuery): Promise<CustomQuery>;
+  updateCustomQuery(id: number, data: Partial<InsertCustomQuery>): Promise<CustomQuery | undefined>;
+  deleteCustomQuery(id: number): Promise<void>;
+
+  // Competitive Data
+  getCompetitiveData(businessId: number): Promise<CompetitiveData[]>;
+  createCompetitiveData(data: InsertCompetitiveData): Promise<CompetitiveData>;
+  updateCompetitiveData(id: number, data: Partial<InsertCompetitiveData>): Promise<CompetitiveData | undefined>;
+  deleteCompetitiveData(id: number): Promise<void>;
+
+  // Content Inventory
+  getContentInventory(businessId: number): Promise<ContentInventoryItem[]>;
+  createContentInventoryItem(item: InsertContentInventory): Promise<ContentInventoryItem>;
+  updateContentInventoryItem(id: number, data: Partial<InsertContentInventory>): Promise<ContentInventoryItem | undefined>;
+  deleteContentInventoryItem(id: number): Promise<void>;
+
+  // Service Areas
+  getServiceAreas(businessId: number): Promise<ServiceArea[]>;
+  createServiceArea(area: InsertServiceArea): Promise<ServiceArea>;
+  updateServiceArea(id: number, data: Partial<InsertServiceArea>): Promise<ServiceArea | undefined>;
+  deleteServiceArea(id: number): Promise<void>;
+
   // Scan Jobs
   createScanJob(job: InsertScanJob): Promise<ScanJob>;
   updateScanJob(id: number, updates: Partial<ScanJob>): Promise<void>;
@@ -146,6 +174,12 @@ export class DatabaseStorage implements IStorage {
     if (data.industry !== undefined) updates.industry = data.industry;
     if (data.website !== undefined) updates.website = data.website;
     if (data.location !== undefined) updates.location = data.location;
+    // Enhanced profile fields
+    if (data.serviceCategories !== undefined) updates.serviceCategories = data.serviceCategories;
+    if (data.targetAudience !== undefined) updates.targetAudience = data.targetAudience;
+    if (data.keyDifferentiators !== undefined) updates.keyDifferentiators = data.keyDifferentiators;
+    if (data.recentNews !== undefined) updates.recentNews = data.recentNews;
+    if (data.websiteContentSummary !== undefined) updates.websiteContentSummary = data.websiteContentSummary;
 
     if (Object.keys(updates).length === 0) {
       return this.getBusiness(id);
@@ -164,6 +198,10 @@ export class DatabaseStorage implements IStorage {
     db.delete(alerts).where(eq(alerts.businessId, id)).run();
     db.delete(contentGaps).where(eq(contentGaps.businessId, id)).run();
     db.delete(locations).where(eq(locations.businessId, id)).run();
+    db.delete(customQueries).where(eq(customQueries.businessId, id)).run();
+    db.delete(competitiveData).where(eq(competitiveData.businessId, id)).run();
+    db.delete(contentInventory).where(eq(contentInventory.businessId, id)).run();
+    db.delete(serviceAreas).where(eq(serviceAreas.businessId, id)).run();
   }
 
   async getPlatforms(): Promise<Platform[]> {
@@ -682,6 +720,84 @@ export class DatabaseStorage implements IStorage {
 
   async getDataFreshness(businessId: number): Promise<FreshnessStats> {
     return getDataFreshness(businessId);
+  }
+
+  // === CUSTOM QUERIES ===
+  async getCustomQueries(businessId: number): Promise<CustomQuery[]> {
+    return db.select().from(customQueries)
+      .where(eq(customQueries.businessId, businessId))
+      .orderBy(customQueries.createdAt)
+      .all();
+  }
+
+  async createCustomQuery(query: InsertCustomQuery): Promise<CustomQuery> {
+    return db.insert(customQueries).values(query).returning().get();
+  }
+
+  async updateCustomQuery(id: number, data: Partial<InsertCustomQuery>): Promise<CustomQuery | undefined> {
+    return db.update(customQueries).set(data).where(eq(customQueries.id, id)).returning().get();
+  }
+
+  async deleteCustomQuery(id: number): Promise<void> {
+    db.delete(customQueries).where(eq(customQueries.id, id)).run();
+  }
+
+  // === COMPETITIVE DATA ===
+  async getCompetitiveData(businessId: number): Promise<CompetitiveData[]> {
+    return db.select().from(competitiveData)
+      .where(eq(competitiveData.businessId, businessId))
+      .all();
+  }
+
+  async createCompetitiveData(data: InsertCompetitiveData): Promise<CompetitiveData> {
+    return db.insert(competitiveData).values(data).returning().get();
+  }
+
+  async updateCompetitiveData(id: number, data: Partial<InsertCompetitiveData>): Promise<CompetitiveData | undefined> {
+    return db.update(competitiveData).set(data).where(eq(competitiveData.id, id)).returning().get();
+  }
+
+  async deleteCompetitiveData(id: number): Promise<void> {
+    db.delete(competitiveData).where(eq(competitiveData.id, id)).run();
+  }
+
+  // === CONTENT INVENTORY ===
+  async getContentInventory(businessId: number): Promise<ContentInventoryItem[]> {
+    return db.select().from(contentInventory)
+      .where(eq(contentInventory.businessId, businessId))
+      .orderBy(desc(contentInventory.publishedDate))
+      .all();
+  }
+
+  async createContentInventoryItem(item: InsertContentInventory): Promise<ContentInventoryItem> {
+    return db.insert(contentInventory).values(item).returning().get();
+  }
+
+  async updateContentInventoryItem(id: number, data: Partial<InsertContentInventory>): Promise<ContentInventoryItem | undefined> {
+    return db.update(contentInventory).set(data).where(eq(contentInventory.id, id)).returning().get();
+  }
+
+  async deleteContentInventoryItem(id: number): Promise<void> {
+    db.delete(contentInventory).where(eq(contentInventory.id, id)).run();
+  }
+
+  // === SERVICE AREAS ===
+  async getServiceAreas(businessId: number): Promise<ServiceArea[]> {
+    return db.select().from(serviceAreas)
+      .where(eq(serviceAreas.businessId, businessId))
+      .all();
+  }
+
+  async createServiceArea(area: InsertServiceArea): Promise<ServiceArea> {
+    return db.insert(serviceAreas).values(area).returning().get();
+  }
+
+  async updateServiceArea(id: number, data: Partial<InsertServiceArea>): Promise<ServiceArea | undefined> {
+    return db.update(serviceAreas).set(data).where(eq(serviceAreas.id, id)).returning().get();
+  }
+
+  async deleteServiceArea(id: number): Promise<void> {
+    db.delete(serviceAreas).where(eq(serviceAreas.id, id)).run();
   }
 
   // === SCAN JOBS ===
