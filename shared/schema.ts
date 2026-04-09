@@ -229,6 +229,24 @@ export const insertApiUsageSchema = createInsertSchema(apiUsage).omit({ id: true
 export type InsertApiUsage = z.infer<typeof insertApiUsageSchema>;
 export type ApiUsage = typeof apiUsage.$inferSelect;
 
+// Prompt Recommendations (cached analysis results)
+export const promptRecommendations = sqliteTable("prompt_recommendations", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  businessId: integer("business_id").notNull(),
+  prompt: text("prompt").notNull(),
+  category: text("category").notNull(), // strength | opportunity | trending | question | competitor | intent
+  mentionRate: integer("mention_rate").notNull().default(0), // 0-100
+  frequency: integer("frequency").notNull().default(0),
+  score: integer("score").notNull().default(0), // 0-100
+  reason: text("reason").notNull(),
+  suggestedAction: text("suggested_action").notNull(),
+  generatedAt: text("generated_at").notNull(),
+});
+
+export const insertPromptRecommendationSchema = createInsertSchema(promptRecommendations).omit({ id: true });
+export type InsertPromptRecommendation = z.infer<typeof insertPromptRecommendationSchema>;
+export type PromptRecommendation = typeof promptRecommendations.$inferSelect;
+
 // API Budget Settings
 export const apiSettings = sqliteTable("api_settings", {
   id: integer("id").primaryKey({ autoIncrement: true }),
