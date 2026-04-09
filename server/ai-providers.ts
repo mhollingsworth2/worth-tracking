@@ -69,30 +69,108 @@ export function setAnalysisKeys(keys: { provider: string; apiKey: string }[]) {
 
 // ── Deterministic text-based analysis ──────────────────────────────────────
 // No more AI-analyzing-AI. Mention detection and position are done with
-// reliable text matching. Only sentiment uses simple keyword heuristics.
-function analyzeWithAI(businessName: string, _query: string, responseText: string, _businessContext?: any): AnalysisResult {
+// reliable text matching. Handles the "echo problem" — when a query contains
+// the business name, AI often just echoes it back in a disclaimer.
+function analyzeWithAI(businessName: string, query: string, responseText: string, _businessContext?: any): AnalysisResult {
   const lower = responseText.toLowerCase();
   const nameLower = businessName.toLowerCase();
+  const queryLower = query.toLowerCase();
 
   // Build search variants: full name, and partial names (2+ word combos)
   const nameWords = nameLower.split(/\s+/).filter(w => w.length > 2);
   const searchVariants: string[] = [nameLower];
-
-  // Add partial variants: first N words for N >= 2
-  // e.g. "Helping Hands Cleaning Services" → "helping hands cleaning", "helping hands"
   if (nameWords.length >= 2) {
     for (let len = nameWords.length; len >= 2; len--) {
       searchVariants.push(nameWords.slice(0, len).join(" "));
     }
   }
 
-  // Check for any variant match in the response
-  const mentioned = searchVariants.some(v => lower.includes(v));
+  // Does the business name appear in the response text?
+  const nameFoundInResponse = searchVariants.some(v => lower.includes(v));
 
-  // Determine position: find where in a numbered/bulleted list the business appears
+  // Does the QUERY itself contain the business name?
+  const queryContainsName = searchVariants.some(v => queryLower.includes(v));
+
+  // ── Echo detection ──────────────────────────────────────────────────────
+  // If the query contains the business name, the AI will almost always echo
+  // it back even if it knows nothing. We need to check for GENUINE knowledge.
+  let mentioned = false;
+
+  if (nameFoundInResponse && !queryContainsName) {
+    // The AI brought up the business ON ITS OWN — this is a genuine mention
+    mentioned = true;
+  } else if (nameFoundInResponse && queryContainsName) {
+    // Name was in the query, so AI might just be echoing it.
+    // Check if the response shows genuine knowledge vs disclaimer/hedge.
+
+    // Disclaimer patterns — AI is just echoing the name in a "sorry I don't know" context
+    const disclaimers = [
+      "i don't have specific information about",
+      "i don't have real-time access",
+      "i cannot provide specific",
+      "i'm not able to verify",
+      "i don't have current data",
+      "as an ai, i don't have",
+      "i cannot browse",
+      "i don't have the ability to",
+      "my training data doesn't include",
+      "i'm unable to confirm",
+      "i don't have up-to-date",
+      "search google", "check yelp", "check google",
+      "i recommend checking", "you might want to search",
+      "i suggest looking at", "i'd recommend checking",
+      "without access to current", "without real-time",
+      "i can't verify", "i cannot verify",
+      "to get the most accurate", "for the most current",
+      "here's how to find", "here's how to research",
+      "where to find current reviews",
+    ];
+
+    const hasDisclaimer = disclaimers.some(d => lower.includes(d));
+
+    // Knowledge signals — AI actually knows something specific about the business
+    const knowledgeSignals = [
+      // Specific factual claims
+      /(?:they|this company|this business|the team)\s+(?:offer|provide|specialize|are known|have been|has been)/i,
+      // Star ratings or review counts
+      /\d+(?:\.\d+)?\s*(?:star|stars|out of|\/\s*5|rating)/i,
+      // Specific services mentioned alongside the business
+      /(?:their|they offer|services include|known for their)\s+\w/i,
+      // Price information
+      /(?:pricing|cost|charge|rate|starting at|\$\d)/i,
+      // Hours, location details
+      /(?:located at|open from|hours|phone|contact)/i,
+      // Review summaries with specifics
+      /(?:customers say|clients report|reviews mention|customers praise|customers complain)/i,
+      // Comparison with specific details
+      /(?:compared to|unlike|better than|worse than|stands out)/i,
+    ];
+
+    const hasKnowledge = knowledgeSignals.some(pattern => pattern.test(responseText));
+
+    // Count how many times the name appears — echoes usually have 1-2 mentions,
+    // genuine knowledge has the name woven throughout
+    const matchedVariant = searchVariants.find(v => lower.includes(v))!;
+    const mentionCount = lower.split(matchedVariant).length - 1;
+
+    if (hasKnowledge) {
+      // AI shows real knowledge — count as mentioned even with disclaimers
+      mentioned = true;
+    } else if (!hasDisclaimer && mentionCount >= 2) {
+      // No disclaimer and name mentioned multiple times — probably genuine
+      mentioned = true;
+    } else if (hasDisclaimer && !hasKnowledge) {
+      // Disclaimer with no real knowledge — this is just an echo
+      mentioned = false;
+    } else {
+      // Ambiguous — mentioned name once without disclaimer but no real knowledge
+      mentioned = mentionCount >= 3;
+    }
+  }
+
+  // ── Position detection ──────────────────────────────────────────────────
   let position: number | null = null;
   if (mentioned) {
-    // Look for numbered list patterns: "1. Business Name", "1) Business Name", "#1: Business Name"
     const lines = responseText.split("\n");
     let listIndex = 0;
     for (const line of lines) {
@@ -108,17 +186,17 @@ function analyzeWithAI(businessName: string, _query: string, responseText: strin
     }
   }
 
-  // Determine sentiment from surrounding context
+  // ── Sentiment analysis ──────────────────────────────────────────────────
   let sentiment: "positive" | "neutral" | "negative" = "neutral";
   if (mentioned) {
     const positiveWords = ["recommend", "excellent", "great", "best", "top", "outstanding", "highly rated",
       "trusted", "reliable", "professional", "quality", "reputable", "well-known", "popular",
-      "favorite", "praised", "strong", "exceptional", "impressive", "thorough"];
+      "favorite", "praised", "strong", "exceptional", "impressive", "thorough", "highly recommend"];
     const negativeWords = ["complaint", "avoid", "poor", "bad", "worst", "unreliable", "overpriced",
       "unprofessional", "disappointing", "warning", "beware", "issues", "problem", "negative reviews"];
 
-    // Check sentiment words near the business name mention
-    const nameIndex = lower.indexOf(searchVariants.find(v => lower.includes(v))!);
+    const matchedVariant = searchVariants.find(v => lower.includes(v))!;
+    const nameIndex = lower.indexOf(matchedVariant);
     const context = lower.slice(Math.max(0, nameIndex - 200), Math.min(lower.length, nameIndex + 500));
 
     const posCount = positiveWords.filter(w => context.includes(w)).length;
@@ -130,22 +208,19 @@ function analyzeWithAI(businessName: string, _query: string, responseText: strin
     else if (negCount > 0) sentiment = "negative";
   }
 
-  // Confidence based on match quality
+  // ── Confidence ──────────────────────────────────────────────────────────
   let confidence: "high" | "medium" | "low" = "medium";
-  if (mentioned && lower.includes(nameLower)) {
-    confidence = "high"; // Full exact name match
-  } else if (mentioned) {
-    confidence = "medium"; // Partial match
+  if (mentioned && !queryContainsName) {
+    confidence = "high"; // AI independently brought up the business
+  } else if (mentioned && queryContainsName) {
+    confidence = "medium"; // Business was in query, so mention is less surprising
   } else {
-    // Check if it's a generic refusal vs genuinely not mentioned
-    const isGeneric = ["i don't have", "i cannot", "search google", "check yelp", "i'm not able",
+    const isGeneric = ["i don't have", "i cannot", "search google", "check yelp",
       "i recommend checking", "you might want to search"].some(p => lower.includes(p));
     confidence = isGeneric ? "low" : "high";
   }
 
-  if (mentioned) {
-    console.log(`[Analysis] "${businessName}" FOUND in response (position: ${position}, sentiment: ${sentiment}, confidence: ${confidence})`);
-  }
+  console.log(`[Analysis] "${businessName}" ${mentioned ? "FOUND" : "NOT FOUND"} (queryHadName: ${queryContainsName}, position: ${position}, sentiment: ${sentiment}, confidence: ${confidence})`);
 
   return { mentioned, sentiment, confidence, position };
 }
