@@ -71,9 +71,8 @@ export function setAnalysisKeys(keys: { provider: string; apiKey: string }[]) {
 }
 
 // ── Deterministic text-based analysis ──────────────────────────────────────
-// No more AI-analyzing-AI. Mention detection and position are done with
-// reliable text matching. Handles the "echo problem" — when a query contains
-// the business name, AI often just echoes it back in a disclaimer.
+// Simple and reliable: if the business name is in the response, it's mentioned.
+// Only exception: pure refusal responses where the AI says nothing useful.
 function analyzeWithAI(businessName: string, query: string, responseText: string, _businessContext?: any): AnalysisResult {
   const lower = responseText.toLowerCase();
   const nameLower = businessName.toLowerCase();
@@ -90,85 +89,23 @@ function analyzeWithAI(businessName: string, query: string, responseText: string
 
   // Does the business name appear in the response text?
   const nameFoundInResponse = searchVariants.some(v => lower.includes(v));
-
-  // Does the QUERY itself contain the business name?
   const queryContainsName = searchVariants.some(v => queryLower.includes(v));
 
-  // ── Echo detection ──────────────────────────────────────────────────────
-  // If the query contains the business name, the AI will almost always echo
-  // it back even if it knows nothing. We need to check for GENUINE knowledge.
+  // ── Mention detection — simple rule ─────────────────────────────────────
+  // If the name is in the response → mentioned.
+  // ONLY exception: the entire response is a short refusal with no substance.
   let mentioned = false;
 
-  if (nameFoundInResponse && !queryContainsName) {
-    // The AI brought up the business ON ITS OWN — this is a genuine mention
-    mentioned = true;
-  } else if (nameFoundInResponse && queryContainsName) {
-    // Name was in the query, so AI might just be echoing it.
-    // Check if the response shows genuine knowledge vs disclaimer/hedge.
-
-    // Disclaimer patterns — AI is just echoing the name in a "sorry I don't know" context
-    const disclaimers = [
-      "i don't have specific information about",
-      "i don't have real-time access",
-      "i cannot provide specific",
-      "i'm not able to verify",
-      "i don't have current data",
-      "as an ai, i don't have",
-      "i cannot browse",
-      "i don't have the ability to",
-      "my training data doesn't include",
-      "i'm unable to confirm",
-      "i don't have up-to-date",
-      "search google", "check yelp", "check google",
-      "i recommend checking", "you might want to search",
-      "i suggest looking at", "i'd recommend checking",
-      "without access to current", "without real-time",
-      "i can't verify", "i cannot verify",
-      "to get the most accurate", "for the most current",
-      "here's how to find", "here's how to research",
-      "where to find current reviews",
+  if (nameFoundInResponse) {
+    // Only reject if the response is PURELY a refusal — short and says nothing useful
+    const pureRefusals = [
+      "i don't have specific information",
+      "i don't have any information",
+      "no verified information available",
+      "i'm not familiar with this business",
     ];
-
-    const hasDisclaimer = disclaimers.some(d => lower.includes(d));
-
-    // Knowledge signals — AI actually knows something specific about the business
-    const knowledgeSignals = [
-      // Specific factual claims
-      /(?:they|this company|this business|the team)\s+(?:offer|provide|specialize|are known|have been|has been)/i,
-      // Star ratings or review counts
-      /\d+(?:\.\d+)?\s*(?:star|stars|out of|\/\s*5|rating)/i,
-      // Specific services mentioned alongside the business
-      /(?:their|they offer|services include|known for their)\s+\w/i,
-      // Price information
-      /(?:pricing|cost|charge|rate|starting at|\$\d)/i,
-      // Hours, location details
-      /(?:located at|open from|hours|phone|contact)/i,
-      // Review summaries with specifics
-      /(?:customers say|clients report|reviews mention|customers praise|customers complain)/i,
-      // Comparison with specific details
-      /(?:compared to|unlike|better than|worse than|stands out)/i,
-    ];
-
-    const hasKnowledge = knowledgeSignals.some(pattern => pattern.test(responseText));
-
-    // Count how many times the name appears — echoes usually have 1-2 mentions,
-    // genuine knowledge has the name woven throughout
-    const matchedVariant = searchVariants.find(v => lower.includes(v))!;
-    const mentionCount = lower.split(matchedVariant).length - 1;
-
-    if (hasKnowledge) {
-      // AI shows real knowledge — count as mentioned even with disclaimers
-      mentioned = true;
-    } else if (!hasDisclaimer && mentionCount >= 2) {
-      // No disclaimer and name mentioned multiple times — probably genuine
-      mentioned = true;
-    } else if (hasDisclaimer && !hasKnowledge) {
-      // Disclaimer with no real knowledge — this is just an echo
-      mentioned = false;
-    } else {
-      // Ambiguous — mentioned name once without disclaimer but no real knowledge
-      mentioned = mentionCount >= 3;
-    }
+    const isPureRefusal = responseText.length < 300 && pureRefusals.some(r => lower.includes(r));
+    mentioned = !isPureRefusal;
   }
 
   // ── Position detection ──────────────────────────────────────────────────
