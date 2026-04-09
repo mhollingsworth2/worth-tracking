@@ -286,6 +286,38 @@ export async function testApiKey(provider: string, apiKey: string): Promise<{ su
   }
 }
 
+// Ask an AI to identify real competitors for a business
+export async function detectCompetitors(
+  businessName: string,
+  industry: string,
+  location: string | null,
+  keys: { provider: string; apiKey: string }[]
+): Promise<string[]> {
+  const locStr = location ? ` in ${location}` : "";
+  const prompt = `List the top 5 real, well-known competitors to "${businessName}" in the ${industry} industry${locStr}. Return ONLY a comma-separated list of business names, nothing else. If you don't know the specific business, list the top 5 well-known ${industry} businesses${locStr} instead. Example format: "Company A, Company B, Company C, Company D, Company E"`;
+
+  // Try each provider until one works
+  for (const key of keys) {
+    const fn = PROVIDER_FN[key.provider];
+    if (!fn) continue;
+    try {
+      const result = await fn(key.apiKey, prompt, "__no_match__"); // dummy name so it doesn't affect mention detection
+      const text = result.responseText.trim();
+      // Parse the comma-separated response, clean up any numbering or quotes
+      const names = text
+        .replace(/^\d+[\.\)]\s*/gm, "") // remove "1. ", "2) " etc
+        .split(/[,\n]+/)
+        .map(s => s.replace(/["""']/g, "").replace(/^\s*-\s*/, "").trim())
+        .filter(s => s.length > 1 && s.length < 80 && !s.toLowerCase().includes("here"))
+        .slice(0, 5);
+      if (names.length > 0) return names;
+    } catch (err: any) {
+      console.error(`[Competitors] ${key.provider} failed:`, err.message);
+    }
+  }
+  return [];
+}
+
 export interface BusinessContext {
   name: string;
   industry: string;

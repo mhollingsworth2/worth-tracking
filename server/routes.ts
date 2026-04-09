@@ -10,7 +10,7 @@ import {
   insertCompetitorSchema, insertAlertSchema, insertLocationSchema,
 } from "@shared/schema";
 import { sql } from "drizzle-orm";
-import { runScan, testApiKey, generateScanQueries, PROVIDER_COST_PER_CALL, type BusinessContext } from "./ai-providers";
+import { runScan, testApiKey, generateScanQueries, detectCompetitors, PROVIDER_COST_PER_CALL, type BusinessContext } from "./ai-providers";
 import { requireAuth, requireAdmin, createSession, deleteSession, getSession } from "./auth";
 import bcrypt from "bcryptjs";
 import { validateSearchRecord, validateReferral, validateAiSnapshot } from "./data-validation";
@@ -60,7 +60,7 @@ function toBizContext(biz: any): BusinessContext {
 
 async function autoScanBusiness(businessId: number) {
   try {
-    const biz = await storage.getBusiness(businessId);
+    let biz = await storage.getBusiness(businessId);
     if (!biz) return;
 
     const keys = await storage.getApiKeys();
@@ -68,6 +68,24 @@ async function autoScanBusiness(businessId: number) {
     if (activeKeys.length === 0) {
       console.log(`[Auto-Scan] No API keys configured — skipping initial scan for "${biz.name}"`);
       return;
+    }
+
+    // Auto-detect competitors if none are set
+    const existingCompetitors = (biz as any).competitors ?? (biz as any).known_competitors ?? "";
+    if (!existingCompetitors) {
+      try {
+        const keyInputs = activeKeys.map((k) => ({ provider: k.provider, apiKey: k.apiKey }));
+        const detected = await detectCompetitors(biz.name, biz.industry, biz.location ?? null, keyInputs);
+        if (detected.length > 0) {
+          const csv = detected.join(", ");
+          console.log(`[Auto-Scan] Detected competitors for "${biz.name}": ${csv}`);
+          db.run(sql`UPDATE businesses SET known_competitors = ${csv} WHERE id = ${businessId}`);
+          // Re-fetch so the scan uses the new competitors
+          biz = (await storage.getBusiness(businessId))!;
+        }
+      } catch (err: any) {
+        console.error(`[Auto-Scan] Competitor detection failed for "${biz.name}":`, err.message);
+      }
     }
 
     const ctx = toBizContext(biz);
