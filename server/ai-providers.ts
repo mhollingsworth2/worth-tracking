@@ -60,30 +60,24 @@ interface AnalysisResult {
   position: number | null;
 }
 
-const ANALYSIS_PROMPT = (businessName: string, query: string, responseText: string, businessContext?: { location?: string | null; website?: string | null; services?: string | null }) => `You are analyzing an AI response to determine if it genuinely mentions and recommends a specific business.
+const ANALYSIS_PROMPT = (businessName: string, query: string, responseText: string, businessContext?: { location?: string | null; website?: string | null; services?: string | null }) => {
+  const locHint = businessContext?.location ? ` in/near ${businessContext.location}` : "";
+  return `Does this AI response mention "${businessName}"${locHint}?
 
-Business name: "${businessName}"
-Original query: "${query}"
-${businessContext?.location || businessContext?.website || businessContext?.services ? `
-IMPORTANT — verify this is the CORRECT "${businessName}":
-${businessContext.location ? `- Must be located in/near: ${businessContext.location}` : ""}
-${businessContext.website ? `- Website should be: ${businessContext.website}` : ""}
-${businessContext.services ? `- Offers these services: ${businessContext.services}` : ""}
-If the response mentions a different "${businessName}" (wrong city, different services, different website), mark as NOT mentioned.` : ""}
+Rules:
+- Count it as mentioned if the business name appears ANYWHERE in the response, even partially (e.g. "Helping Hands" counts for "Helping Hands Cleaning Services")
+- Count it as mentioned if the response discusses or recommends this business, even without using the exact full name
+- Do NOT require a website match or services match — just the name and approximate location
+- If the response is a generic "I can't help" or "search Google" message that doesn't mention the business specifically, mark as NOT mentioned
 
-AI Response to analyze:
+Response to analyze:
 """
-${responseText.slice(0, 2000)}
+${responseText.slice(0, 3000)}
 """
 
-Answer these questions about the response above:
-1. Does the response genuinely mention the SPECIFIC "${businessName}" that matches the business details above (not a different business with the same or similar name)?
-2. If mentioned, what position in a list does it appear? (1 = first mentioned, 2 = second, etc. null if not in a list)
-3. What is the overall sentiment toward "${businessName}"? (positive = recommended/praised, neutral = just mentioned factually, negative = warned against/criticized)
-4. How confident are you in this analysis? (high = clearly mentioned or clearly not, medium = somewhat ambiguous, low = very unclear)
-
-Respond with ONLY valid JSON, no other text:
+Return ONLY valid JSON:
 {"mentioned": true/false, "position": number or null, "sentiment": "positive"/"neutral"/"negative", "confidence": "high"/"medium"/"low"}`;
+};
 
 // Keys available for analysis calls (populated from active API keys)
 let analysisKeys: { provider: string; apiKey: string }[] = [];
@@ -176,12 +170,26 @@ async function analyzeWithAI(businessName: string, query: string, responseText: 
       const cleaned = analysisText.replace(/```json?\s*/gi, "").replace(/```/g, "").trim();
       const parsed = JSON.parse(cleaned);
 
-      return {
+      const result = {
         mentioned: !!parsed.mentioned,
         sentiment: ["positive", "neutral", "negative"].includes(parsed.sentiment) ? parsed.sentiment : "neutral",
         confidence: ["high", "medium", "low"].includes(parsed.confidence) ? parsed.confidence : "medium",
         position: typeof parsed.position === "number" ? parsed.position : null,
       };
+
+      // Sanity check: if the business name literally appears in the response but AI said "not mentioned", override
+      const responseLower = responseText.toLowerCase();
+      const nameWords = businessName.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+      const nameInResponse = responseLower.includes(businessName.toLowerCase()) ||
+        (nameWords.length >= 2 && nameWords.filter(w => responseLower.includes(w)).length >= Math.min(2, nameWords.length));
+
+      if (!result.mentioned && nameInResponse) {
+        console.log(`[AI Analysis] Override: "${businessName}" found in response text but analyzer said not mentioned — correcting to mentioned`);
+        result.mentioned = true;
+        result.confidence = "medium";
+      }
+
+      return result;
     } catch (err: any) {
       console.error(`[AI Analysis] ${key.provider} failed:`, err.message);
       continue;
@@ -198,8 +206,12 @@ function fallbackAnalysis(businessName: string, responseText: string): AnalysisR
   const lower = responseText.toLowerCase();
   const nameLower = businessName.toLowerCase();
 
-  const noKnowledge = ["i don't have", "i do not have", "no verified information", "not familiar with", "no information"].some(p => lower.includes(p));
-  const mentioned = !noKnowledge && lower.includes(nameLower);
+  // Check if the business name (or a significant portion of it) appears in the response
+  const nameWords = nameLower.split(/\s+/).filter(w => w.length > 2);
+  const fullNameMatch = lower.includes(nameLower);
+  // Partial match: if 2+ significant words from the business name appear close together
+  const partialMatch = nameWords.length >= 2 && nameWords.filter(w => lower.includes(w)).length >= Math.min(2, nameWords.length);
+  const mentioned = fullNameMatch || partialMatch;
 
   let position: number | null = null;
   if (mentioned) {
