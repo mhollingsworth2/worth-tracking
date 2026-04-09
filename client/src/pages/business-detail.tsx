@@ -1193,6 +1193,7 @@ export default function BusinessDetail() {
 
           {/* ========== SETTINGS TAB ========== */}
           <TabsContent value="settings" className="space-y-6 mt-4">
+            <PlatformHealthCard />
             <AIContextSettings businessId={id} business={business} />
             {/* Embed Click Tracker */}
             <Card>
@@ -1986,6 +1987,52 @@ function ContentGapsSection({ gaps }: { gaps: ContentGap[] }) {
 }
 
 /* ============ AI SEARCH CONTEXT SETTINGS ============ */
+function PlatformHealthCard() {
+  const { data: health, isLoading } = useQuery<{ provider: string; successCount: number; errorCount: number; successRate: number; avgResponseTime: number }[]>({
+    queryKey: ["/api/platform-health"],
+    queryFn: async () => { const res = await fetch("/api/platform-health"); return res.json(); },
+  });
+
+  const providerLabels: Record<string, string> = { openai: "ChatGPT", anthropic: "Claude", google: "Google Gemini", perplexity: "Perplexity" };
+
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        <CardTitle className="text-sm font-medium flex items-center gap-2">
+          <Cpu className="w-4 h-4 text-primary" />
+          Platform Health (Last 7 Days)
+          <InfoTip text="Tracks the success rate and speed of each AI platform over the past 7 days. Green means reliable, yellow means occasional issues, red means frequent failures." />
+        </CardTitle>
+        <CardDescription className="text-xs">API reliability and response times</CardDescription>
+      </CardHeader>
+      <CardContent>
+        {isLoading ? <Skeleton className="h-24 w-full" /> : !health || health.length === 0 ? (
+          <p className="text-sm text-muted-foreground text-center py-4">No health data yet — run a scan to start tracking.</p>
+        ) : (
+          <div className="space-y-3">
+            {health.map((h) => (
+              <div key={h.provider} className="flex items-center gap-3">
+                <span className="text-sm w-28 truncate font-medium">{providerLabels[h.provider] ?? h.provider}</span>
+                <div className="flex-1 h-5 bg-muted rounded-full overflow-hidden">
+                  <div
+                    className={`h-full rounded-full transition-all ${h.successRate >= 90 ? "bg-emerald-500" : h.successRate >= 70 ? "bg-amber-500" : "bg-destructive"}`}
+                    style={{ width: `${Math.max(h.successRate, 3)}%` }}
+                  />
+                </div>
+                <span className={`text-xs font-medium w-12 text-right ${h.successRate >= 90 ? "text-emerald-600" : h.successRate >= 70 ? "text-amber-600" : "text-destructive"}`}>
+                  {h.successRate}%
+                </span>
+                <span className="text-[10px] text-muted-foreground w-16 text-right">{h.avgResponseTime}ms</span>
+                <span className="text-[10px] text-muted-foreground w-16 text-right">{h.successCount}✓ {h.errorCount}✗</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 function AIContextSettings({ businessId, business }: { businessId: number; business: Business }) {
   const [services, setServices] = useState((business as any).services ?? "");
   const [keywords, setKeywords] = useState((business as any).keywords ?? "");

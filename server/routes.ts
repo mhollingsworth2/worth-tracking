@@ -6,12 +6,12 @@ import {
   businesses, platforms, searchRecords, optimizedPrompts, referrals,
   competitors, aiSnapshots, alerts, contentGaps, locations,
   apiKeys, scanJobs, apiUsage, apiSettings, clickEvents,
-  users, userBusinesses, agencySettings, loginSchema,
+  users, userBusinesses, agencySettings, platformHealth, loginSchema,
   insertBusinessSchema, insertSearchRecordSchema,
   insertCompetitorSchema, insertAlertSchema, insertLocationSchema,
 } from "@shared/schema";
 import { sql } from "drizzle-orm";
-import { runScan, testApiKey, generateScanQueries, detectCompetitors, setAnalysisKeys, detectHallucinations, PROVIDER_COST_PER_CALL, type BusinessContext } from "./ai-providers";
+import { runScan, testApiKey, generateScanQueries, detectCompetitors, setAnalysisKeys, detectHallucinations, verifyCitations, setHealthCallback, PROVIDER_COST_PER_CALL, type BusinessContext } from "./ai-providers";
 import { generateDemoData, clearDemoData } from "./demo-data";
 import { requireAuth, requireAdmin, createSession, deleteSession, getSession } from "./auth";
 import bcrypt from "bcryptjs";
@@ -96,7 +96,7 @@ async function generateScanAlerts(businessId: number) {
 
     if (todayRecords.length === 0) return; // no scan results today
 
-    // ── (a) Mention rate drop ────────────────────────────────────────────────
+    // ── (a) Mention rate drop (with temporal anomaly detection) ────────────────
     if (prevDateRow) {
       const prevDate = prevDateRow.date;
       const prevRecords = db
@@ -105,11 +105,72 @@ async function generateScanAlerts(businessId: number) {
         .where(sql`business_id = ${businessId} AND competitor_id IS NULL AND date = ${prevDate}`)
         .all();
 
+      // Get rolling average from last 7 scan dates for anomaly detection
+      const recentDates = db
+        .select({ date: searchRecords.date })
+        .from(searchRecords)
+        .where(sql`business_id = ${businessId} AND competitor_id IS NULL AND date <= ${today}`)
+        .groupBy(searchRecords.date)
+        .orderBy(sql`date DESC`)
+        .limit(7)
+        .all();
+
+      let rollingAvgRate: number | null = null;
+      if (recentDates.length >= 3) {
+        let totalMentions = 0;
+        let totalRecords = 0;
+        for (const { date } of recentDates.slice(1)) { // exclude today
+          const dayRecords = db
+            .select()
+            .from(searchRecords)
+            .where(sql`business_id = ${businessId} AND competitor_id IS NULL AND date = ${date}`)
+            .all();
+          totalRecords += dayRecords.length;
+          totalMentions += dayRecords.filter(r => r.mentioned === 1).length;
+        }
+        if (totalRecords > 0) {
+          rollingAvgRate = totalMentions / totalRecords;
+        }
+      }
+
+      // Detect extreme anomaly: if today's rate swings more than 50% from rolling avg
+      if (rollingAvgRate !== null && todayRecords.length > 0) {
+        const todayRate = todayRecords.filter(r => r.mentioned === 1).length / todayRecords.length;
+        const deviation = Math.abs(todayRate - rollingAvgRate) / Math.max(rollingAvgRate, 0.01);
+        if (deviation > 0.5) {
+          const direction = todayRate < rollingAvgRate ? "drop" : "spike";
+          const msg = `Anomaly detected: mention rate ${direction} of ${Math.round(deviation * 100)}% from 7-day average (${Math.round(rollingAvgRate * 100)}% avg → ${Math.round(todayRate * 100)}% today). This may be a temporary fluctuation.`;
+          if (!alertExists("anomaly", msg, today)) {
+            await storage.createAlert({ businessId, type: "anomaly", message: msg, severity: "info", date: today });
+            console.log(`[Alerts] Created anomaly alert for business ${businessId}`);
+          }
+        }
+      }
+
       if (prevRecords.length > 0) {
         const prevMentionRate = prevRecords.filter((r) => r.mentioned === 1).length / prevRecords.length;
         const todayMentionRate = todayRecords.filter((r) => r.mentioned === 1).length / todayRecords.length;
 
-        if (prevMentionRate > 0) {
+        // Use rolling average comparison when available, fall back to prev-day
+        if (rollingAvgRate !== null && rollingAvgRate > 0) {
+          // Compare against rolling average instead of just previous day
+          const dropPct = ((rollingAvgRate - todayMentionRate) / rollingAvgRate) * 100;
+
+          if (dropPct > 30) {
+            const msg = `Mention rate dropped ${Math.round(dropPct)}% from 7-day average (${Math.round(rollingAvgRate * 100)}% avg → ${Math.round(todayMentionRate * 100)}% today)`;
+            if (!alertExists("mention_drop", msg, today)) {
+              await storage.createAlert({ businessId, type: "mention_drop", message: msg, severity: "critical", date: today });
+              console.log(`[Alerts] Created critical mention_drop alert for business ${businessId}`);
+            }
+          } else if (dropPct > 15) {
+            const msg = `Mention rate dropped ${Math.round(dropPct)}% from 7-day average (${Math.round(rollingAvgRate * 100)}% avg → ${Math.round(todayMentionRate * 100)}% today)`;
+            if (!alertExists("mention_drop", msg, today)) {
+              await storage.createAlert({ businessId, type: "mention_drop", message: msg, severity: "warning", date: today });
+              console.log(`[Alerts] Created warning mention_drop alert for business ${businessId}`);
+            }
+          }
+        } else if (prevMentionRate > 0) {
+          // Fallback: less than 3 days of data, compare to previous day
           const dropPct = ((prevMentionRate - todayMentionRate) / prevMentionRate) * 100;
 
           if (dropPct > 30) {
@@ -274,8 +335,12 @@ async function autoScanBusiness(businessId: number) {
     let mentionCount = 0;
     const keyInputs = activeKeys.map((k) => ({ provider: k.provider, apiKey: k.apiKey }));
     setAnalysisKeys(keyInputs);
+    const scanDateStr = new Date().toISOString().split("T")[0];
+    setHealthCallback((provider, status, responseTimeMs, errorMessage) => {
+      db.insert(platformHealth).values({ provider, status, errorMessage: errorMessage ?? null, responseTimeMs, date: scanDateStr, timestamp: new Date().toISOString() }).run();
+    });
 
-    for await (const result of runScan(biz.name, queries, keyInputs, extraTerms)) {
+    for await (const result of runScan(biz.name, queries, keyInputs, extraTerms, { location: biz.location ?? null, website: biz.website ?? null, services: (biz as any).services ?? null })) {
       completed++;
       const platformId = platformMap[result.platform] ?? 1;
       const dateStr = new Date().toISOString().split("T")[0];
@@ -333,6 +398,16 @@ async function autoScanBusiness(businessId: number) {
         } catch (err: any) {
           console.error(`[Auto-Scan] Hallucination check failed:`, err.message);
         }
+      }
+
+      // Citation verification for grounded sources
+      if (result.sourceType === "grounded" && result.mentioned) {
+        try {
+          const citations = await verifyCitations(result.responseText, biz.name);
+          if (citations.failed > 0) {
+            issues.push(`Citation: ${citations.failed} of ${citations.verified + citations.failed} cited URLs are broken/invalid`);
+          }
+        } catch {}
       }
 
       if (result.responseText) {
@@ -692,6 +767,16 @@ export async function registerRoutes(
     custom_domain TEXT,
     footer_text TEXT,
     created_at TEXT NOT NULL
+  )`);
+
+  db.run(sql`CREATE TABLE IF NOT EXISTS platform_health (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider TEXT NOT NULL,
+    status TEXT NOT NULL,
+    error_message TEXT,
+    response_time_ms INTEGER,
+    date TEXT NOT NULL,
+    timestamp TEXT NOT NULL
   )`);
 
   console.log("[init] Core tables created successfully");
@@ -2151,7 +2236,11 @@ Extract real information from the content. If a field isn't clear from the websi
     try {
       const keyInputs = activeKeys.map((k) => ({ provider: k.provider, apiKey: k.apiKey }));
       setAnalysisKeys(keyInputs);
-      for await (const result of runScan(business.name, queries, keyInputs, extraTerms)) {
+      const manualScanDate = new Date().toISOString().split("T")[0];
+      setHealthCallback((provider, status, responseTimeMs, errorMessage) => {
+        db.insert(platformHealth).values({ provider, status, errorMessage: errorMessage ?? null, responseTimeMs, date: manualScanDate, timestamp: new Date().toISOString() }).run();
+      });
+      for await (const result of runScan(business.name, queries, keyInputs, extraTerms, { location: business.location ?? null, website: (business as any).website ?? null, services: (business as any).services ?? null })) {
         completed++;
         const platformId = platformMap[result.platform] ?? 1;
         const dateStr = new Date().toISOString().split("T")[0];
@@ -2208,6 +2297,16 @@ Extract real information from the content. If a field isn't clear from the websi
           } catch (err: any) {
             console.error(`[Scan] Hallucination check failed:`, err.message);
           }
+        }
+
+        // Citation verification for grounded sources
+        if (result.sourceType === "grounded" && result.mentioned) {
+          try {
+            const citations = await verifyCitations(result.responseText, business.name);
+            if (citations.failed > 0) {
+              issues.push(`Citation: ${citations.failed} of ${citations.verified + citations.failed} cited URLs are broken/invalid`);
+            }
+          } catch {}
         }
 
         if (result.responseText) {
@@ -2333,6 +2432,29 @@ Extract real information from the content. If a field isn't clear from the websi
       callCount: sql<number>`count(*)`,
     }).from(apiUsage).groupBy(apiUsage.date).orderBy(sql`date desc`).limit(30).all();
     res.json(rows.map(r => ({ ...r, totalSpend: Math.round(parseFloat(r.totalSpend ?? "0") * 1000) / 1000 })));
+  });
+
+  // === PLATFORM HEALTH ===
+  app.get("/api/platform-health", async (_req, res) => {
+    const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString().split("T")[0];
+    const stats = db.select({
+      provider: platformHealth.provider,
+      successCount: sql<number>`sum(case when status = 'success' then 1 else 0 end)`,
+      errorCount: sql<number>`sum(case when status = 'error' then 1 else 0 end)`,
+      avgResponseTime: sql<number>`avg(response_time_ms)`,
+    })
+      .from(platformHealth)
+      .where(sql`date >= ${sevenDaysAgo}`)
+      .groupBy(platformHealth.provider)
+      .all();
+
+    res.json(stats.map(s => ({
+      ...s,
+      successRate: s.successCount + s.errorCount > 0
+        ? Math.round((s.successCount / (s.successCount + s.errorCount)) * 100)
+        : 0,
+      avgResponseTime: Math.round(s.avgResponseTime ?? 0),
+    })));
   });
 
   app.get("/api/settings/budget", async (_req, res) => {

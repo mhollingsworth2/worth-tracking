@@ -277,6 +277,21 @@ export const insertAgencySettingsSchema = createInsertSchema(agencySettings).omi
 export type InsertAgencySettings = z.infer<typeof insertAgencySettingsSchema>;
 export type AgencySettings = typeof agencySettings.$inferSelect;
 
+// Platform Health Tracking
+export const platformHealth = sqliteTable("platform_health", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  provider: text("provider").notNull(),
+  status: text("status").notNull(), // "success" | "error"
+  errorMessage: text("error_message"),
+  responseTimeMs: integer("response_time_ms"),
+  date: text("date").notNull(),
+  timestamp: text("timestamp").notNull(),
+});
+
+export const insertPlatformHealthSchema = createInsertSchema(platformHealth).omit({ id: true });
+export type InsertPlatformHealth = z.infer<typeof insertPlatformHealthSchema>;
+export type PlatformHealth = typeof platformHealth.$inferSelect;
+
 // API Budget Settings
 export const apiSettings = sqliteTable("api_settings", {
   id: integer("id").primaryKey({ autoIncrement: true }),

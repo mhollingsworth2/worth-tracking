@@ -21,6 +21,7 @@ const typeLabels: Record<string, string> = {
   competitor_outrank: "Competitor Outrank",
   platform_missing: "Platform Missing",
   accuracy_issue: "Accuracy Issue",
+  anomaly: "Anomaly Detected",
 };
 
 export default function Alerts() {
@@ -91,6 +92,7 @@ export default function Alerts() {
             <SelectItem value="competitor_outrank">Competitor Outrank</SelectItem>
             <SelectItem value="platform_missing">Platform Missing</SelectItem>
             <SelectItem value="accuracy_issue">Accuracy Issue</SelectItem>
+            <SelectItem value="anomaly">Anomaly Detected</SelectItem>
           </SelectContent>
         </Select>
 

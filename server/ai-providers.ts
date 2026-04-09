@@ -10,6 +10,32 @@ export interface AIQueryResult {
   crossValidated: boolean | null; // null = not yet validated (single-platform)
 }
 
+// Retry wrapper for transient failures (rate limits & server errors)
+async function fetchWithRetry(url: string, options: RequestInit, maxRetries = 2): Promise<Response> {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await fetch(url, options);
+      // Retry on rate limit (429) or server errors (500+)
+      if ((res.status === 429 || res.status >= 500) && attempt < maxRetries) {
+        const delay = Math.pow(2, attempt) * 1000; // 1s, 2s, 4s
+        console.warn(`[Retry] ${res.status} on attempt ${attempt + 1}, waiting ${delay}ms...`);
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+      return res;
+    } catch (err: any) {
+      if (attempt < maxRetries && (err.name === 'TypeError' || err.message?.includes('fetch'))) {
+        const delay = Math.pow(2, attempt) * 1000;
+        console.warn(`[Retry] Network error on attempt ${attempt + 1}, waiting ${delay}ms...`);
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error('Max retries exceeded');
+}
+
 // System instruction sent with every query to reduce hallucination.
 // Models are told to explicitly decline rather than fabricate business details.
 const SYSTEM_INSTRUCTION = "You are answering questions about real-world businesses. Base your answer only on verified, factual information. If you do not have reliable, specific information about a business being asked about, respond with 'No verified information available' and briefly explain what you do and don't know. Do not guess, fabricate details, or invent reviews, ratings, addresses, or services. It is better to say you don't know than to make something up.";
@@ -27,10 +53,16 @@ interface AnalysisResult {
   position: number | null;
 }
 
-const ANALYSIS_PROMPT = (businessName: string, query: string, responseText: string) => `You are analyzing an AI response to determine if it genuinely mentions and recommends a specific business.
+const ANALYSIS_PROMPT = (businessName: string, query: string, responseText: string, businessContext?: { location?: string | null; website?: string | null; services?: string | null }) => `You are analyzing an AI response to determine if it genuinely mentions and recommends a specific business.
 
 Business name: "${businessName}"
 Original query: "${query}"
+${businessContext?.location || businessContext?.website || businessContext?.services ? `
+IMPORTANT — verify this is the CORRECT "${businessName}":
+${businessContext.location ? `- Must be located in/near: ${businessContext.location}` : ""}
+${businessContext.website ? `- Website should be: ${businessContext.website}` : ""}
+${businessContext.services ? `- Offers these services: ${businessContext.services}` : ""}
+If the response mentions a different "${businessName}" (wrong city, different services, different website), mark as NOT mentioned.` : ""}
 
 AI Response to analyze:
 """
@@ -38,7 +70,7 @@ ${responseText.slice(0, 2000)}
 """
 
 Answer these questions about the response above:
-1. Does the response genuinely mention "${businessName}" as a real recommendation (not just echoing the question, saying "I don't know about them", or confusing it with a different business)?
+1. Does the response genuinely mention the SPECIFIC "${businessName}" that matches the business details above (not a different business with the same or similar name)?
 2. If mentioned, what position in a list does it appear? (1 = first mentioned, 2 = second, etc. null if not in a list)
 3. What is the overall sentiment toward "${businessName}"? (positive = recommended/praised, neutral = just mentioned factually, negative = warned against/criticized)
 4. How confident are you in this analysis? (high = clearly mentioned or clearly not, medium = somewhat ambiguous, low = very unclear)
@@ -53,7 +85,7 @@ export function setAnalysisKeys(keys: { provider: string; apiKey: string }[]) {
   analysisKeys = keys;
 }
 
-async function analyzeWithAI(businessName: string, query: string, responseText: string): Promise<AnalysisResult> {
+async function analyzeWithAI(businessName: string, query: string, responseText: string, businessContext?: { location?: string | null; website?: string | null; services?: string | null }): Promise<AnalysisResult> {
   // Try to use the cheapest available model for analysis
   // Priority: Google (cheapest) > OpenAI > Anthropic > Perplexity
   const priority = ["google", "openai", "anthropic", "perplexity"];
@@ -61,31 +93,33 @@ async function analyzeWithAI(businessName: string, query: string, responseText: 
     return priority.indexOf(a.provider) - priority.indexOf(b.provider);
   });
 
-  const prompt = ANALYSIS_PROMPT(businessName, query, responseText);
+  const prompt = ANALYSIS_PROMPT(businessName, query, responseText, businessContext);
 
   for (const key of sortedKeys) {
     try {
       let analysisText = "";
 
       if (key.provider === "google") {
-        const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key.apiKey}`, {
+        const res = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key.apiKey}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             systemInstruction: { parts: [{ text: "You are a precise JSON-only analysis tool. Respond with valid JSON only, no markdown, no explanation." }] },
             contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { temperature: 0 },
           }),
         });
         if (!res.ok) continue;
         const data = await res.json();
         analysisText = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
       } else if (key.provider === "openai") {
-        const res = await fetch("https://api.openai.com/v1/chat/completions", {
+        const res = await fetchWithRetry("https://api.openai.com/v1/chat/completions", {
           method: "POST",
           headers: { "Authorization": `Bearer ${key.apiKey}`, "Content-Type": "application/json" },
           body: JSON.stringify({
             model: "gpt-4o-mini",
             max_completion_tokens: 256,
+            temperature: 0,
             messages: [
               { role: "system", content: "You are a precise JSON-only analysis tool. Respond with valid JSON only, no markdown, no explanation." },
               { role: "user", content: prompt },
@@ -96,12 +130,13 @@ async function analyzeWithAI(businessName: string, query: string, responseText: 
         const data = await res.json();
         analysisText = data.choices?.[0]?.message?.content ?? "";
       } else if (key.provider === "anthropic") {
-        const res = await fetch("https://api.anthropic.com/v1/messages", {
+        const res = await fetchWithRetry("https://api.anthropic.com/v1/messages", {
           method: "POST",
           headers: { "x-api-key": key.apiKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
           body: JSON.stringify({
             model: "claude-haiku-4-5-20251001",
             max_tokens: 256,
+            temperature: 0,
             system: "You are a precise JSON-only analysis tool. Respond with valid JSON only, no markdown, no explanation.",
             messages: [{ role: "user", content: prompt }],
           }),
@@ -112,12 +147,13 @@ async function analyzeWithAI(businessName: string, query: string, responseText: 
           ? data.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("")
           : "";
       } else if (key.provider === "perplexity") {
-        const res = await fetch("https://api.perplexity.ai/chat/completions", {
+        const res = await fetchWithRetry("https://api.perplexity.ai/chat/completions", {
           method: "POST",
           headers: { "Authorization": `Bearer ${key.apiKey}`, "Content-Type": "application/json" },
           body: JSON.stringify({
             model: "sonar",
             max_tokens: 256,
+            temperature: 0,
             messages: [
               { role: "system", content: "You are a precise JSON-only analysis tool. Respond with valid JSON only, no markdown, no explanation." },
               { role: "user", content: prompt },
@@ -175,6 +211,46 @@ function fallbackAnalysis(businessName: string, responseText: string): AnalysisR
   return { mentioned, sentiment, confidence: "low", position };
 }
 
+// ── Response Fingerprinting ──────────────────────────────────────────────
+// Detect generic, template, or evasive responses that shouldn't count as
+// reliable data points.
+
+export function isGenericResponse(responseText: string): boolean {
+  const lower = responseText.toLowerCase();
+  const genericPatterns = [
+    "i don't have specific information",
+    "i don't have access to real-time",
+    "i cannot provide specific recommendations",
+    "i'm not able to verify",
+    "i don't have current data",
+    "as an ai, i don't have",
+    "i cannot browse the internet",
+    "i don't have the ability to",
+    "my training data doesn't include",
+    "i'm unable to confirm",
+    "i don't have up-to-date",
+    "without access to current",
+    "i can't verify specific businesses",
+    "i don't have information about businesses in your area",
+    "i recommend checking google",
+    "you might want to search",
+    "i suggest looking at",
+    "please verify this information",
+  ];
+
+  const matchCount = genericPatterns.filter(p => lower.includes(p)).length;
+  // If 2+ patterns match, it's likely a template/evasive response
+  if (matchCount >= 2) return true;
+
+  // Also detect very short responses (likely "I don't know" variants)
+  if (responseText.trim().length < 100) {
+    const shortDismissals = ["i don't", "i cannot", "i'm not", "no information", "not available"];
+    if (shortDismissals.some(p => lower.includes(p))) return true;
+  }
+
+  return false;
+}
+
 // ── Hallucination Detection ──────────────────────────────────────────────
 // After confirming a business IS mentioned, check if the AI fabricated any
 // facts about it (wrong location, made-up services, etc.)
@@ -230,24 +306,26 @@ export async function detectHallucinations(
       let analysisText = "";
 
       if (key.provider === "google") {
-        const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key.apiKey}`, {
+        const res = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key.apiKey}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             systemInstruction: { parts: [{ text: "You are a precise JSON-only fact-checking tool. Respond with valid JSON only, no markdown, no explanation." }] },
             contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { temperature: 0 },
           }),
         });
         if (!res.ok) continue;
         const data = await res.json();
         analysisText = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
       } else if (key.provider === "openai") {
-        const res = await fetch("https://api.openai.com/v1/chat/completions", {
+        const res = await fetchWithRetry("https://api.openai.com/v1/chat/completions", {
           method: "POST",
           headers: { "Authorization": `Bearer ${key.apiKey}`, "Content-Type": "application/json" },
           body: JSON.stringify({
             model: "gpt-4o-mini",
             max_completion_tokens: 256,
+            temperature: 0,
             messages: [
               { role: "system", content: "You are a precise JSON-only fact-checking tool. Respond with valid JSON only, no markdown, no explanation." },
               { role: "user", content: prompt },
@@ -258,12 +336,13 @@ export async function detectHallucinations(
         const data = await res.json();
         analysisText = data.choices?.[0]?.message?.content ?? "";
       } else if (key.provider === "anthropic") {
-        const res = await fetch("https://api.anthropic.com/v1/messages", {
+        const res = await fetchWithRetry("https://api.anthropic.com/v1/messages", {
           method: "POST",
           headers: { "x-api-key": key.apiKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
           body: JSON.stringify({
             model: "claude-haiku-4-5-20251001",
             max_tokens: 256,
+            temperature: 0,
             system: "You are a precise JSON-only fact-checking tool. Respond with valid JSON only, no markdown, no explanation.",
             messages: [{ role: "user", content: prompt }],
           }),
@@ -274,12 +353,13 @@ export async function detectHallucinations(
           ? data.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("")
           : "";
       } else if (key.provider === "perplexity") {
-        const res = await fetch("https://api.perplexity.ai/chat/completions", {
+        const res = await fetchWithRetry("https://api.perplexity.ai/chat/completions", {
           method: "POST",
           headers: { "Authorization": `Bearer ${key.apiKey}`, "Content-Type": "application/json" },
           body: JSON.stringify({
             model: "sonar",
             max_tokens: 256,
+            temperature: 0,
             messages: [
               { role: "system", content: "You are a precise JSON-only fact-checking tool. Respond with valid JSON only, no markdown, no explanation." },
               { role: "user", content: prompt },
@@ -310,119 +390,180 @@ export async function detectHallucinations(
   return { hasHallucinations: false, issues: [] };
 }
 
-async function queryOpenAI(apiKey: string, query: string, businessName: string, extraTerms?: string[]): Promise<AIQueryResult> {
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      max_completion_tokens: 1024,
-      messages: [
-        { role: "system", content: SYSTEM_INSTRUCTION },
-        { role: "user", content: query },
-      ],
-    }),
-  });
+// ── Citation Verification ──────────────────────────────────────────────────
+// For grounded platforms (Perplexity, Gemini), verify that cited URLs actually exist.
+export async function verifyCitations(responseText: string, businessName: string): Promise<{ verified: number; failed: number; urls: { url: string; valid: boolean }[] }> {
+  const urlRegex = /https?:\/\/[^\s\)\]"'<>]+/g;
+  const urls = [...new Set(responseText.match(urlRegex) || [])].slice(0, 5);
+  if (urls.length === 0) return { verified: 0, failed: 0, urls: [] };
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`OpenAI API error ${res.status}: ${text}`);
+  const results: { url: string; valid: boolean }[] = [];
+  for (const url of urls) {
+    try {
+      const res = await fetch(url, {
+        method: "HEAD",
+        headers: { "User-Agent": "Mozilla/5.0 (compatible; WorthTracking/1.0)" },
+        signal: AbortSignal.timeout(5000),
+        redirect: "follow",
+      });
+      results.push({ url, valid: res.status < 400 });
+    } catch {
+      results.push({ url, valid: false });
+    }
   }
-
-  const data = await res.json();
-  const responseText = data.choices?.[0]?.message?.content ?? "";
-  const analysis = await analyzeWithAI(businessName, query, responseText);
-
-  return { platform: "ChatGPT", query, responseText, ...analysis, sourceType: "knowledge" as const, crossValidated: null };
+  return { verified: results.filter(r => r.valid).length, failed: results.filter(r => !r.valid).length, urls: results };
 }
 
-async function queryAnthropic(apiKey: string, query: string, businessName: string, extraTerms?: string[]): Promise<AIQueryResult> {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 1024,
-      system: SYSTEM_INSTRUCTION,
-      messages: [{ role: "user", content: query }],
-    }),
-  });
+// ── Platform Health Tracking ────────────────────────────────────────────────
+let healthCallback: ((provider: string, status: "success" | "error", responseTimeMs: number, errorMessage?: string) => void) | null = null;
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Anthropic API error ${res.status}: ${text}`);
-  }
-
-  const data = await res.json();
-  const responseText = Array.isArray(data.content)
-    ? data.content.filter((block: any) => block.type === "text").map((block: any) => block.text).join("\n")
-    : "";
-  const analysis = await analyzeWithAI(businessName, query, responseText);
-
-  return { platform: "Claude", query, responseText, ...analysis, sourceType: "knowledge" as const, crossValidated: null };
+export function setHealthCallback(cb: typeof healthCallback) {
+  healthCallback = cb;
 }
 
-async function queryGemini(apiKey: string, query: string, businessName: string, extraTerms?: string[]): Promise<AIQueryResult> {
-  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
-      contents: [{ parts: [{ text: query }] }],
-    }),
-  });
+async function queryOpenAI(apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null }): Promise<AIQueryResult> {
+  const startTime = Date.now();
+  try {
+    const res = await fetchWithRetry("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        max_completion_tokens: 1024,
+        temperature: 0,
+        messages: [
+          { role: "system", content: SYSTEM_INSTRUCTION },
+          { role: "user", content: query },
+        ],
+      }),
+    });
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Gemini API error ${res.status}: ${text}`);
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`OpenAI API error ${res.status}: ${text}`);
+    }
+
+    const data = await res.json();
+    const responseText = data.choices?.[0]?.message?.content ?? "";
+    const analysis = await analyzeWithAI(businessName, query, responseText, businessContext);
+
+    healthCallback?.("openai", "success", Date.now() - startTime);
+    return { platform: "ChatGPT", query, responseText, ...analysis, sourceType: "knowledge" as const, crossValidated: null };
+  } catch (err: any) {
+    healthCallback?.("openai", "error", Date.now() - startTime, err.message);
+    throw err;
   }
-
-  const data = await res.json();
-  const responseText = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-  const analysis = await analyzeWithAI(businessName, query, responseText);
-
-  // Gemini has access to web search / grounding by default
-  return { platform: "Google Gemini", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null };
 }
 
-async function queryPerplexity(apiKey: string, query: string, businessName: string, extraTerms?: string[]): Promise<AIQueryResult> {
-  const res = await fetch("https://api.perplexity.ai/chat/completions", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "sonar",
-      max_tokens: 1024,
-      messages: [
-        { role: "system", content: SYSTEM_INSTRUCTION },
-        { role: "user", content: query },
-      ],
-    }),
-  });
+async function queryAnthropic(apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null }): Promise<AIQueryResult> {
+  const startTime = Date.now();
+  try {
+    const res = await fetchWithRetry("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 1024,
+        temperature: 0,
+        system: SYSTEM_INSTRUCTION,
+        messages: [{ role: "user", content: query }],
+      }),
+    });
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Perplexity API error ${res.status}: ${text}`);
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Anthropic API error ${res.status}: ${text}`);
+    }
+
+    const data = await res.json();
+    const responseText = Array.isArray(data.content)
+      ? data.content.filter((block: any) => block.type === "text").map((block: any) => block.text).join("\n")
+      : "";
+    const analysis = await analyzeWithAI(businessName, query, responseText, businessContext);
+
+    healthCallback?.("anthropic", "success", Date.now() - startTime);
+    return { platform: "Claude", query, responseText, ...analysis, sourceType: "knowledge" as const, crossValidated: null };
+  } catch (err: any) {
+    healthCallback?.("anthropic", "error", Date.now() - startTime, err.message);
+    throw err;
   }
-
-  const data = await res.json();
-  const responseText = data.choices?.[0]?.message?.content ?? "";
-  const analysis = await analyzeWithAI(businessName, query, responseText);
-
-  // Perplexity always searches the web in real-time
-  return { platform: "Perplexity", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null };
 }
 
-const PROVIDER_FN: Record<string, (apiKey: string, query: string, businessName: string, extraTerms?: string[]) => Promise<AIQueryResult>> = {
+async function queryGemini(apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null }): Promise<AIQueryResult> {
+  const startTime = Date.now();
+  try {
+    const res = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
+        contents: [{ parts: [{ text: query }] }],
+        generationConfig: { temperature: 0 },
+      }),
+    });
+
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Gemini API error ${res.status}: ${text}`);
+    }
+
+    const data = await res.json();
+    const responseText = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+    const analysis = await analyzeWithAI(businessName, query, responseText, businessContext);
+
+    healthCallback?.("google", "success", Date.now() - startTime);
+    return { platform: "Google Gemini", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null };
+  } catch (err: any) {
+    healthCallback?.("google", "error", Date.now() - startTime, err.message);
+    throw err;
+  }
+}
+
+async function queryPerplexity(apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null }): Promise<AIQueryResult> {
+  const startTime = Date.now();
+  try {
+    const res = await fetchWithRetry("https://api.perplexity.ai/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "sonar",
+        max_tokens: 1024,
+        temperature: 0,
+        messages: [
+          { role: "system", content: SYSTEM_INSTRUCTION },
+          { role: "user", content: query },
+        ],
+      }),
+    });
+
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Perplexity API error ${res.status}: ${text}`);
+    }
+
+    const data = await res.json();
+    const responseText = data.choices?.[0]?.message?.content ?? "";
+    const analysis = await analyzeWithAI(businessName, query, responseText, businessContext);
+
+    healthCallback?.("perplexity", "success", Date.now() - startTime);
+    return { platform: "Perplexity", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null };
+  } catch (err: any) {
+    healthCallback?.("perplexity", "error", Date.now() - startTime, err.message);
+    throw err;
+  }
+}
+
+const PROVIDER_FN: Record<string, (apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null }) => Promise<AIQueryResult>> = {
   openai: queryOpenAI,
   anthropic: queryAnthropic,
   google: queryGemini,
@@ -488,25 +629,80 @@ export async function* runScan(
   businessName: string,
   queries: string[],
   keys: { provider: string; apiKey: string }[],
-  extraTerms?: string[]
+  extraTerms?: string[],
+  businessContext?: { location?: string | null; website?: string | null; services?: string | null }
 ): AsyncGenerator<AIQueryResult> {
-  for (const query of queries) {
-    // Collect all platform results for this query before yielding
-    const batchResults: AIQueryResult[] = [];
+  const RUNS_PER_QUERY = 2; // Run each query 2x per platform for stability
 
-    for (const key of keys) {
-      const fn = PROVIDER_FN[key.provider];
-      if (!fn) continue;
-      try {
-        const result = await fn(key.apiKey, query, businessName, extraTerms);
-        batchResults.push(result);
-      } catch (err: any) {
-        console.error(`[AI Scan] ${key.provider} failed for query "${query}":`, err.message);
+  for (const query of queries) {
+    // Collect results across multiple runs
+    const allRuns: AIQueryResult[][] = [];
+
+    for (let run = 0; run < RUNS_PER_QUERY; run++) {
+      const runResults: AIQueryResult[] = [];
+      for (const key of keys) {
+        const fn = PROVIDER_FN[key.provider];
+        if (!fn) continue;
+        try {
+          const result = await fn(key.apiKey, query, businessName, extraTerms, businessContext);
+          if (isGenericResponse(result.responseText)) {
+            console.log(`[Scan] Generic response detected from ${result.platform} for "${query}" (run ${run + 1})`);
+            result.confidence = "low";
+          }
+          runResults.push(result);
+        } catch (err: any) {
+          console.error(`[AI Scan] ${key.provider} run ${run + 1} failed for query "${query}":`, err.message);
+        }
+      }
+      allRuns.push(runResults);
+    }
+
+    // Average results per platform across runs
+    const platformResults = new Map<string, AIQueryResult[]>();
+    for (const runResults of allRuns) {
+      for (const result of runResults) {
+        if (!platformResults.has(result.platform)) platformResults.set(result.platform, []);
+        platformResults.get(result.platform)!.push(result);
       }
     }
 
-    // Cross-validate the batch, then yield each validated result
-    const validated = crossValidateResults(batchResults);
+    const averaged: AIQueryResult[] = [];
+    for (const [platform, results] of platformResults) {
+      if (results.length === 0) continue;
+
+      // Majority vote on mentioned
+      const mentionedCount = results.filter(r => r.mentioned).length;
+      const mentioned = mentionedCount > results.length / 2;
+
+      // Average position (only from runs where mentioned)
+      const positions = results.filter(r => r.mentioned && r.position !== null).map(r => r.position!);
+      const avgPosition = positions.length > 0 ? Math.round((positions.reduce((a, b) => a + b, 0) / positions.length) * 10) / 10 : null;
+
+      // Majority vote on sentiment
+      const sentimentCounts = { positive: 0, neutral: 0, negative: 0 };
+      for (const r of results) sentimentCounts[r.sentiment]++;
+      const sentiment = (Object.entries(sentimentCounts).sort((a, b) => b[1] - a[1])[0][0]) as "positive" | "neutral" | "negative";
+
+      // If runs disagree on mentioned, lower confidence
+      const allAgree = results.every(r => r.mentioned === mentioned);
+      let confidence = results[0].confidence;
+      if (!allAgree) confidence = confidence === "high" ? "medium" : "low";
+
+      // Use the longest response text (most informative)
+      const bestResponse = [...results].sort((a, b) => b.responseText.length - a.responseText.length)[0];
+
+      averaged.push({
+        platform, query,
+        responseText: bestResponse.responseText,
+        mentioned, sentiment, confidence,
+        position: avgPosition,
+        sourceType: results[0].sourceType,
+        crossValidated: null,
+      });
+    }
+
+    // Cross-validate the averaged batch, then yield
+    const validated = crossValidateResults(averaged);
     for (const result of validated) {
       yield result;
     }
