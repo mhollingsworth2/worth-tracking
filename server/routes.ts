@@ -667,8 +667,11 @@ export async function registerRoutes(
     sentiment TEXT NOT NULL,
     mentioned_accurate INTEGER NOT NULL DEFAULT 1,
     flagged_issues TEXT,
+    hallucination_count INTEGER NOT NULL DEFAULT 0,
     date TEXT NOT NULL
   )`);
+  // Migration for existing DBs missing hallucination_count
+  try { db.run(sql`ALTER TABLE ai_snapshots ADD COLUMN hallucination_count INTEGER NOT NULL DEFAULT 0`); } catch (_e) { /* exists */ }
 
   db.run(sql`CREATE TABLE IF NOT EXISTS alerts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
