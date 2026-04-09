@@ -69,12 +69,16 @@ async function generateOptimizedPrompts(businessId: number) {
     const biz = await storage.getBusiness(businessId);
     if (!biz) return;
 
-    const today = new Date().toISOString().split("T")[0];
-    const records = db.select().from(searchRecords)
-      .where(sql`business_id = ${businessId} AND date = ${today} AND competitor_id IS NULL`)
+    // Use the most recent scan's records (not filtered by exact date to avoid timezone issues)
+    const allRecords = db.select().from(searchRecords)
+      .where(sql`business_id = ${businessId} AND competitor_id IS NULL`)
       .all();
 
-    if (records.length === 0) return;
+    if (allRecords.length === 0) return;
+
+    // Find the latest date and use records from that date
+    const latestDate = allRecords.reduce((max, r) => r.date > max ? r.date : max, allRecords[0].date);
+    const records = allRecords.filter(r => r.date === latestDate);
 
     // Clear old prompts for this business and regenerate
     db.delete(optimizedPrompts).where(sql`business_id = ${businessId}`).run();
@@ -151,6 +155,123 @@ async function generateOptimizedPrompts(businessId: number) {
     console.log(`[Prompts] Generated ${topPrompts.length} optimized prompts for business #${businessId}`);
   } catch (err: any) {
     console.error(`[Prompts] Error generating prompts for business #${businessId}:`, err.message);
+  }
+}
+
+// ── Content Gap Detection ──────────────────────────────────────────────────
+// Analyzes scan results to find queries where the business is NOT being mentioned.
+// These represent content opportunities — topics to write about on your website.
+async function generateContentGaps(businessId: number) {
+  try {
+    const biz = await storage.getBusiness(businessId);
+    if (!biz) return;
+
+    // Get the most recent scan's records
+    const allRecords = db.select().from(searchRecords)
+      .where(sql`business_id = ${businessId} AND competitor_id IS NULL`)
+      .all();
+
+    if (allRecords.length === 0) return;
+
+    const latestDate = allRecords.reduce((max, r) => r.date > max ? r.date : max, allRecords[0].date);
+    const records = allRecords.filter(r => r.date === latestDate);
+
+    // Clear old gaps and regenerate
+    db.delete(contentGaps).where(sql`business_id = ${businessId}`).run();
+
+    // Group by query — find queries with low or zero mention rates
+    const queryMap = new Map<string, { mentioned: number; total: number }>();
+    for (const r of records) {
+      if (!queryMap.has(r.query)) queryMap.set(r.query, { mentioned: 0, total: 0 });
+      const q = queryMap.get(r.query)!;
+      q.total++;
+      if (r.mentioned) q.mentioned++;
+    }
+
+    const gaps: { query: string; category: string; currentlyRanking: number; recommendedContent: string; contentType: string; priority: string }[] = [];
+
+    for (const [query, data] of queryMap) {
+      const mentionRate = data.total > 0 ? data.mentioned / data.total : 0;
+
+      // Only flag as a gap if mention rate is below 50%
+      if (mentionRate >= 0.5) continue;
+
+      const lq = query.toLowerCase();
+      const bizName = biz.name.toLowerCase();
+
+      // Determine category
+      let category = "General";
+      if (lq.includes("best") || lq.includes("recommend") || lq.includes("top")) category = "Discovery";
+      else if (lq.includes("vs ") || lq.includes("compare") || lq.includes("between")) category = "Comparison";
+      else if (lq.includes("review") || lq.includes("reputation") || lq.includes("worth")) category = "Reputation";
+      else if (lq.includes("near") || lq.includes("in ") || lq.includes("local")) category = "Local SEO";
+      else if (lq.includes("cost") || lq.includes("price") || lq.includes("afford")) category = "Pricing";
+      else if (lq.includes("how") || lq.includes("what") || lq.includes("tips")) category = "Educational";
+
+      // Determine content type recommendation
+      let contentType = "blog_post";
+      let recommendedContent = "";
+      const priority = mentionRate === 0 ? "high" : "medium";
+
+      if (category === "Discovery") {
+        contentType = "landing_page";
+        recommendedContent = `Create a dedicated service page optimized for "${query.replace(/"/g, '')}". Include your business name, location, services, and customer testimonials. Add schema markup (LocalBusiness + Service).`;
+      } else if (category === "Comparison") {
+        contentType = "blog_post";
+        recommendedContent = `Write a comparison guide that positions your business against alternatives. Highlight your unique advantages, pricing, and customer reviews.`;
+      } else if (category === "Reputation") {
+        contentType = "review_response";
+        recommendedContent = `Strengthen your review presence: respond to all Google/Yelp reviews, add testimonials to your website, and create a dedicated reviews page. Encourage satisfied customers to leave reviews.`;
+      } else if (category === "Local SEO") {
+        contentType = "schema_markup";
+        recommendedContent = `Optimize for local search: complete your Google Business Profile, add LocalBusiness schema markup, build citations on directories (Yelp, BBB, industry-specific), and create location-specific content.`;
+      } else if (category === "Pricing") {
+        contentType = "landing_page";
+        recommendedContent = `Create a pricing/cost guide page. AI models often cite businesses with transparent pricing. Include service tiers, starting prices, and "get a free quote" calls-to-action.`;
+      } else if (category === "Educational") {
+        contentType = "blog_post";
+        recommendedContent = `Write an educational blog post or FAQ page addressing "${query.replace(/"/g, '')}". AI models heavily cite authoritative, informative content.`;
+      } else {
+        contentType = "blog_post";
+        recommendedContent = `Create content addressing "${query.replace(/"/g, '')}". Add relevant keywords to your website, publish a blog post, and ensure your business is listed on major directories.`;
+      }
+
+      // Skip queries that are just about the business by name (those aren't content gaps)
+      if (lq.includes(bizName) && category === "Reputation") continue;
+
+      gaps.push({
+        query,
+        category,
+        currentlyRanking: mentionRate > 0 ? 1 : 0,
+        recommendedContent,
+        contentType,
+        priority,
+      });
+    }
+
+    // Sort by priority (high first) then by category
+    gaps.sort((a, b) => {
+      const prio = { high: 0, medium: 1, low: 2 };
+      return (prio[a.priority as keyof typeof prio] ?? 1) - (prio[b.priority as keyof typeof prio] ?? 1);
+    });
+
+    const topGaps = gaps.slice(0, 15);
+
+    for (const g of topGaps) {
+      db.insert(contentGaps).values({
+        businessId,
+        query: g.query,
+        category: g.category,
+        currentlyRanking: g.currentlyRanking,
+        recommendedContent: g.recommendedContent,
+        contentType: g.contentType,
+        priority: g.priority,
+      }).run();
+    }
+
+    console.log(`[ContentGaps] Generated ${topGaps.length} content gaps for business #${businessId}`);
+  } catch (err: any) {
+    console.error(`[ContentGaps] Error generating gaps for business #${businessId}:`, err.message);
   }
 }
 
@@ -594,9 +715,10 @@ async function autoScanBusiness(businessId: number) {
       }
     }
 
-    // Generate alerts based on scan results
+    // Generate alerts, prompts, and content gaps based on scan results
     await generateScanAlerts(businessId);
     await generateOptimizedPrompts(businessId);
+    await generateContentGaps(businessId);
 
   } catch (err: any) {
     console.error(`[Auto-Scan] Error for business ${businessId}:`, err.message);
@@ -1355,7 +1477,8 @@ export async function registerRoutes(
       const biz = await storage.getBusiness(businessId);
       if (!biz) return res.status(404).json({ error: "Business not found" });
 
-      const activeKeys = db.select().from(apiKeys).where(eq(apiKeys.isActive, 1)).all();
+      const keys = await storage.getApiKeys();
+      const activeKeys = keys.filter((k) => k.isActive);
       if (activeKeys.length === 0) return res.status(400).json({ error: "No API keys configured" });
 
       const keyInputs = activeKeys.map((k) => ({ provider: k.provider, apiKey: k.apiKey }));
@@ -2549,9 +2672,10 @@ Extract real information from the content. If a field isn't clear from the websi
         }
       }
 
-      // Generate alerts and prompts based on scan results
+      // Generate alerts, prompts, and content gaps based on scan results
       await generateScanAlerts(businessId);
       await generateOptimizedPrompts(businessId);
+      await generateContentGaps(businessId);
 
       res.json({
         jobId: job.id,

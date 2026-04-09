@@ -209,35 +209,11 @@ export function isGenericResponse(responseText: string): boolean {
 // After confirming a business IS mentioned, check if the AI fabricated any
 // facts about it (wrong location, made-up services, etc.)
 
-const HALLUCINATION_PROMPT = (
-  businessName: string,
-  facts: { location: string | null; website: string | null; services: string | null },
-  responseText: string,
-  platform: string,
-) => {
-  const knownFacts: string[] = [];
-  if (facts.location) knownFacts.push(`Location: ${facts.location}`);
-  if (facts.website) knownFacts.push(`Website: ${facts.website}`);
-  if (facts.services) knownFacts.push(`Services offered: ${facts.services}`);
-  const factsBlock = knownFacts.length > 0 ? knownFacts.join("\n") : "No verified facts available";
-
-  return `Check this ${platform} AI response about "${businessName}" for hallucinated or incorrect facts.
-
-Known facts about the business:
-${factsBlock}
-
-AI Response:
-"""
-${responseText.slice(0, 1500)}
-"""
-
-List ONLY concrete factual errors (wrong address/location, fabricated services not offered, made-up reviews/ratings, wrong website URL, confused with a different business). Ignore subjective claims or opinions.
-
-Respond with ONLY valid JSON:
-{"issues": ["issue 1", "issue 2"]}
-If no issues found: {"issues": []}`;
-};
-
+// ── Deterministic hallucination detection ─────────────────────────────────
+// The old approach used a knowledge-only AI to fact-check web-grounded responses,
+// which caused massive false positives (the checker couldn't verify real web data
+// and flagged it as "hallucinated"). Now we only check for direct contradictions
+// with known business facts — no AI needed, just text matching.
 export async function detectHallucinations(
   businessFacts: {
     name: string;
@@ -246,102 +222,67 @@ export async function detectHallucinations(
     services: string | null;
   },
   responseText: string,
-  platform: string,
+  _platform: string,
 ): Promise<{ hasHallucinations: boolean; issues: string[] }> {
-  const priority = ["google", "openai", "anthropic", "perplexity"];
-  const sortedKeys = [...analysisKeys].sort((a, b) => {
-    return priority.indexOf(a.provider) - priority.indexOf(b.provider);
-  });
+  const lower = responseText.toLowerCase();
+  const issues: string[] = [];
 
-  const prompt = HALLUCINATION_PROMPT(businessFacts.name, businessFacts, responseText, platform);
+  // Check 1: If response mentions a DIFFERENT city/state than the known location
+  if (businessFacts.location) {
+    const locParts = businessFacts.location.toLowerCase().split(",").map(s => s.trim());
+    const city = locParts[0]; // e.g., "elmhurst"
+    const state = locParts[1]; // e.g., "il"
 
-  for (const key of sortedKeys) {
-    try {
-      let analysisText = "";
-
-      if (key.provider === "google") {
-        const res = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key.apiKey}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            systemInstruction: { parts: [{ text: "You are a precise JSON-only fact-checking tool. Respond with valid JSON only, no markdown, no explanation." }] },
-            contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: { temperature: 0 },
-          }),
-        });
-        if (!res.ok) continue;
-        const data = await res.json();
-        analysisText = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-      } else if (key.provider === "openai") {
-        const res = await fetchWithRetry("https://api.openai.com/v1/chat/completions", {
-          method: "POST",
-          headers: { "Authorization": `Bearer ${key.apiKey}`, "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: "gpt-4o-mini",
-            max_completion_tokens: 256,
-            temperature: 0,
-            messages: [
-              { role: "system", content: "You are a precise JSON-only fact-checking tool. Respond with valid JSON only, no markdown, no explanation." },
-              { role: "user", content: prompt },
-            ],
-          }),
-        });
-        if (!res.ok) continue;
-        const data = await res.json();
-        analysisText = data.choices?.[0]?.message?.content ?? "";
-      } else if (key.provider === "anthropic") {
-        const res = await fetchWithRetry("https://api.anthropic.com/v1/messages", {
-          method: "POST",
-          headers: { "x-api-key": key.apiKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: "claude-haiku-4-5-20251001",
-            max_tokens: 256,
-            temperature: 0,
-            system: "You are a precise JSON-only fact-checking tool. Respond with valid JSON only, no markdown, no explanation.",
-            messages: [{ role: "user", content: prompt }],
-          }),
-        });
-        if (!res.ok) continue;
-        const data = await res.json();
-        analysisText = Array.isArray(data.content)
-          ? data.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("")
-          : "";
-      } else if (key.provider === "perplexity") {
-        const res = await fetchWithRetry("https://api.perplexity.ai/chat/completions", {
-          method: "POST",
-          headers: { "Authorization": `Bearer ${key.apiKey}`, "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: "sonar",
-            max_tokens: 256,
-            temperature: 0,
-            messages: [
-              { role: "system", content: "You are a precise JSON-only fact-checking tool. Respond with valid JSON only, no markdown, no explanation." },
-              { role: "user", content: prompt },
-            ],
-          }),
-        });
-        if (!res.ok) continue;
-        const data = await res.json();
-        analysisText = data.choices?.[0]?.message?.content ?? "";
+    // Look for "located in [wrong city]" or "based in [wrong city]" patterns
+    const locationClaims = lower.match(/(?:located|based|headquartered|operates|serving)\s+(?:in|out of|from)\s+([a-z\s]+?)(?:[,.\n]|$)/g);
+    if (locationClaims) {
+      for (const claim of locationClaims) {
+        const claimLower = claim.toLowerCase();
+        // Only flag if the claim mentions a specific city that contradicts ours
+        if (city && !claimLower.includes(city) && !claimLower.includes("area") && !claimLower.includes("region")) {
+          // Make sure it's actually naming a different place, not just a generic phrase
+          const hasSpecificPlace = /(?:located|based|headquartered|operates|serving)\s+(?:in|out of|from)\s+[A-Z]/.test(claim);
+          if (hasSpecificPlace) {
+            issues.push(`Response says "${claim.trim()}" but business is in ${businessFacts.location}`);
+          }
+        }
       }
-
-      // Parse JSON from response (strip markdown code fences if present)
-      const cleaned = analysisText.replace(/```json?\s*/gi, "").replace(/```/g, "").trim();
-      const parsed = JSON.parse(cleaned);
-      const issues: string[] = Array.isArray(parsed.issues)
-        ? parsed.issues.filter((i: unknown) => typeof i === "string" && i.length > 0)
-        : [];
-
-      return { hasHallucinations: issues.length > 0, issues };
-    } catch (err: any) {
-      console.error(`[Hallucination Detection] ${key.provider} failed:`, err.message);
-      continue;
     }
   }
 
-  // Fallback: if all providers fail, assume no hallucinations
-  console.warn("[Hallucination Detection] All providers failed — returning clean");
-  return { hasHallucinations: false, issues: [] };
+  // Check 2: If response mentions a wrong website URL
+  if (businessFacts.website) {
+    const knownDomain = businessFacts.website.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "");
+    const urlRegex = /https?:\/\/[^\s\)\]"'<>]+/g;
+    const urls = responseText.match(urlRegex) || [];
+    for (const url of urls) {
+      const urlDomain = url.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "");
+      // Only flag if the response attributes a different website to THIS business
+      if (urlDomain !== knownDomain && lower.includes(businessFacts.name.toLowerCase()) && lower.includes(urlDomain)) {
+        // Check if the URL is near the business name mention (within ~200 chars)
+        const nameIdx = lower.indexOf(businessFacts.name.toLowerCase());
+        const urlIdx = lower.indexOf(urlDomain);
+        if (Math.abs(nameIdx - urlIdx) < 200) {
+          issues.push(`Response links to ${urlDomain} but business website is ${knownDomain}`);
+        }
+      }
+    }
+  }
+
+  // Check 3: If response confuses the business with a different company name entirely
+  const nameLower = businessFacts.name.toLowerCase();
+  const confusionPatterns = [
+    new RegExp(`${nameLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[^.]*(?:also known as|formerly|now called|renamed to)\\s+([^,.]+)`, "i"),
+  ];
+  for (const pattern of confusionPatterns) {
+    const match = responseText.match(pattern);
+    if (match) {
+      issues.push(`Response may confuse business identity: "${match[0].trim()}"`);
+    }
+  }
+
+  console.log(`[Hallucination] "${businessFacts.name}": ${issues.length} issues found`);
+  return { hasHallucinations: issues.length > 0, issues };
 }
 
 // ── Citation Verification ──────────────────────────────────────────────────
