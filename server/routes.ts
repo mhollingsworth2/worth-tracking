@@ -2446,9 +2446,39 @@ Extract real information from the content. If a field isn't clear from the websi
         completedAt: new Date().toISOString(),
       });
 
-      // Generate alerts based on scan results
+      // ── Competitor scanning (same as auto-scan) ──────────────────────────
+      const comps = await storage.getCompetitors(businessId);
+      const compSubset = comps.slice(0, 5);
+      const compQueries = queries.slice(0, 8);
+
+      for (const comp of compSubset) {
+        console.log(`[Scan] Scanning competitor "${comp.name}" for "${business.name}"`);
+        try {
+          for await (const result of runScan(comp.name, compQueries, keyInputs, [])) {
+            const platId = platformMap[result.platform] ?? 1;
+            const dateStr = new Date().toISOString().split("T")[0];
+            await storage.createSearchRecord({
+              businessId,
+              platformId: platId,
+              query: result.query,
+              mentioned: result.mentioned ? 1 : 0,
+              position: result.position,
+              sentiment: result.sentiment,
+              confidence: result.confidence,
+              sourceType: result.sourceType,
+              crossValidated: result.crossValidated === null ? null : result.crossValidated ? 1 : 0,
+              competitorId: comp.id,
+              date: dateStr,
+            });
+          }
+        } catch (compErr: any) {
+          console.error(`[Scan] Error scanning competitor "${comp.name}":`, compErr.message);
+        }
+      }
+
+      // Generate alerts and prompts based on scan results
       await generateScanAlerts(businessId);
-    await generateOptimizedPrompts(businessId);
+      await generateOptimizedPrompts(businessId);
 
       res.json({
         jobId: job.id,
