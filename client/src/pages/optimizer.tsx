@@ -1,93 +1,36 @@
 import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
 import { Progress } from "@/components/ui/progress";
 import { Badge } from "@/components/ui/badge";
-import { Lightbulb, Search, Star, MapPin, FileText, Clock, Trophy } from "lucide-react";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Loader2, Globe, MapPin, Star, FileText, Code2, Trophy, CheckCircle, XCircle, ExternalLink, Lightbulb } from "lucide-react";
 import { InfoTip } from "@/components/info-tip";
 
-interface ScoreCategory {
+interface AuditCategory {
   name: string;
   score: number;
-  icon: any;
   tips: string[];
-  color: string;
-  tooltip: string;
+  details: string;
 }
 
-function analyzeContent(name: string, description: string): ScoreCategory[] {
-  const text = `${name} ${description}`.toLowerCase();
-  const words = text.split(/\s+/).filter(Boolean);
-  const uniqueWords = new Set(words);
+interface AuditResult {
+  businessName: string;
+  website: string | null;
+  pagesScraped: number;
+  pagesFound: string[];
+  overallScore: number;
+  categories: AuditCategory[];
+  scanStats: { mentionRate: number; avgPosition: number | null; totalQueries: number } | null;
+}
 
-  // Specificity
-  const adjectives = ["best", "top", "premium", "unique", "exclusive", "custom", "specialized", "award", "certified", "expert", "leading", "innovative", "professional", "quality", "superior"];
-  const adjCount = adjectives.filter(a => text.includes(a)).length;
-  const wordCount = words.length;
-  let specificityScore = Math.min(100, (wordCount >= 30 ? 25 : wordCount * 0.8) + (uniqueWords.size / words.length * 30) + (adjCount * 10));
-  const specificityTips: string[] = [];
-  if (wordCount < 30) specificityTips.push("Add more detail — aim for at least 30 words in your description");
-  if (adjCount < 2) specificityTips.push("Include unique adjectives like 'award-winning', 'certified', or 'specialized'");
-  if (uniqueWords.size / words.length < 0.7) specificityTips.push("Use more varied vocabulary to stand out in AI responses");
-
-  // Review Signals
-  const reviewKeywords = ["review", "testimonial", "rated", "stars", "customer", "feedback", "recommend", "trusted", "verified", "satisfaction", "guarantee"];
-  const reviewCount = reviewKeywords.filter(k => text.includes(k)).length;
-  let reviewScore = Math.min(100, reviewCount * 15 + (text.includes("5 star") || text.includes("5-star") ? 20 : 0));
-  const reviewTips: string[] = [];
-  if (reviewCount < 2) reviewTips.push("Mention customer reviews or testimonials in your description");
-  if (!text.includes("rated") && !text.includes("star")) reviewTips.push("Include star ratings or review scores (e.g., '4.8 stars on Google')");
-  if (!text.includes("trusted") && !text.includes("verified")) reviewTips.push("Use trust signals like 'trusted by 500+ customers'");
-
-  // Local Signals
-  const localKeywords = ["address", "street", "avenue", "city", "state", "zip", "downtown", "near", "located", "location", "neighborhood", "area", "local", "community", "region"];
-  const localCount = localKeywords.filter(k => text.includes(k)).length;
-  let localScore = Math.min(100, localCount * 15 + (/\d{5}/.test(text) ? 20 : 0));
-  const localTips: string[] = [];
-  if (localCount < 2) localTips.push("Include your city, neighborhood, or street address");
-  if (!/\d{5}/.test(text)) localTips.push("Add your zip code for better local AI matching");
-  if (!text.includes("near") && !text.includes("located")) localTips.push("Use location phrases like 'located in' or 'serving the [area] community'");
-
-  // Structured Info
-  const structuredKeywords = ["hours", "open", "close", "price", "cost", "phone", "email", "contact", "book", "schedule", "appointment", "menu", "service", "offer"];
-  const structuredCount = structuredKeywords.filter(k => text.includes(k)).length;
-  const hasPhone = /\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/.test(text);
-  const hasEmail = /@/.test(text);
-  let structuredScore = Math.min(100, structuredCount * 12 + (hasPhone ? 15 : 0) + (hasEmail ? 15 : 0));
-  const structuredTips: string[] = [];
-  if (!hasPhone) structuredTips.push("Include a phone number for direct contact");
-  if (structuredCount < 3) structuredTips.push("Mention hours, pricing, or services offered");
-  if (!text.includes("book") && !text.includes("schedule")) structuredTips.push("Add booking or scheduling information if applicable");
-
-  // Content Freshness
-  const currentYear = "2026";
-  const hasYear = text.includes(currentYear) || text.includes("2025");
-  const freshKeywords = ["new", "updated", "latest", "current", "now", "today", "recently", "modern", "fresh"];
-  const freshCount = freshKeywords.filter(k => text.includes(k)).length;
-  let freshnessScore = Math.min(100, (hasYear ? 35 : 0) + freshCount * 15);
-  const freshnessTips: string[] = [];
-  if (!hasYear) freshnessTips.push(`Include the current year (${currentYear}) to signal freshness to AI`);
-  if (freshCount < 2) freshnessTips.push("Use time-sensitive words like 'updated', 'latest', or 'new in 2026'");
-
-  // Competitive Edge
-  const edgeKeywords = ["only", "first", "exclusive", "patented", "proprietary", "award", "winning", "ranked", "best", "leading", "pioneering", "innovative", "unique"];
-  const edgeCount = edgeKeywords.filter(k => text.includes(k)).length;
-  const hasNumbers = /\d+%|\d+ years|\d+\+/.test(text);
-  let edgeScore = Math.min(100, edgeCount * 15 + (hasNumbers ? 20 : 0));
-  const edgeTips: string[] = [];
-  if (edgeCount < 2) edgeTips.push("Highlight what makes you unique — awards, patents, or 'only' claims");
-  if (!hasNumbers) edgeTips.push("Include specific numbers (e.g., '10+ years experience', '500+ clients served')");
-
-  return [
-    { name: "Specificity", score: Math.round(specificityScore), icon: Search, tips: specificityTips, color: "text-blue-500", tooltip: "How detailed and unique your business description is. Vague descriptions get overlooked by AI." },
-    { name: "Review Signals", score: Math.round(reviewScore), icon: Star, tips: reviewTips, color: "text-amber-500", tooltip: "Whether your description mentions reviews, ratings, or testimonials. AI platforms heavily weight social proof." },
-    { name: "Local Signals", score: Math.round(localScore), icon: MapPin, tips: localTips, color: "text-green-500", tooltip: "Whether your description includes location details like city, address, or neighborhood. Critical for 'near me' AI searches." },
-    { name: "Structured Info", score: Math.round(structuredScore), icon: FileText, tips: structuredTips, color: "text-purple-500", tooltip: "Whether you include practical details like hours, pricing, phone number, and email. AI platforms favor complete information." },
-    { name: "Content Freshness", score: Math.round(freshnessScore), icon: Clock, tips: freshnessTips, color: "text-sky-500", tooltip: "Whether your content references current dates or recent events. AI platforms prefer up-to-date information." },
-    { name: "Competitive Edge", score: Math.round(edgeScore), icon: Trophy, tips: edgeTips, color: "text-rose-500", tooltip: "Whether you highlight what makes you unique — awards, certifications, guarantees, or exclusive offerings." },
-  ];
+interface Business {
+  id: number;
+  name: string;
+  website: string | null;
+  location: string | null;
+  industry: string | null;
 }
 
 function getScoreColor(score: number): string {
@@ -104,122 +47,241 @@ function getScoreLabel(score: number): string {
   return "Poor";
 }
 
-export default function Optimizer() {
-  const [businessName, setBusinessName] = useState("");
-  const [description, setDescription] = useState("");
-  const [results, setResults] = useState<ScoreCategory[] | null>(null);
+function getProgressColor(score: number): string {
+  if (score >= 80) return "[&>div]:bg-green-500";
+  if (score >= 60) return "[&>div]:bg-amber-500";
+  if (score >= 40) return "[&>div]:bg-orange-500";
+  return "[&>div]:bg-red-500";
+}
 
-  const handleAnalyze = () => {
-    if (!businessName.trim() || !description.trim()) return;
-    setResults(analyzeContent(businessName, description));
+const CATEGORY_ICONS: Record<string, any> = {
+  "Local Signals": MapPin,
+  "Review & Trust Signals": Star,
+  "Schema & Structured Data": Code2,
+  "Content Quality": FileText,
+  "Competitive Edge": Trophy,
+};
+
+const CATEGORY_COLORS: Record<string, string> = {
+  "Local Signals": "text-green-500",
+  "Review & Trust Signals": "text-amber-500",
+  "Schema & Structured Data": "text-purple-500",
+  "Content Quality": "text-blue-500",
+  "Competitive Edge": "text-rose-500",
+};
+
+export default function Optimizer() {
+  const [selectedBiz, setSelectedBiz] = useState<string>("");
+  const [auditResult, setAuditResult] = useState<AuditResult | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const { data: businesses } = useQuery<Business[]>({
+    queryKey: ["/api/businesses"],
+    queryFn: async () => { const res = await fetch("/api/businesses"); return res.json(); },
+  });
+
+  const runAudit = async () => {
+    if (!selectedBiz) return;
+    setLoading(true);
+    setError(null);
+    setAuditResult(null);
+    try {
+      const res = await fetch(`/api/businesses/${selectedBiz}/visibility-audit`);
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.error || "Audit failed");
+      }
+      const data = await res.json();
+      setAuditResult(data);
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
   };
 
-  const overallScore = results ? Math.round(results.reduce((sum, r) => sum + r.score, 0) / results.length) : 0;
+  const selectedBusiness = businesses?.find(b => b.id.toString() === selectedBiz);
 
   return (
     <div className="p-6 max-w-4xl mx-auto space-y-6">
       <div>
-        <h1 className="text-2xl font-serif font-semibold" data-testid="text-optimizer-title">Prompt Optimizer</h1>
-        <p className="text-sm text-muted-foreground mt-1">Analyze your business description for AI search visibility</p>
+        <h1 className="text-2xl font-serif font-semibold" data-testid="text-optimizer-title">AI Visibility Audit</h1>
+        <p className="text-sm text-muted-foreground mt-1">Scrapes your website and analyzes it for AI search visibility signals</p>
       </div>
 
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-lg">
-            <Lightbulb className="w-5 h-5 text-primary" />
-            AI Visibility Scorer<InfoTip text="Analyzes your business description to predict how well AI search engines can find and recommend your business. Higher scores mean better AI visibility." />
+            <Globe className="w-5 h-5 text-primary" />
+            Website Analysis
+            <InfoTip text="Scrapes your actual website (homepage, about, services, contact, reviews pages) and checks for signals that AI platforms use to recommend businesses — schema markup, local SEO, trust signals, content quality, and competitive differentiators." />
           </CardTitle>
-          <CardDescription>Enter your business name and description to see how well it performs for AI search engines</CardDescription>
+          <CardDescription>Select a business to audit its website for AI visibility</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div>
-            <label className="text-sm font-medium mb-1 block">Business Name</label>
-            <Input
-              data-testid="input-optimizer-name"
-              placeholder="e.g., Sunset Bistro"
-              value={businessName}
-              onChange={(e) => setBusinessName(e.target.value)}
-            />
+          <div className="flex gap-3">
+            <Select value={selectedBiz} onValueChange={setSelectedBiz}>
+              <SelectTrigger className="flex-1" data-testid="select-business">
+                <SelectValue placeholder="Select a business..." />
+              </SelectTrigger>
+              <SelectContent>
+                {businesses?.map(b => (
+                  <SelectItem key={b.id} value={b.id.toString()}>
+                    {b.name} {b.location ? `— ${b.location}` : ""}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Button
+              onClick={runAudit}
+              disabled={!selectedBiz || loading}
+              data-testid="button-analyze"
+            >
+              {loading ? <Loader2 className="w-4 h-4 mr-1.5 animate-spin" /> : <Lightbulb className="w-4 h-4 mr-1.5" />}
+              {loading ? "Scraping & Analyzing..." : "Run Audit"}
+            </Button>
           </div>
-          <div>
-            <label className="text-sm font-medium mb-1 block">Business Description / Website Content</label>
-            <Textarea
-              data-testid="input-optimizer-description"
-              placeholder="Paste your business description, about page content, or meta description here..."
-              rows={6}
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-            />
-          </div>
-          <Button
-            data-testid="button-analyze"
-            onClick={handleAnalyze}
-            disabled={!businessName.trim() || !description.trim()}
-          >
-            Analyze Visibility
-          </Button>
+
+          {selectedBusiness && (
+            <div className="flex gap-3 text-xs text-muted-foreground">
+              {selectedBusiness.website && (
+                <span className="flex items-center gap-1">
+                  <Globe className="w-3 h-3" />
+                  <a href={selectedBusiness.website.startsWith("http") ? selectedBusiness.website : `https://${selectedBusiness.website}`} target="_blank" rel="noopener noreferrer" className="hover:underline">
+                    {selectedBusiness.website}
+                  </a>
+                  <ExternalLink className="w-2.5 h-2.5" />
+                </span>
+              )}
+              {selectedBusiness.location && (
+                <span className="flex items-center gap-1"><MapPin className="w-3 h-3" />{selectedBusiness.location}</span>
+              )}
+              {!selectedBusiness.website && (
+                <span className="text-amber-600">No website configured — add one in business settings for a full audit</span>
+              )}
+            </div>
+          )}
+
+          {error && (
+            <div className="text-sm text-red-600 bg-red-50 dark:bg-red-950/20 p-3 rounded-lg">{error}</div>
+          )}
         </CardContent>
       </Card>
 
-      {results && (
+      {auditResult && (
         <>
+          {/* Overall Score */}
           <Card>
             <CardContent className="p-6">
-              <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center justify-between">
                 <div>
-                  <p className="text-sm text-muted-foreground">Overall AI Visibility Score</p>
+                  <p className="text-sm text-muted-foreground">AI Visibility Score</p>
                   <div className="flex items-baseline gap-2">
-                    <span className={`text-4xl font-bold font-serif ${getScoreColor(overallScore)}`} data-testid="text-overall-score">{overallScore}</span>
+                    <span className={`text-4xl font-bold font-serif ${getScoreColor(auditResult.overallScore)}`} data-testid="text-overall-score">
+                      {auditResult.overallScore}
+                    </span>
                     <span className="text-lg text-muted-foreground">/ 100</span>
                   </div>
-                  <Badge variant={overallScore >= 60 ? "default" : "destructive"} className="mt-1" data-testid="badge-score-label">
-                    {getScoreLabel(overallScore)}
+                  <Badge variant={auditResult.overallScore >= 60 ? "default" : "destructive"} className="mt-1" data-testid="badge-score-label">
+                    {getScoreLabel(auditResult.overallScore)}
                   </Badge>
+                  <div className="mt-3 space-y-1 text-xs text-muted-foreground">
+                    <p><strong>{auditResult.pagesScraped}</strong> pages scraped from your website</p>
+                    {auditResult.scanStats && (
+                      <p>Latest scan: <strong>{auditResult.scanStats.mentionRate}%</strong> mention rate across {auditResult.scanStats.totalQueries} queries</p>
+                    )}
+                  </div>
                 </div>
                 <div className="w-32 h-32 relative">
                   <svg viewBox="0 0 100 100" className="w-full h-full -rotate-90">
                     <circle cx="50" cy="50" r="40" fill="none" stroke="hsl(var(--muted))" strokeWidth="8" />
                     <circle
                       cx="50" cy="50" r="40" fill="none"
-                      stroke="hsl(var(--primary))"
+                      stroke={auditResult.overallScore >= 80 ? "#22c55e" : auditResult.overallScore >= 60 ? "#f59e0b" : auditResult.overallScore >= 40 ? "#f97316" : "#ef4444"}
                       strokeWidth="8"
-                      strokeDasharray={`${overallScore * 2.51} 251`}
+                      strokeDasharray={`${auditResult.overallScore * 2.51} 251`}
                       strokeLinecap="round"
                     />
                   </svg>
+                  <div className="absolute inset-0 flex items-center justify-center">
+                    <span className="text-2xl font-bold">{auditResult.overallScore}</span>
+                  </div>
                 </div>
               </div>
             </CardContent>
           </Card>
 
+          {/* Pages found */}
+          {auditResult.pagesFound.length > 0 && (
+            <Card>
+              <CardContent className="p-4">
+                <p className="text-xs font-medium mb-2">Pages analyzed:</p>
+                <div className="flex flex-wrap gap-1.5">
+                  {auditResult.pagesFound.map((url, i) => (
+                    <Badge key={i} variant="outline" className="text-xs font-mono">
+                      {url.replace(/^https?:\/\//, "").replace(/^www\./, "")}
+                    </Badge>
+                  ))}
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* Category cards */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {results.map((category) => (
-              <Card key={category.name}>
-                <CardContent className="p-4">
-                  <div className="flex items-center gap-2 mb-3">
-                    <category.icon className={`w-4 h-4 ${category.color}`} />
-                    <span className="font-medium text-sm">{category.name}<InfoTip text={category.tooltip} /></span>
-                    <span className={`ml-auto font-bold ${getScoreColor(category.score)}`} data-testid={`text-score-${category.name.toLowerCase().replace(/\s/g, "-")}`}>
-                      {category.score}
-                    </span>
-                  </div>
-                  <Progress value={category.score} className="h-2 mb-3" />
-                  {category.tips.length > 0 && (
-                    <ul className="space-y-1.5">
-                      {category.tips.map((tip, i) => (
-                        <li key={i} className="text-xs text-muted-foreground flex gap-1.5">
-                          <span className="text-primary mt-0.5 shrink-0">-</span>
-                          <span>{tip}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                  {category.tips.length === 0 && (
-                    <p className="text-xs text-green-600 dark:text-green-400">Great job! This category is well optimized.</p>
-                  )}
-                </CardContent>
-              </Card>
-            ))}
+            {auditResult.categories.map((category) => {
+              const Icon = CATEGORY_ICONS[category.name] || FileText;
+              const color = CATEGORY_COLORS[category.name] || "text-blue-500";
+              return (
+                <Card key={category.name}>
+                  <CardContent className="p-4">
+                    <div className="flex items-center gap-2 mb-3">
+                      <Icon className={`w-4 h-4 ${color}`} />
+                      <span className="font-medium text-sm">{category.name}</span>
+                      <span className={`ml-auto font-bold text-lg ${getScoreColor(category.score)}`} data-testid={`text-score-${category.name.toLowerCase().replace(/\s+/g, "-")}`}>
+                        {category.score}
+                      </span>
+                    </div>
+                    <Progress value={category.score} className={`h-2 mb-3 ${getProgressColor(category.score)}`} />
+
+                    {/* What was found */}
+                    {category.details && (
+                      <div className="mb-2">
+                        <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide mb-1">Found on your site</p>
+                        <div className="flex flex-wrap gap-1">
+                          {category.details.split(", ").filter(Boolean).map((d, i) => (
+                            <Badge key={i} variant="outline" className="text-xs text-green-600 border-green-300 dark:border-green-800">
+                              {d}
+                            </Badge>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Recommendations */}
+                    {category.tips.length > 0 && (
+                      <div>
+                        <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide mb-1">Recommendations</p>
+                        <ul className="space-y-1.5">
+                          {category.tips.map((tip, i) => (
+                            <li key={i} className="text-xs text-muted-foreground flex gap-1.5">
+                              <XCircle className="w-3 h-3 text-red-400 mt-0.5 shrink-0" />
+                              <span>{tip}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    {category.tips.length === 0 && (
+                      <p className="text-xs text-green-600 dark:text-green-400 flex items-center gap-1">
+                        <CheckCircle className="w-3 h-3" /> Great job! This category is well optimized.
+                      </p>
+                    )}
+                  </CardContent>
+                </Card>
+              );
+            })}
           </div>
         </>
       )}

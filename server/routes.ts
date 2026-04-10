@@ -2461,6 +2461,248 @@ Extract real information from the content. If a field isn't clear from the websi
     }
   });
 
+  // === AI VISIBILITY AUDIT — scrape website + analyze for AI signals ===
+  app.get("/api/businesses/:id/visibility-audit", async (req, res) => {
+    try {
+      const businessId = parseInt(req.params.id);
+      const biz = await storage.getBusiness(businessId);
+      if (!biz) return res.status(404).json({ error: "Business not found" });
+
+      const websiteUrl = biz.website;
+      let websiteText = "";
+      let scrapedPages: { url: string; text: string }[] = [];
+
+      // 1. Scrape the website if available
+      if (websiteUrl) {
+        const pagesToScrape = [websiteUrl];
+        // Try common subpages
+        const baseUrl = websiteUrl.replace(/\/$/, "");
+        for (const path of ["/about", "/services", "/contact", "/reviews"]) {
+          pagesToScrape.push(baseUrl + path);
+        }
+
+        for (const pageUrl of pagesToScrape) {
+          try {
+            let fullUrl = pageUrl.trim();
+            if (!fullUrl.startsWith("http")) fullUrl = "https://" + fullUrl;
+            const pageRes = await fetch(fullUrl, {
+              headers: { "User-Agent": "Mozilla/5.0 (compatible; WorthTracking/1.0; +https://worthtracking.com)", Accept: "text/html" },
+              signal: AbortSignal.timeout(8000),
+              redirect: "follow",
+            });
+            if (pageRes.ok) {
+              const html = await pageRes.text();
+              const cleaned = html
+                .replace(/<script[\s\S]*?<\/script>/gi, "")
+                .replace(/<style[\s\S]*?<\/style>/gi, "")
+                .replace(/<[^>]+>/g, " ")
+                .replace(/&[a-zA-Z]+;/g, " ")
+                .replace(/\s+/g, " ")
+                .trim();
+              if (cleaned.length > 50) {
+                scrapedPages.push({ url: fullUrl, text: cleaned.slice(0, 3000) });
+                websiteText += " " + cleaned;
+              }
+            }
+          } catch { /* skip failed pages */ }
+        }
+        websiteText = websiteText.slice(0, 12000);
+      }
+
+      const allText = `${biz.name} ${biz.industry || ""} ${biz.location || ""} ${(biz as any).services || ""} ${(biz as any).description || ""} ${websiteText}`.toLowerCase();
+      const bizLocation = biz.location?.toLowerCase() || "";
+      const bizName = biz.name.toLowerCase();
+
+      // 2. Analyze signals from ALL data sources
+      const categories: { name: string; score: number; tips: string[]; details: string }[] = [];
+
+      // ── Local Signals ──
+      const locationParts = bizLocation.split(",").map(s => s.trim()).filter(Boolean);
+      const city = locationParts[0] || "";
+      const state = locationParts[1] || "";
+      let localScore = 0;
+      const localTips: string[] = [];
+      const localDetails: string[] = [];
+
+      if (city && allText.includes(city)) { localScore += 20; localDetails.push(`✓ City "${city}" found`); }
+      else if (city) { localTips.push(`Add your city "${city}" to your website content`); }
+
+      if (state && allText.includes(state.toLowerCase())) { localScore += 10; localDetails.push(`✓ State found`); }
+
+      if (/\d{5}/.test(allText)) { localScore += 15; localDetails.push("✓ Zip code found"); }
+      else localTips.push("Add your zip code to your website");
+
+      const localPhrases = ["located in", "based in", "serving", "near", "our location", "visit us", "come see us"];
+      const localPhraseCount = localPhrases.filter(p => allText.includes(p)).length;
+      localScore += Math.min(25, localPhraseCount * 8);
+      if (localPhraseCount > 0) localDetails.push(`✓ ${localPhraseCount} location phrases found`);
+      else localTips.push("Add location phrases like 'located in' or 'serving the [area] community'");
+
+      if (allText.includes("google business") || allText.includes("google maps") || allText.includes("directions")) {
+        localScore += 10; localDetails.push("✓ Google Business/Maps reference found");
+      } else localTips.push("Reference Google Business Profile or add directions link");
+
+      const hasAddress = /\d+\s+\w+\s+(st|street|ave|avenue|blvd|boulevard|dr|drive|rd|road|ln|lane|way|ct|court|pl|place)/i.test(websiteText);
+      if (hasAddress) { localScore += 20; localDetails.push("✓ Street address found on website"); }
+      else localTips.push("Add your full street address to your website");
+
+      localScore = Math.min(100, localScore);
+      categories.push({ name: "Local Signals", score: localScore, tips: localTips, details: localDetails.join(", ") });
+
+      // ── Review / Trust Signals ──
+      let reviewScore = 0;
+      const reviewTips: string[] = [];
+      const reviewDetails: string[] = [];
+
+      const trustWords = ["review", "testimonial", "rated", "stars", "customer", "feedback", "recommend", "trusted", "verified", "satisfaction", "guarantee", "award", "certified", "accredited", "bbb", "angi", "yelp", "google review"];
+      const trustCount = trustWords.filter(w => allText.includes(w)).length;
+      reviewScore += Math.min(50, trustCount * 8);
+      if (trustCount > 0) reviewDetails.push(`✓ ${trustCount} trust signals found`);
+      else reviewTips.push("Mention customer reviews and ratings on your website");
+
+      if (/\d(\.\d)?\s*(star|\/\s*5|out of 5)/i.test(allText)) { reviewScore += 20; reviewDetails.push("✓ Star rating found"); }
+      else reviewTips.push("Display your star rating (e.g., '4.8 stars on Google')");
+
+      if (/\d+\s*(review|testimonial|\+?\s*customer)/i.test(allText)) { reviewScore += 15; reviewDetails.push("✓ Review count found"); }
+      else reviewTips.push("Show review count (e.g., 'trusted by 200+ customers')");
+
+      if (allText.includes("guarantee") || allText.includes("warranty") || allText.includes("satisfaction")) {
+        reviewScore += 15; reviewDetails.push("✓ Guarantee/warranty mentioned");
+      } else reviewTips.push("Add satisfaction guarantee or warranty information");
+
+      reviewScore = Math.min(100, reviewScore);
+      categories.push({ name: "Review & Trust Signals", score: reviewScore, tips: reviewTips, details: reviewDetails.join(", ") });
+
+      // ── Schema / Structured Data ──
+      let schemaScore = 0;
+      const schemaTips: string[] = [];
+      const schemaDetails: string[] = [];
+      const rawHtml = scrapedPages.length > 0 ? scrapedPages.map(p => p.text).join(" ") : "";
+      // Check original HTML for schema markup (before tag stripping)
+      let fullHtml = "";
+      if (websiteUrl) {
+        try {
+          let fullUrl = websiteUrl.trim();
+          if (!fullUrl.startsWith("http")) fullUrl = "https://" + fullUrl;
+          const r = await fetch(fullUrl, {
+            headers: { "User-Agent": "Mozilla/5.0 (compatible; WorthTracking/1.0)", Accept: "text/html" },
+            signal: AbortSignal.timeout(8000),
+          });
+          if (r.ok) fullHtml = await r.text();
+        } catch { /* skip */ }
+      }
+
+      if (fullHtml.includes("application/ld+json")) { schemaScore += 40; schemaDetails.push("✓ JSON-LD schema markup found"); }
+      else schemaTips.push("Add JSON-LD schema markup (LocalBusiness type) to your website");
+
+      if (fullHtml.includes("LocalBusiness") || fullHtml.includes("localbusiness")) { schemaScore += 20; schemaDetails.push("✓ LocalBusiness schema found"); }
+      else if (schemaScore > 0) schemaTips.push("Add LocalBusiness schema type specifically");
+
+      if (fullHtml.includes("AggregateRating") || fullHtml.includes("aggregaterating")) { schemaScore += 20; schemaDetails.push("✓ AggregateRating schema found"); }
+      else schemaTips.push("Add AggregateRating schema to display review stars in search results");
+
+      if (fullHtml.includes("FAQPage") || fullHtml.includes("faqpage")) { schemaScore += 10; schemaDetails.push("✓ FAQ schema found"); }
+      else schemaTips.push("Add FAQ schema to help AI platforms find answers about your business");
+
+      if (/<meta\s[^>]*description/i.test(fullHtml)) { schemaScore += 10; schemaDetails.push("✓ Meta description found"); }
+      else schemaTips.push("Add a meta description tag to your homepage");
+
+      schemaScore = Math.min(100, schemaScore);
+      categories.push({ name: "Schema & Structured Data", score: schemaScore, tips: schemaTips, details: schemaDetails.join(", ") });
+
+      // ── Content Quality ──
+      let contentScore = 0;
+      const contentTips: string[] = [];
+      const contentDetails: string[] = [];
+
+      const wordCount = websiteText.split(/\s+/).filter(Boolean).length;
+      if (wordCount > 500) { contentScore += 25; contentDetails.push(`✓ Good content volume (${wordCount}+ words)`); }
+      else if (wordCount > 200) { contentScore += 15; contentDetails.push(`Moderate content (${wordCount} words)`); contentTips.push("Add more detailed content — aim for 500+ words on key pages"); }
+      else { contentTips.push("Your website needs more content. Add detailed service descriptions, about page, and FAQ"); }
+
+      const services = ((biz as any).services || "").split(",").map((s: string) => s.trim().toLowerCase()).filter(Boolean);
+      const servicesOnSite = services.filter((s: string) => allText.includes(s)).length;
+      if (services.length > 0) {
+        const serviceRate = servicesOnSite / services.length;
+        contentScore += Math.round(serviceRate * 25);
+        if (serviceRate >= 0.8) contentDetails.push(`✓ ${servicesOnSite}/${services.length} services mentioned on site`);
+        else contentTips.push(`Only ${servicesOnSite}/${services.length} of your services are mentioned on your website. Add pages for: ${services.filter((s: string) => !allText.includes(s)).join(", ")}`);
+      }
+
+      if (allText.includes("faq") || allText.includes("frequently asked") || allText.includes("questions")) {
+        contentScore += 15; contentDetails.push("✓ FAQ content found");
+      } else contentTips.push("Add an FAQ page — AI platforms heavily cite FAQ content");
+
+      if (allText.includes("blog") || allText.includes("article") || allText.includes("guide") || allText.includes("how to")) {
+        contentScore += 15; contentDetails.push("✓ Blog/educational content found");
+      } else contentTips.push("Start a blog with guides and tips — this builds AI authority");
+
+      if (allText.includes("about") && (allText.includes("team") || allText.includes("founder") || allText.includes("experience") || allText.includes("years"))) {
+        contentScore += 10; contentDetails.push("✓ About/team page found");
+      } else contentTips.push("Add an 'About Us' page with team info and years of experience");
+
+      const hasPhone = /\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/.test(allText);
+      const hasEmail = /@/.test(allText) && allText.includes(".");
+      if (hasPhone) { contentScore += 5; contentDetails.push("✓ Phone number found"); } else contentTips.push("Add your phone number to the website");
+      if (hasEmail) { contentScore += 5; contentDetails.push("✓ Email found"); }
+
+      contentScore = Math.min(100, contentScore);
+      categories.push({ name: "Content Quality", score: contentScore, tips: contentTips, details: contentDetails.join(", ") });
+
+      // ── Competitive Edge ──
+      let edgeScore = 0;
+      const edgeTips: string[] = [];
+      const edgeDetails: string[] = [];
+
+      const edgeWords = ["only", "first", "exclusive", "patented", "proprietary", "award", "winning", "ranked", "leading", "pioneering", "innovative", "unique", "best"];
+      const edgeCount = edgeWords.filter(w => allText.includes(w)).length;
+      edgeScore += Math.min(40, edgeCount * 8);
+      if (edgeCount > 0) edgeDetails.push(`✓ ${edgeCount} differentiator keywords found`);
+      else edgeTips.push("Highlight what makes you unique — awards, patents, certifications, or 'only' claims");
+
+      if (/\d+%|\d+\s*years|\d+\+|\d+\s*customers|\d+\s*projects|\d+\s*clients/i.test(allText)) {
+        edgeScore += 20; edgeDetails.push("✓ Specific numbers/stats found");
+      } else edgeTips.push("Include specific numbers (e.g., '10+ years', '500+ clients', '98% satisfaction rate')");
+
+      if (allText.includes("free") && (allText.includes("quote") || allText.includes("estimate") || allText.includes("consultation"))) {
+        edgeScore += 15; edgeDetails.push("✓ Free quote/estimate offer found");
+      } else edgeTips.push("Add a 'free quote' or 'free consultation' offer — AI platforms favor businesses with clear CTAs");
+
+      if (allText.includes("insured") || allText.includes("licensed") || allText.includes("bonded") || allText.includes("certified")) {
+        edgeScore += 15; edgeDetails.push("✓ Licensing/insurance mentioned");
+      } else edgeTips.push("Mention licensing, insurance, or certifications — these build AI trust signals");
+
+      if (allText.includes("price") || allText.includes("cost") || allText.includes("pricing") || allText.includes("rate") || allText.includes("$")) {
+        edgeScore += 10; edgeDetails.push("✓ Pricing information found");
+      } else edgeTips.push("Add pricing info — AI platforms prefer businesses with transparent pricing");
+
+      edgeScore = Math.min(100, edgeScore);
+      categories.push({ name: "Competitive Edge", score: edgeScore, tips: edgeTips, details: edgeDetails.join(", ") });
+
+      // 3. Get latest scan stats for context
+      const stats = await storage.getSearchStats(businessId);
+
+      const overallScore = Math.round(categories.reduce((sum, c) => sum + c.score, 0) / categories.length);
+
+      res.json({
+        businessName: biz.name,
+        website: websiteUrl,
+        pagesScraped: scrapedPages.length,
+        pagesFound: scrapedPages.map(p => p.url),
+        overallScore,
+        categories,
+        scanStats: stats ? {
+          mentionRate: stats.mentionRate,
+          avgPosition: stats.avgPosition,
+          totalQueries: stats.totalQueries,
+        } : null,
+      });
+    } catch (err: any) {
+      console.error("[Visibility Audit] Error:", err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // === SCAN ===
   app.post("/api/businesses/:id/scan", async (req, res) => {
     const businessId = parseInt(req.params.id);

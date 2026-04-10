@@ -22,7 +22,7 @@ import type { Business } from "@shared/schema";
 const navItems = [
   { title: "Dashboard", url: "/", icon: BarChart3, adminOnly: false },
   { title: "Add Business", url: "/add", icon: Plus, adminOnly: false },
-  { title: "Prompt Optimizer", url: "/optimizer", icon: Lightbulb, adminOnly: false },
+  { title: "Visibility Audit", url: "/optimizer", icon: Lightbulb, adminOnly: false },
   { title: "API Keys", url: "/api-keys", icon: KeyRound, adminOnly: true },
 ];
 
