@@ -23,7 +23,7 @@ import {
   ExternalLink, Copy, Smartphone, Monitor, Tablet,
   Phone, ShoppingCart, UserPlus, Mail, CalendarCheck,
   Info, Download, Users, Camera, AlertTriangle, Plus, X, Settings, ChevronDown, ChevronUp,
-  Zap, Loader2, Code2,
+  Zap, Loader2, Code2, Link2, CalendarClock, RotateCcw,
 } from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
@@ -610,6 +610,10 @@ export default function BusinessDetail() {
               <AlertTriangle className="w-3.5 h-3.5 mr-1.5" />
               Content Gaps
             </TabsTrigger>
+            <TabsTrigger value="citations" data-testid="tab-citations">
+              <Link2 className="w-3.5 h-3.5 mr-1.5" />
+              Citations
+            </TabsTrigger>
             <TabsTrigger value="prompts" data-testid="tab-prompts">AI SEO Prompts</TabsTrigger>
             <TabsTrigger value="records" data-testid="tab-records">Search Log</TabsTrigger>
             <TabsTrigger value="settings" data-testid="tab-settings">
@@ -1107,6 +1111,11 @@ export default function BusinessDetail() {
             <ContentGapsSection gaps={contentGapsData ?? []} />
           </TabsContent>
 
+          {/* ========== CITATIONS TAB ========== */}
+          <TabsContent value="citations" className="space-y-6 mt-4">
+            <CitationsSection businessId={id} />
+          </TabsContent>
+
           {/* ========== PROMPTS TAB ========== */}
           <TabsContent value="prompts" className="space-y-6 mt-4">
             <Card>
@@ -1276,6 +1285,7 @@ export default function BusinessDetail() {
 
           {/* ========== SETTINGS TAB ========== */}
           <TabsContent value="settings" className="space-y-6 mt-4">
+            <ScanScheduleSection businessId={id} />
             <PlatformHealthCard />
             <AIContextSettings businessId={id} business={business} />
             {/* Embed Click Tracker */}
@@ -2159,6 +2169,253 @@ function ContentGapsSection({ gaps }: { gaps: ContentGap[] }) {
         </Card>
       )}
     </>
+  );
+}
+
+/* ============ CITATIONS SECTION ============ */
+function CitationsSection({ businessId }: { businessId: number }) {
+  const { data, isLoading } = useQuery<{
+    totalCitations: number;
+    ownCitations: number;
+    ownCitationRate: number;
+    topDomains: { domain: string; count: number; isOwn: boolean; platforms: string[] }[];
+    recentCitations: { url: string; domain: string; platform: string; query: string; date: string; isOwnDomain: number }[];
+  }>({
+    queryKey: [`/api/businesses/${businessId}/citations`],
+    queryFn: async () => { const res = await fetch(`/api/businesses/${businessId}/citations`); return res.json(); },
+  });
+
+  if (isLoading) return <div className="flex items-center justify-center py-12"><Loader2 className="w-6 h-6 animate-spin" /></div>;
+
+  if (!data || data.totalCitations === 0) {
+    return (
+      <Card>
+        <CardContent className="p-8 text-center">
+          <Link2 className="w-10 h-10 mx-auto mb-3 text-muted-foreground" />
+          <p className="text-muted-foreground font-medium">No citations tracked yet</p>
+          <p className="text-xs text-muted-foreground mt-1">Run an AI scan to start tracking which URLs are cited by AI platforms when they mention your business.</p>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return (
+    <>
+      {/* KPI row */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <Card>
+          <CardContent className="p-4">
+            <p className="text-xs text-muted-foreground font-medium">Total Citations</p>
+            <p className="text-2xl font-bold" data-testid="text-total-citations">{data.totalCitations}</p>
+            <p className="text-xs text-muted-foreground mt-1">URLs cited across all AI platform responses</p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="p-4">
+            <p className="text-xs text-muted-foreground font-medium">Your Domain Citations</p>
+            <p className="text-2xl font-bold text-emerald-600" data-testid="text-own-citations">{data.ownCitations}</p>
+            <p className="text-xs text-muted-foreground mt-1">Times AI platforms linked to your website</p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="p-4">
+            <p className="text-xs text-muted-foreground font-medium">Own Domain Rate</p>
+            <p className={`text-2xl font-bold ${data.ownCitationRate >= 20 ? "text-emerald-600" : data.ownCitationRate >= 5 ? "text-amber-600" : "text-red-600"}`} data-testid="text-own-rate">
+              {data.ownCitationRate}%
+            </p>
+            <p className="text-xs text-muted-foreground mt-1">Percentage of all citations pointing to your site</p>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Top domains */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-sm font-medium flex items-center gap-2">
+            <Globe className="w-4 h-4 text-primary" />
+            Top Cited Domains
+            <InfoTip text="These are the domains most frequently cited by AI platforms when responding to queries about your business or industry. Your own domain appearing here means AI is linking directly to your content." />
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-2">
+            {data.topDomains.map((d, i) => {
+              const maxCount = data.topDomains[0]?.count ?? 1;
+              return (
+                <div key={d.domain} className="flex items-center gap-3">
+                  <span className="text-xs text-muted-foreground w-5 text-right">{i + 1}</span>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className={`text-sm font-mono truncate ${d.isOwn ? "text-emerald-600 font-semibold" : ""}`}>
+                        {d.domain}
+                      </span>
+                      {d.isOwn && <Badge variant="default" className="text-[10px] h-4 px-1.5">Your site</Badge>}
+                    </div>
+                    <div className="flex gap-1 mt-0.5">
+                      {d.platforms.map(p => (
+                        <Badge key={p} variant="outline" className="text-[10px] h-4 px-1">{p}</Badge>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="w-32 flex items-center gap-2">
+                    <div className="flex-1 h-2 bg-muted rounded-full overflow-hidden">
+                      <div
+                        className={`h-full rounded-full ${d.isOwn ? "bg-emerald-500" : "bg-primary/60"}`}
+                        style={{ width: `${(d.count / maxCount) * 100}%` }}
+                      />
+                    </div>
+                    <span className="text-xs font-medium w-6 text-right">{d.count}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Recent citations */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-sm font-medium">Recent Citations</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-2 max-h-80 overflow-y-auto">
+            {data.recentCitations.map((c, i) => (
+              <div key={i} className="flex items-start gap-3 text-xs py-2 border-b last:border-0">
+                <div className="flex-1 min-w-0">
+                  <a href={c.url} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline truncate block font-mono">
+                    {c.url.replace(/^https?:\/\//, "").substring(0, 80)}
+                    <ExternalLink className="w-2.5 h-2.5 inline ml-1" />
+                  </a>
+                  <p className="text-muted-foreground mt-0.5 truncate">Query: {c.query}</p>
+                </div>
+                <Badge variant="outline" className="text-[10px] shrink-0">{c.platform}</Badge>
+                <span className="text-muted-foreground shrink-0">{c.date}</span>
+              </div>
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+    </>
+  );
+}
+
+/* ============ SCAN SCHEDULE SECTION ============ */
+function ScanScheduleSection({ businessId }: { businessId: number }) {
+  const { toast } = useToast();
+
+  const { data: schedule, isLoading } = useQuery<{
+    scanFrequency: string;
+    scanDay: number;
+    lastAutoScan: string | null;
+    nextScanDue: string | null;
+  }>({
+    queryKey: [`/api/businesses/${businessId}/schedule`],
+    queryFn: async () => { const res = await fetch(`/api/businesses/${businessId}/schedule`); return res.json(); },
+  });
+
+  const [frequency, setFrequency] = useState<string>("manual");
+  const [scanDay, setScanDay] = useState<number>(1);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (schedule) {
+      setFrequency(schedule.scanFrequency);
+      setScanDay(schedule.scanDay);
+    }
+  }, [schedule]);
+
+  const saveSchedule = async () => {
+    setSaving(true);
+    try {
+      const res = await fetch(`/api/businesses/${businessId}/schedule`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scanFrequency: frequency, scanDay }),
+      });
+      if (!res.ok) throw new Error("Failed to save");
+      const data = await res.json();
+      queryClient.invalidateQueries({ queryKey: [`/api/businesses/${businessId}/schedule`] });
+      toast({ title: "Schedule updated", description: frequency === "manual" ? "Auto-scanning disabled" : `Next scan: ${data.nextScanDue}` });
+    } catch {
+      toast({ title: "Error", description: "Failed to update schedule", variant: "destructive" });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+  if (isLoading) return <Skeleton className="h-40 w-full" />;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-sm font-medium flex items-center gap-2">
+          <CalendarClock className="w-4 h-4 text-primary" />
+          Auto-Scan Schedule
+          <InfoTip text="Configure automatic AI scans that run on a schedule. Each scan checks all AI platforms for your business visibility and tracks changes over time." />
+        </CardTitle>
+        <CardDescription className="text-xs">
+          Set how frequently this business is automatically scanned across all AI platforms
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div className="space-y-2">
+            <Label className="text-xs">Scan Frequency</Label>
+            <Select value={frequency} onValueChange={setFrequency}>
+              <SelectTrigger data-testid="select-scan-frequency">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="manual">Manual only</SelectItem>
+                <SelectItem value="daily">Daily</SelectItem>
+                <SelectItem value="weekly">Weekly</SelectItem>
+                <SelectItem value="biweekly">Every 2 weeks</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          {(frequency === "weekly" || frequency === "biweekly") && (
+            <div className="space-y-2">
+              <Label className="text-xs">Preferred Day</Label>
+              <Select value={scanDay.toString()} onValueChange={(v) => setScanDay(parseInt(v))}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {dayNames.map((name, i) => (
+                    <SelectItem key={i} value={i.toString()}>{name}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
+        </div>
+
+        {schedule && (
+          <div className="flex flex-wrap gap-4 text-xs text-muted-foreground">
+            {schedule.lastAutoScan && (
+              <span className="flex items-center gap-1">
+                <RotateCcw className="w-3 h-3" />
+                Last auto-scan: {schedule.lastAutoScan}
+              </span>
+            )}
+            {schedule.nextScanDue && frequency !== "manual" && (
+              <span className="flex items-center gap-1">
+                <CalendarClock className="w-3 h-3" />
+                Next scan due: {schedule.nextScanDue}
+              </span>
+            )}
+          </div>
+        )}
+
+        <Button size="sm" onClick={saveSchedule} disabled={saving} data-testid="button-save-schedule">
+          {saving ? <Loader2 className="w-4 h-4 mr-1.5 animate-spin" /> : <CalendarClock className="w-4 h-4 mr-1.5" />}
+          Save Schedule
+        </Button>
+      </CardContent>
+    </Card>
   );
 }
 

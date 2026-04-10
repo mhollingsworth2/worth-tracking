@@ -8,6 +8,7 @@ export interface AIQueryResult {
   position: number | null;
   sourceType: "grounded" | "knowledge";
   crossValidated: boolean | null; // null = not yet validated (single-platform)
+  citedUrls: string[]; // URLs cited by the AI platform as sources
 }
 
 // Retry wrapper for transient failures (rate limits & server errors)
@@ -351,10 +352,32 @@ async function queryOpenAI(apiKey: string, query: string, businessName: string, 
       }
     }
     if (!responseText) responseText = data.output_text ?? "";
+
+    // Extract citations from OpenAI Responses API (url_citation annotations)
+    const citedUrls: string[] = [];
+    if (Array.isArray(data.output)) {
+      for (const item of data.output) {
+        if (item.type === "message" && Array.isArray(item.content)) {
+          for (const block of item.content) {
+            if (block.type === "output_text" && Array.isArray(block.annotations)) {
+              for (const ann of block.annotations) {
+                if (ann.type === "url_citation" && ann.url) citedUrls.push(ann.url);
+              }
+            }
+          }
+        }
+      }
+    }
+    // Fallback: extract URLs from text
+    if (citedUrls.length === 0) {
+      const urlRegex = /https?:\/\/[^\s\)\]"'<>,]+/g;
+      citedUrls.push(...(responseText.match(urlRegex) || []));
+    }
+
     const analysis = analyzeWithAI(businessName, query, responseText, businessContext);
 
     healthCallback?.("openai", "success", Date.now() - startTime);
-    return { platform: "ChatGPT", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null };
+    return { platform: "ChatGPT", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null, citedUrls: [...new Set(citedUrls)] };
   } catch (err: any) {
     healthCallback?.("openai", "error", Date.now() - startTime, err.message);
     throw err;
@@ -387,14 +410,38 @@ async function queryAnthropic(apiKey: string, query: string, businessName: strin
     }
 
     const data = await res.json();
-    // Extract text blocks from response (may contain tool_use and text blocks)
+    // Extract text blocks and citations from response
     const responseText = Array.isArray(data.content)
       ? data.content.filter((block: any) => block.type === "text").map((block: any) => block.text).join("\n")
       : "";
+
+    // Extract cited URLs from Claude's web_search_tool_result blocks
+    const citedUrls: string[] = [];
+    if (Array.isArray(data.content)) {
+      for (const block of data.content) {
+        if (block.type === "web_search_tool_result" && Array.isArray(block.content)) {
+          for (const result of block.content) {
+            if (result.url) citedUrls.push(result.url);
+          }
+        }
+        // Also check for citations in text block annotations
+        if (block.type === "text" && Array.isArray(block.citations)) {
+          for (const cit of block.citations) {
+            if (cit.url) citedUrls.push(cit.url);
+          }
+        }
+      }
+    }
+    // Fallback: extract URLs from text
+    if (citedUrls.length === 0) {
+      const urlRegex = /https?:\/\/[^\s\)\]"'<>,]+/g;
+      citedUrls.push(...(responseText.match(urlRegex) || []));
+    }
+
     const analysis = analyzeWithAI(businessName, query, responseText, businessContext);
 
     healthCallback?.("anthropic", "success", Date.now() - startTime);
-    return { platform: "Claude", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null };
+    return { platform: "Claude", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null, citedUrls: [...new Set(citedUrls)] };
   } catch (err: any) {
     healthCallback?.("anthropic", "error", Date.now() - startTime, err.message);
     throw err;
@@ -424,10 +471,29 @@ async function queryGemini(apiKey: string, query: string, businessName: string, 
     // Gemini may return multiple parts when grounded; concatenate all text parts
     const parts = data.candidates?.[0]?.content?.parts ?? [];
     const responseText = parts.filter((p: any) => p.text).map((p: any) => p.text).join("\n") || "";
+
+    // Extract grounding citations from Gemini's groundingMetadata
+    const citedUrls: string[] = [];
+    const groundingMeta = data.candidates?.[0]?.groundingMetadata;
+    if (groundingMeta?.groundingChunks) {
+      for (const chunk of groundingMeta.groundingChunks) {
+        if (chunk.web?.uri) citedUrls.push(chunk.web.uri);
+      }
+    }
+    // Also extract from groundingSupports
+    if (groundingMeta?.webSearchQueries) {
+      console.log(`[Gemini] Grounding used ${groundingMeta.webSearchQueries.length} search queries, found ${citedUrls.length} source URLs`);
+    }
+    // Fallback: extract URLs from response text
+    if (citedUrls.length === 0) {
+      const urlRegex = /https?:\/\/[^\s\)\]"'<>,]+/g;
+      citedUrls.push(...(responseText.match(urlRegex) || []));
+    }
+
     const analysis = analyzeWithAI(businessName, query, responseText, businessContext);
 
     healthCallback?.("google", "success", Date.now() - startTime);
-    return { platform: "Google Gemini", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null };
+    return { platform: "Google Gemini", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null, citedUrls: [...new Set(citedUrls)] };
   } catch (err: any) {
     healthCallback?.("google", "error", Date.now() - startTime, err.message);
     throw err;
@@ -461,10 +527,22 @@ async function queryPerplexity(apiKey: string, query: string, businessName: stri
 
     const data = await res.json();
     const responseText = data.choices?.[0]?.message?.content ?? "";
+
+    // Perplexity returns citations in the response body
+    const citedUrls: string[] = [];
+    if (Array.isArray(data.citations)) {
+      citedUrls.push(...data.citations);
+    }
+    // Fallback: extract URLs from response text
+    if (citedUrls.length === 0) {
+      const urlRegex = /https?:\/\/[^\s\)\]"'<>,]+/g;
+      citedUrls.push(...(responseText.match(urlRegex) || []));
+    }
+
     const analysis = analyzeWithAI(businessName, query, responseText, businessContext);
 
     healthCallback?.("perplexity", "success", Date.now() - startTime);
-    return { platform: "Perplexity", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null };
+    return { platform: "Perplexity", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null, citedUrls: [...new Set(citedUrls)] };
   } catch (err: any) {
     healthCallback?.("perplexity", "error", Date.now() - startTime, err.message);
     throw err;
@@ -599,6 +677,9 @@ export async function* runScan(
       // Use the longest response text (most informative)
       const bestResponse = [...results].sort((a, b) => b.responseText.length - a.responseText.length)[0];
 
+      // Merge all cited URLs from all runs
+      const allCitedUrls = [...new Set(results.flatMap(r => r.citedUrls || []))];
+
       averaged.push({
         platform, query,
         responseText: bestResponse.responseText,
@@ -606,6 +687,7 @@ export async function* runScan(
         position: avgPosition,
         sourceType: results[0].sourceType,
         crossValidated: null,
+        citedUrls: allCitedUrls,
       });
     }
 

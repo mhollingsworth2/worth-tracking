@@ -6,7 +6,7 @@ import {
   businesses, platforms, searchRecords, optimizedPrompts, referrals,
   competitors, aiSnapshots, alerts, contentGaps, locations,
   apiKeys, scanJobs, apiUsage, apiSettings, clickEvents,
-  users, userBusinesses, agencySettings, platformHealth, loginSchema,
+  users, userBusinesses, agencySettings, platformHealth, citations, loginSchema,
   insertBusinessSchema, insertSearchRecordSchema,
   insertCompetitorSchema, insertAlertSchema, insertLocationSchema,
 } from "@shared/schema";
@@ -572,7 +572,7 @@ async function autoScanBusiness(businessId: number) {
       const platformId = platformMap[result.platform] ?? 1;
       const dateStr = new Date().toISOString().split("T")[0];
 
-      await storage.createSearchRecord({
+      const record = await storage.createSearchRecord({
         businessId,
         platformId,
         query: result.query,
@@ -584,6 +584,29 @@ async function autoScanBusiness(businessId: number) {
         crossValidated: result.crossValidated === null ? null : result.crossValidated ? 1 : 0,
         date: dateStr,
       });
+
+      // Extract citations — prefer structured citedUrls from AI providers, fall back to regex
+      const citedUrls: string[] = (result as any).citedUrls ?? [];
+      if (citedUrls.length === 0 && result.responseText) {
+        const urlRegex = /https?:\/\/[^\s\)\]"'<>,]+/g;
+        citedUrls.push(...(result.responseText.match(urlRegex) || []));
+      }
+      const uniqueUrls = [...new Set(citedUrls)];
+      const bizDomain = biz.website?.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "") || "";
+      for (const url of uniqueUrls.slice(0, 20)) {
+        const domain = url.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "");
+        const isOwn = bizDomain && domain.includes(bizDomain) ? 1 : 0;
+        db.insert(citations).values({
+          businessId,
+          searchRecordId: record.id,
+          url,
+          domain,
+          isOwnDomain: isOwn,
+          platform: result.platform,
+          query: result.query,
+          date: dateStr,
+        }).run();
+      }
 
       // Track API cost (original query + analysis follow-up)
       const providerKey = keyInputs.find(k => {
@@ -630,9 +653,9 @@ async function autoScanBusiness(businessId: number) {
 
       if (result.sourceType === "grounded" && result.mentioned) {
         checks.push(
-          verifyCitations(result.responseText, biz.name).then(citations => {
-            if (citations.failed > 0) {
-              issues.push(`Citation: ${citations.failed} of ${citations.verified + citations.failed} cited URLs are broken/invalid`);
+          verifyCitations(result.responseText, biz.name).then(citationResult => {
+            if (citationResult.failed > 0) {
+              issues.push(`Citation: ${citationResult.failed} of ${citationResult.verified + citationResult.failed} cited URLs are broken/invalid`);
             }
           }).catch(() => {})
         );
@@ -677,7 +700,7 @@ async function autoScanBusiness(businessId: number) {
           const platformId = platformMap[result.platform] ?? 1;
           const dateStr = new Date().toISOString().split("T")[0];
 
-          await storage.createSearchRecord({
+          const compRecord = await storage.createSearchRecord({
             businessId,
             platformId,
             query: result.query,
@@ -690,6 +713,29 @@ async function autoScanBusiness(businessId: number) {
             competitorId: comp.id,
             date: dateStr,
           });
+
+          // Extract citations — prefer structured citedUrls, fall back to regex
+          const compCitedUrls: string[] = (result as any).citedUrls ?? [];
+          if (compCitedUrls.length === 0 && result.responseText) {
+            const urlRegex = /https?:\/\/[^\s\)\]"'<>,]+/g;
+            compCitedUrls.push(...(result.responseText.match(urlRegex) || []));
+          }
+          const compUniqueUrls = [...new Set(compCitedUrls)];
+          const compBizDomain = biz.website?.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "") || "";
+          for (const url of compUniqueUrls.slice(0, 20)) {
+            const domain = url.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "");
+            const isOwn = compBizDomain && domain.includes(compBizDomain) ? 1 : 0;
+            db.insert(citations).values({
+              businessId,
+              searchRecordId: compRecord.id,
+              url,
+              domain,
+              isOwnDomain: isOwn,
+              platform: result.platform,
+              query: result.query,
+              date: dateStr,
+            }).run();
+          }
 
           // Track API cost for competitor scans too
           const providerKey = keyInputs.find(k => {
@@ -725,10 +771,10 @@ async function autoScanBusiness(businessId: number) {
   }
 }
 
-// ── Nightly scan scheduler ──────────────────────────────────────────────────
-// Runs all business scans once per night at 2 AM, plus on-login trigger.
-let nightlyScanRunning = false;
-let lastNightlyScanDate = ""; // tracks which date we already ran for
+// ── Scheduled auto-scan system ─────────────────────────────────────────────
+// Supports per-business scan frequencies: manual, daily, weekly, biweekly.
+// Checks every hour for businesses that are due for a scan and runs them.
+let scheduledScanRunning = false;
 
 async function runAllBusinessScans(trigger: string) {
   if (nightlyScanRunning) {
@@ -1014,6 +1060,18 @@ export async function registerRoutes(
     timestamp TEXT NOT NULL
   )`);
 
+  db.run(sql`CREATE TABLE IF NOT EXISTS citations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    business_id INTEGER NOT NULL,
+    search_record_id INTEGER,
+    url TEXT NOT NULL,
+    domain TEXT NOT NULL,
+    is_own_domain INTEGER NOT NULL DEFAULT 0,
+    platform TEXT NOT NULL,
+    query TEXT NOT NULL,
+    date TEXT NOT NULL
+  )`);
+
   console.log("[init] Core tables created successfully");
 
   // === DATABASE INDEXES for query performance ===
@@ -1028,6 +1086,10 @@ export async function registerRoutes(
     ON referrals(business_id, converted)`);
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_ai_snapshots_business_date
     ON ai_snapshots(business_id, date)`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_citations_business_date
+    ON citations(business_id, date)`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_citations_business_domain
+    ON citations(business_id, domain)`);
   console.log("[init] Database indexes created successfully");
 
   // Ensure archive tables exist
@@ -2117,6 +2179,42 @@ Include 3-6 sections in the outline, each with 2-4 bullet points. Include 5-10 k
     res.json(result);
   });
 
+  // === CITATIONS ===
+  app.get("/api/businesses/:id/citations", async (req, res) => {
+    const businessId = parseInt(req.params.id);
+
+    const allCitations = db.select().from(citations)
+      .where(sql`business_id = ${businessId}`)
+      .all();
+
+    // Group by domain
+    const domainMap = new Map<string, { domain: string; count: number; isOwn: boolean; platforms: Set<string> }>();
+    for (const c of allCitations) {
+      if (!domainMap.has(c.domain)) {
+        domainMap.set(c.domain, { domain: c.domain, count: 0, isOwn: !!c.isOwnDomain, platforms: new Set() });
+      }
+      const d = domainMap.get(c.domain)!;
+      d.count++;
+      if (c.platform) d.platforms.add(c.platform);
+    }
+
+    const domains = [...domainMap.values()]
+      .map(d => ({ ...d, platforms: [...d.platforms] }))
+      .sort((a, b) => b.count - a.count);
+
+    const totalCitations = allCitations.length;
+    const ownCitations = allCitations.filter(c => c.isOwnDomain).length;
+    const ownRate = totalCitations > 0 ? Math.round((ownCitations / totalCitations) * 100) : 0;
+
+    res.json({
+      totalCitations,
+      ownCitations,
+      ownCitationRate: ownRate,
+      topDomains: domains.slice(0, 20),
+      recentCitations: allCitations.slice(-20).reverse(),
+    });
+  });
+
   // === LOCATIONS ===
   app.get("/api/businesses/:id/locations", async (req, res) => {
     const id = parseInt(req.params.id);
@@ -2794,7 +2892,7 @@ Extract real information from the content. If a field isn't clear from the websi
         const platformId = platformMap[result.platform] ?? 1;
         const dateStr = new Date().toISOString().split("T")[0];
 
-        await storage.createSearchRecord({
+        const record = await storage.createSearchRecord({
           businessId,
           platformId,
           query: result.query,
@@ -2806,6 +2904,29 @@ Extract real information from the content. If a field isn't clear from the websi
           crossValidated: result.crossValidated === null ? null : result.crossValidated ? 1 : 0,
           date: dateStr,
         });
+
+        // Extract citations — prefer structured citedUrls, fall back to regex
+        const autoScanCitedUrls: string[] = (result as any).citedUrls ?? [];
+        if (autoScanCitedUrls.length === 0 && result.responseText) {
+          const urlRegex = /https?:\/\/[^\s\)\]"'<>,]+/g;
+          autoScanCitedUrls.push(...(result.responseText.match(urlRegex) || []));
+        }
+        const autoScanUniqueUrls = [...new Set(autoScanCitedUrls)];
+        const autoScanBizDomain = business.website?.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "") || "";
+        for (const url of autoScanUniqueUrls.slice(0, 20)) {
+          const domain = url.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "");
+          const isOwn = autoScanBizDomain && domain.includes(autoScanBizDomain) ? 1 : 0;
+          db.insert(citations).values({
+            businessId,
+            searchRecordId: record.id,
+            url,
+            domain,
+            isOwnDomain: isOwn,
+            platform: result.platform,
+            query: result.query,
+            date: dateStr,
+          }).run();
+        }
 
         // Track API cost (original query + analysis follow-up)
         const providerKey = keyInputs.find(k => {
@@ -2851,9 +2972,9 @@ Extract real information from the content. If a field isn't clear from the websi
 
         if (result.sourceType === "grounded" && result.mentioned) {
           checks.push(
-            verifyCitations(result.responseText, business.name).then(citations => {
-              if (citations.failed > 0) {
-                issues.push(`Citation: ${citations.failed} of ${citations.verified + citations.failed} cited URLs are broken/invalid`);
+            verifyCitations(result.responseText, business.name).then(citationResult => {
+              if (citationResult.failed > 0) {
+                issues.push(`Citation: ${citationResult.failed} of ${citationResult.verified + citationResult.failed} cited URLs are broken/invalid`);
               }
             }).catch(() => {})
           );
@@ -2895,7 +3016,7 @@ Extract real information from the content. If a field isn't clear from the websi
           for await (const result of runScan(comp.name, compQueries, keyInputs, [], { industry: business.industry ?? null, location: business.location ?? null, website: null, services: null })) {
             const platId = platformMap[result.platform] ?? 1;
             const dateStr = new Date().toISOString().split("T")[0];
-            await storage.createSearchRecord({
+            const compRecord = await storage.createSearchRecord({
               businessId,
               platformId: platId,
               query: result.query,
@@ -2908,6 +3029,29 @@ Extract real information from the content. If a field isn't clear from the websi
               competitorId: comp.id,
               date: dateStr,
             });
+
+            // Extract citations — prefer structured citedUrls, fall back to regex
+            const autoCompCitedUrls: string[] = (result as any).citedUrls ?? [];
+            if (autoCompCitedUrls.length === 0 && result.responseText) {
+              const urlRegex = /https?:\/\/[^\s\)\]"'<>,]+/g;
+              autoCompCitedUrls.push(...(result.responseText.match(urlRegex) || []));
+            }
+            const autoCompUniqueUrls = [...new Set(autoCompCitedUrls)];
+            const autoCompBizDomain = business.website?.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "") || "";
+            for (const url of autoCompUniqueUrls.slice(0, 20)) {
+              const domain = url.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "");
+              const isOwn = autoCompBizDomain && domain.includes(autoCompBizDomain) ? 1 : 0;
+              db.insert(citations).values({
+                businessId,
+                searchRecordId: compRecord.id,
+                url,
+                domain,
+                isOwnDomain: isOwn,
+                platform: result.platform,
+                query: result.query,
+                date: dateStr,
+              }).run();
+            }
           }
         } catch (compErr: any) {
           console.error(`[Scan] Error scanning competitor "${comp.name}":`, compErr.message);

@@ -168,6 +168,21 @@ export const insertLocationSchema = createInsertSchema(locations).omit({ id: tru
 export type InsertLocation = z.infer<typeof insertLocationSchema>;
 export type Location = typeof locations.$inferSelect;
 
+// Citations — URLs cited by AI platforms in their responses
+export const citations = sqliteTable("citations", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  businessId: integer("business_id").notNull(),
+  searchRecordId: integer("search_record_id"),
+  url: text("url").notNull(),
+  domain: text("domain").notNull(),
+  isOwnDomain: integer("is_own_domain").notNull().default(0),
+  platform: text("platform").notNull(),
+  query: text("query").notNull(),
+  date: text("date").notNull(),
+});
+
+export type Citation = typeof citations.$inferSelect;
+
 // Users
 export const users = sqliteTable("users", {
   id: integer("id").primaryKey({ autoIncrement: true }),
