@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Loader2, Globe, MapPin, Star, FileText, Code2, Trophy, CheckCircle, XCircle, ExternalLink, Lightbulb } from "lucide-react";
+import { Loader2, Globe, MapPin, Star, FileText, Code2, Trophy, CheckCircle, XCircle, ExternalLink, Lightbulb, Radar } from "lucide-react";
 import { InfoTip } from "@/components/info-tip";
 
 interface AuditCategory {
@@ -60,6 +60,7 @@ const CATEGORY_ICONS: Record<string, any> = {
   "Schema & Structured Data": Code2,
   "Content Quality": FileText,
   "Competitive Edge": Trophy,
+  "AI Crawlability": Radar,
 };
 
 const CATEGORY_COLORS: Record<string, string> = {
@@ -68,6 +69,7 @@ const CATEGORY_COLORS: Record<string, string> = {
   "Schema & Structured Data": "text-purple-500",
   "Content Quality": "text-blue-500",
   "Competitive Edge": "text-rose-500",
+  "AI Crawlability": "text-cyan-500",
 };
 
 export default function Optimizer() {

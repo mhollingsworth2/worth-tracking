@@ -24,6 +24,7 @@ import {
   Phone, ShoppingCart, UserPlus, Mail, CalendarCheck,
   Info, Download, Users, Camera, AlertTriangle, Plus, X, Settings, ChevronDown, ChevronUp,
   Zap, Loader2, Code2, Link2, CalendarClock, RotateCcw,
+  Activity, Crosshair, Radar, FileDown, Megaphone, BookOpen,
 } from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
@@ -614,6 +615,14 @@ export default function BusinessDetail() {
               <Link2 className="w-3.5 h-3.5 mr-1.5" />
               Citations
             </TabsTrigger>
+            <TabsTrigger value="sentiment" data-testid="tab-sentiment">
+              <Activity className="w-3.5 h-3.5 mr-1.5" />
+              Sentiment
+            </TabsTrigger>
+            <TabsTrigger value="geo-roadmap" data-testid="tab-geo-roadmap">
+              <Crosshair className="w-3.5 h-3.5 mr-1.5" />
+              GEO Roadmap
+            </TabsTrigger>
             <TabsTrigger value="prompts" data-testid="tab-prompts">AI SEO Prompts</TabsTrigger>
             <TabsTrigger value="records" data-testid="tab-records">Search Log</TabsTrigger>
             <TabsTrigger value="settings" data-testid="tab-settings">
@@ -1114,6 +1123,16 @@ export default function BusinessDetail() {
           {/* ========== CITATIONS TAB ========== */}
           <TabsContent value="citations" className="space-y-6 mt-4">
             <CitationsSection businessId={id} />
+          </TabsContent>
+
+          {/* ========== SENTIMENT TAB ========== */}
+          <TabsContent value="sentiment" className="space-y-6 mt-4">
+            <SentimentSection businessId={id} />
+          </TabsContent>
+
+          {/* ========== GEO ROADMAP TAB ========== */}
+          <TabsContent value="geo-roadmap" className="space-y-6 mt-4">
+            <GeoRoadmapSection businessId={id} />
           </TabsContent>
 
           {/* ========== PROMPTS TAB ========== */}
@@ -2416,6 +2435,306 @@ function ScanScheduleSection({ businessId }: { businessId: number }) {
         </Button>
       </CardContent>
     </Card>
+  );
+}
+
+/* ============ SENTIMENT SECTION ============ */
+function SentimentSection({ businessId }: { businessId: number }) {
+  const { data, isLoading } = useQuery<{
+    overallScore: number;
+    topicBreakdown: { topic: string; avgScore: number; count: number; sentiment: string }[];
+    trend: { date: string; avgScore: number }[];
+    recentMentions: { query: string; sentiment: string; sentimentScore: number; topic: string; date: string }[];
+  }>({
+    queryKey: [`/api/businesses/${businessId}/sentiment`],
+    queryFn: async () => { const res = await fetch(`/api/businesses/${businessId}/sentiment`); return res.json(); },
+  });
+
+  if (isLoading) return <div className="flex items-center justify-center py-12"><Loader2 className="w-6 h-6 animate-spin" /></div>;
+  if (!data || data.topicBreakdown.length === 0) {
+    return (
+      <Card><CardContent className="p-8 text-center">
+        <Activity className="w-10 h-10 mx-auto mb-3 text-muted-foreground" />
+        <p className="text-muted-foreground font-medium">No sentiment data yet</p>
+        <p className="text-xs text-muted-foreground mt-1">Run an AI scan to start tracking how AI platforms talk about your business.</p>
+      </CardContent></Card>
+    );
+  }
+
+  const scoreColor = (s: number) => s >= 65 ? "text-emerald-600" : s <= 35 ? "text-red-600" : "text-amber-600";
+  const scoreBg = (s: number) => s >= 65 ? "bg-emerald-500" : s <= 35 ? "bg-red-500" : "bg-amber-500";
+  const topicLabels: Record<string, string> = {
+    purchase_intent: "Purchase Intent", comparison: "Comparison", reputation: "Reputation",
+    local: "Local", educational: "Educational", general: "General",
+  };
+
+  return (
+    <>
+      {/* Overall sentiment score */}
+      <Card>
+        <CardContent className="p-6">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm text-muted-foreground">Overall Brand Sentiment</p>
+              <div className="flex items-baseline gap-2">
+                <span className={`text-4xl font-bold font-serif ${scoreColor(data.overallScore)}`} data-testid="text-sentiment-score">
+                  {data.overallScore}
+                </span>
+                <span className="text-lg text-muted-foreground">/ 100</span>
+              </div>
+              <p className="text-xs text-muted-foreground mt-1">
+                {data.overallScore >= 65 ? "AI platforms speak positively about your brand" :
+                 data.overallScore <= 35 ? "AI platforms have a negative perception — action needed" :
+                 "AI platforms have a neutral perception — room for improvement"}
+              </p>
+            </div>
+            <div className="w-24 h-24 relative">
+              <svg viewBox="0 0 100 100" className="w-full h-full -rotate-90">
+                <circle cx="50" cy="50" r="40" fill="none" stroke="hsl(var(--muted))" strokeWidth="8" />
+                <circle cx="50" cy="50" r="40" fill="none"
+                  stroke={data.overallScore >= 65 ? "#22c55e" : data.overallScore <= 35 ? "#ef4444" : "#f59e0b"}
+                  strokeWidth="8" strokeDasharray={`${data.overallScore * 2.51} 251`} strokeLinecap="round" />
+              </svg>
+              <div className="absolute inset-0 flex items-center justify-center">
+                <span className="text-xl font-bold">{data.overallScore}</span>
+              </div>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Topic breakdown */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-sm font-medium flex items-center gap-2">
+            <Layers className="w-4 h-4 text-primary" />
+            Sentiment by Topic
+            <InfoTip text="Shows how AI platforms perceive your brand across different query categories. Purchase intent and comparison queries are the most valuable — positive sentiment here directly impacts whether AI recommends you." />
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-3">
+            {data.topicBreakdown.map(t => (
+              <div key={t.topic} className="flex items-center gap-3">
+                <span className="text-xs font-medium w-28 truncate">{topicLabels[t.topic] ?? t.topic}</span>
+                <div className="flex-1 h-3 bg-muted rounded-full overflow-hidden">
+                  <div className={`h-full rounded-full ${scoreBg(t.avgScore)}`} style={{ width: `${t.avgScore}%` }} />
+                </div>
+                <span className={`text-sm font-bold w-8 text-right ${scoreColor(t.avgScore)}`}>{t.avgScore}</span>
+                <Badge variant="outline" className="text-[10px]">{t.count} mentions</Badge>
+              </div>
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Sentiment trend */}
+      {data.trend.length > 1 && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-sm font-medium">Sentiment Trend</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <ResponsiveContainer width="100%" height={200}>
+              <AreaChart data={data.trend}>
+                <XAxis dataKey="date" tick={{ fontSize: 10 }} />
+                <YAxis domain={[0, 100]} tick={{ fontSize: 10 }} />
+                <Tooltip />
+                <Area type="monotone" dataKey="avgScore" stroke="#6366f1" fill="#6366f1" fillOpacity={0.1} name="Sentiment Score" />
+              </AreaChart>
+            </ResponsiveContainer>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Notable mentions */}
+      {data.recentMentions.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-sm font-medium">Notable Mentions</CardTitle>
+            <CardDescription className="text-xs">Strongest positive and negative mentions across AI platforms</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-2">
+              {data.recentMentions.map((m, i) => (
+                <div key={i} className="flex items-center gap-3 text-xs py-2 border-b last:border-0">
+                  <span className={`text-lg font-bold w-8 ${scoreColor(m.sentimentScore)}`}>{m.sentimentScore}</span>
+                  <div className="flex-1 min-w-0">
+                    <p className="truncate font-medium">{m.query}</p>
+                    <p className="text-muted-foreground">{topicLabels[m.topic] ?? m.topic}</p>
+                  </div>
+                  <Badge variant={m.sentiment === "positive" ? "default" : "destructive"} className="text-[10px]">
+                    {m.sentiment}
+                  </Badge>
+                  <span className="text-muted-foreground">{m.date}</span>
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+    </>
+  );
+}
+
+/* ============ GEO ROADMAP SECTION ============ */
+function GeoRoadmapSection({ businessId }: { businessId: number }) {
+  const { toast } = useToast();
+  const { data: actions, isLoading } = useQuery<any[]>({
+    queryKey: [`/api/businesses/${businessId}/geo-actions`],
+    queryFn: async () => { const res = await fetch(`/api/businesses/${businessId}/geo-actions`); return res.json(); },
+  });
+
+  const [generating, setGenerating] = useState(false);
+
+  const generateActions = async () => {
+    setGenerating(true);
+    try {
+      await fetch(`/api/businesses/${businessId}/generate-geo-actions`, { method: "POST" });
+      queryClient.invalidateQueries({ queryKey: [`/api/businesses/${businessId}/geo-actions`] });
+      toast({ title: "GEO Roadmap generated", description: "Action items have been created based on your scan data." });
+    } catch {
+      toast({ title: "Error", description: "Failed to generate actions", variant: "destructive" });
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  const updateStatus = async (actionId: number, status: string) => {
+    await fetch(`/api/geo-actions/${actionId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status }),
+    });
+    queryClient.invalidateQueries({ queryKey: [`/api/businesses/${businessId}/geo-actions`] });
+  };
+
+  if (isLoading) return <div className="flex items-center justify-center py-12"><Loader2 className="w-6 h-6 animate-spin" /></div>;
+
+  const pending = (actions ?? []).filter(a => a.status === "pending" || a.status === "in_progress");
+  const completed = (actions ?? []).filter(a => a.status === "done");
+  const dismissed = (actions ?? []).filter(a => a.status === "dismissed");
+  const ownedMedia = pending.filter(a => a.actionType === "owned_media");
+  const earnedMedia = pending.filter(a => a.actionType === "earned_media");
+
+  const scoreBadge = (score: string) => {
+    if (score === "high") return <Badge variant="destructive" className="text-[10px]">High Impact</Badge>;
+    if (score === "medium") return <Badge variant="default" className="text-[10px]">Medium</Badge>;
+    return <Badge variant="secondary" className="text-[10px]">Low</Badge>;
+  };
+
+  if (!actions || actions.length === 0) {
+    return (
+      <Card>
+        <CardContent className="p-8 text-center">
+          <Crosshair className="w-10 h-10 mx-auto mb-3 text-muted-foreground" />
+          <p className="text-muted-foreground font-medium">No GEO actions yet</p>
+          <p className="text-xs text-muted-foreground mt-1 mb-4">Generate a prioritized action roadmap based on your scan results.</p>
+          <Button onClick={generateActions} disabled={generating} size="sm">
+            {generating ? <Loader2 className="w-4 h-4 mr-1.5 animate-spin" /> : <Crosshair className="w-4 h-4 mr-1.5" />}
+            Generate Roadmap
+          </Button>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  const ActionCard = ({ action }: { action: any }) => (
+    <div className="flex items-start gap-3 p-3 rounded-lg border bg-card">
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2 mb-1">
+          {scoreBadge(action.opportunityScore ?? action.opportunity_score)}
+          <Badge variant="outline" className="text-[10px]">{action.category}</Badge>
+        </div>
+        <p className="text-sm font-medium">{action.title}</p>
+        <p className="text-xs text-muted-foreground mt-1">{action.description}</p>
+        {(action.relatedQuery ?? action.related_query) && (
+          <p className="text-xs text-primary mt-1 font-mono">Query: {action.relatedQuery ?? action.related_query}</p>
+        )}
+      </div>
+      <div className="flex flex-col gap-1 shrink-0">
+        {(action.status === "pending") && (
+          <>
+            <Button size="sm" variant="outline" className="h-6 text-[10px]" onClick={() => updateStatus(action.id, "in_progress")}>Start</Button>
+            <Button size="sm" variant="ghost" className="h-6 text-[10px] text-muted-foreground" onClick={() => updateStatus(action.id, "dismissed")}>Dismiss</Button>
+          </>
+        )}
+        {(action.status === "in_progress") && (
+          <Button size="sm" variant="default" className="h-6 text-[10px]" onClick={() => updateStatus(action.id, "done")}>Done</Button>
+        )}
+      </div>
+    </div>
+  );
+
+  return (
+    <>
+      <div className="flex items-center justify-between">
+        <div>
+          <h3 className="text-lg font-semibold flex items-center gap-2">
+            <Crosshair className="w-5 h-5 text-primary" />
+            GEO Roadmap
+          </h3>
+          <p className="text-xs text-muted-foreground mt-1">{pending.length} pending actions, {completed.length} completed</p>
+        </div>
+        <Button onClick={generateActions} disabled={generating} size="sm" variant="outline">
+          {generating ? <Loader2 className="w-4 h-4 mr-1.5 animate-spin" /> : <RotateCcw className="w-4 h-4 mr-1.5" />}
+          Regenerate
+        </Button>
+      </div>
+
+      {ownedMedia.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-sm font-medium flex items-center gap-2">
+              <BookOpen className="w-4 h-4 text-blue-500" />
+              Owned Media
+              <InfoTip text="Content and pages you create on your own website to improve AI visibility." />
+            </CardTitle>
+            <CardDescription className="text-xs">Content to create or improve on your website</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            {ownedMedia.map(a => <ActionCard key={a.id} action={a} />)}
+          </CardContent>
+        </Card>
+      )}
+
+      {earnedMedia.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-sm font-medium flex items-center gap-2">
+              <Megaphone className="w-4 h-4 text-amber-500" />
+              Earned Media
+              <InfoTip text="External sites, directories, and communities where getting mentioned will boost your AI visibility." />
+            </CardTitle>
+            <CardDescription className="text-xs">Get listed, mentioned, or featured on these external platforms</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            {earnedMedia.map(a => <ActionCard key={a.id} action={a} />)}
+          </CardContent>
+        </Card>
+      )}
+
+      {completed.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-sm font-medium flex items-center gap-2">
+              <CheckCircle className="w-4 h-4 text-emerald-500" />
+              Completed ({completed.length})
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-1">
+              {completed.map(a => (
+                <div key={a.id} className="flex items-center gap-2 text-xs text-muted-foreground py-1">
+                  <CheckCircle className="w-3 h-3 text-emerald-500 shrink-0" />
+                  <span className="line-through">{a.title}</span>
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+    </>
   );
 }
 

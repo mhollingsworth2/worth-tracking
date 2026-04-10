@@ -183,6 +183,35 @@ export const citations = sqliteTable("citations", {
 
 export type Citation = typeof citations.$inferSelect;
 
+// AI Bot Visits — tracks which AI crawlers visit the business website
+export const botVisits = sqliteTable("bot_visits", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  businessId: integer("business_id").notNull(),
+  botName: text("bot_name").notNull(),    // GPTBot, ClaudeBot, PerplexityBot, Googlebot, etc.
+  pageUrl: text("page_url").notNull(),
+  statusCode: integer("status_code"),
+  date: text("date").notNull(),
+  timestamp: text("timestamp").notNull(),
+});
+
+export type BotVisit = typeof botVisits.$inferSelect;
+
+// GEO Actions — scored action items derived from content gaps
+export const geoActions = sqliteTable("geo_actions", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  businessId: integer("business_id").notNull(),
+  actionType: text("action_type").notNull(),  // "owned_media" | "earned_media"
+  title: text("title").notNull(),
+  description: text("description").notNull(),
+  category: text("category").notNull(),       // Discovery, Comparison, Local SEO, etc.
+  opportunityScore: text("opportunity_score").notNull().default("medium"), // "high" | "medium" | "low"
+  status: text("status").notNull().default("pending"), // "pending" | "in_progress" | "done" | "dismissed"
+  relatedQuery: text("related_query"),
+  createdAt: text("created_at").notNull(),
+});
+
+export type GeoAction = typeof geoActions.$inferSelect;
+
 // Users
 export const users = sqliteTable("users", {
   id: integer("id").primaryKey({ autoIncrement: true }),

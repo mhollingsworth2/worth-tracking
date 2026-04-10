@@ -4,6 +4,8 @@ export interface AIQueryResult {
   responseText: string;
   mentioned: boolean;
   sentiment: "positive" | "neutral" | "negative";
+  sentimentScore: number; // 0-100 granular sentiment (50=neutral, 100=very positive, 0=very negative)
+  sentimentTopic: string; // topic category: "purchase_intent" | "comparison" | "reputation" | "general" | "local" | "educational"
   confidence: "high" | "medium" | "low";
   position: number | null;
   sourceType: "grounded" | "knowledge";
@@ -57,6 +59,8 @@ async function fetchWithRetry(url: string, options: RequestInit, maxRetries = 2)
 interface AnalysisResult {
   mentioned: boolean;
   sentiment: "positive" | "neutral" | "negative";
+  sentimentScore: number;
+  sentimentTopic: string;
   confidence: "high" | "medium" | "low";
   position: number | null;
 }
@@ -124,26 +128,56 @@ function analyzeWithAI(businessName: string, query: string, responseText: string
     }
   }
 
-  // ── Sentiment analysis ──────────────────────────────────────────────────
+  // ── Topic classification ─────────────────────────────────────────────────
+  let sentimentTopic = "general";
+  const ql = queryLower;
+  if (ql.includes("buy") || ql.includes("purchase") || ql.includes("hire") || ql.includes("cost") || ql.includes("price") || ql.includes("worth it") || ql.includes("should i")) {
+    sentimentTopic = "purchase_intent";
+  } else if (ql.includes("vs ") || ql.includes("compare") || ql.includes("between") || ql.includes("alternative") || ql.includes("better than")) {
+    sentimentTopic = "comparison";
+  } else if (ql.includes("review") || ql.includes("reputation") || ql.includes("rating") || ql.includes("experience with")) {
+    sentimentTopic = "reputation";
+  } else if (ql.includes("near") || ql.includes("in ") || ql.includes("local") || ql.includes("city") || ql.includes("area")) {
+    sentimentTopic = "local";
+  } else if (ql.includes("how") || ql.includes("what is") || ql.includes("tips") || ql.includes("guide") || ql.includes("explain")) {
+    sentimentTopic = "educational";
+  } else if (ql.includes("best") || ql.includes("top") || ql.includes("recommend")) {
+    sentimentTopic = "purchase_intent";
+  }
+
+  // ── Sentiment analysis (granular 0-100 scoring) ────────────────────────
   let sentiment: "positive" | "neutral" | "negative" = "neutral";
+  let sentimentScore = 50; // neutral baseline
   if (mentioned) {
-    const positiveWords = ["recommend", "excellent", "great", "best", "top", "outstanding", "highly rated",
-      "trusted", "reliable", "professional", "quality", "reputable", "well-known", "popular",
-      "favorite", "praised", "strong", "exceptional", "impressive", "thorough", "highly recommend"];
-    const negativeWords = ["complaint", "avoid", "poor", "bad", "worst", "unreliable", "overpriced",
-      "unprofessional", "disappointing", "warning", "beware", "issues", "problem", "negative reviews"];
+    const strongPositive = ["highly recommend", "excellent", "outstanding", "exceptional", "best choice",
+      "top-rated", "industry leader", "go-to", "first choice", "can't go wrong"];
+    const mildPositive = ["recommend", "great", "good", "reliable", "professional", "quality",
+      "reputable", "well-known", "popular", "trusted", "solid", "experienced", "strong",
+      "impressive", "thorough", "praised", "favorable", "dependable"];
+    const mildNegative = ["mixed reviews", "some complaints", "could improve", "not the cheapest",
+      "limited hours", "slow response", "inconsistent", "varying quality", "hit or miss"];
+    const strongNegative = ["avoid", "poor", "bad", "worst", "unreliable", "overpriced",
+      "unprofessional", "disappointing", "beware", "scam", "terrible", "horrible", "do not recommend"];
 
     const matchedVariant = searchVariants.find(v => lower.includes(v))!;
     const nameIndex = lower.indexOf(matchedVariant);
     const context = lower.slice(Math.max(0, nameIndex - 200), Math.min(lower.length, nameIndex + 500));
 
-    const posCount = positiveWords.filter(w => context.includes(w)).length;
-    const negCount = negativeWords.filter(w => context.includes(w)).length;
+    const strongPosCount = strongPositive.filter(w => context.includes(w)).length;
+    const mildPosCount = mildPositive.filter(w => context.includes(w)).length;
+    const mildNegCount = mildNegative.filter(w => context.includes(w)).length;
+    const strongNegCount = strongNegative.filter(w => context.includes(w)).length;
 
-    if (posCount > negCount && posCount >= 2) sentiment = "positive";
-    else if (negCount > posCount && negCount >= 2) sentiment = "negative";
-    else if (posCount > 0) sentiment = "positive";
-    else if (negCount > 0) sentiment = "negative";
+    // Score: each strong word = 10 points, mild = 5 points
+    sentimentScore = 50 + (strongPosCount * 10) + (mildPosCount * 5) - (strongNegCount * 10) - (mildNegCount * 5);
+    sentimentScore = Math.max(0, Math.min(100, sentimentScore));
+
+    // Map to category
+    if (sentimentScore >= 65) sentiment = "positive";
+    else if (sentimentScore <= 35) sentiment = "negative";
+    else sentiment = "neutral";
+  } else {
+    sentimentScore = 50; // not mentioned = neutral
   }
 
   // ── Confidence ──────────────────────────────────────────────────────────
@@ -158,12 +192,12 @@ function analyzeWithAI(businessName: string, query: string, responseText: string
     confidence = isGeneric ? "low" : "high";
   }
 
-  console.log(`[Analysis] "${businessName}" ${mentioned ? "FOUND ✓" : "NOT FOUND ✗"} | queryHadName: ${queryContainsName} | nameInResponse: ${nameFoundInResponse} | responseLen: ${responseText.length} | position: ${position} | sentiment: ${sentiment} | confidence: ${confidence}`);
+  console.log(`[Analysis] "${businessName}" ${mentioned ? "FOUND ✓" : "NOT FOUND ✗"} | queryHadName: ${queryContainsName} | nameInResponse: ${nameFoundInResponse} | responseLen: ${responseText.length} | position: ${position} | sentiment: ${sentiment}(${sentimentScore}) | topic: ${sentimentTopic} | confidence: ${confidence}`);
   if (!mentioned && !nameFoundInResponse) {
     console.log(`[Analysis] Response preview (first 200 chars): ${responseText.substring(0, 200).replace(/\n/g, " ")}`);
   }
 
-  return { mentioned, sentiment, confidence, position };
+  return { mentioned, sentiment, sentimentScore, sentimentTopic, confidence, position };
 }
 
 // ── Response Fingerprinting ──────────────────────────────────────────────
@@ -664,10 +698,12 @@ export async function* runScan(
       const positions = results.filter(r => r.mentioned && r.position !== null).map(r => r.position!);
       const avgPosition = positions.length > 0 ? Math.round((positions.reduce((a, b) => a + b, 0) / positions.length) * 10) / 10 : null;
 
-      // Majority vote on sentiment
+      // Average sentiment score + majority vote on sentiment category
+      const avgSentimentScore = Math.round(results.reduce((sum, r) => sum + r.sentimentScore, 0) / results.length);
       const sentimentCounts = { positive: 0, neutral: 0, negative: 0 };
       for (const r of results) sentimentCounts[r.sentiment]++;
       const sentiment = (Object.entries(sentimentCounts).sort((a, b) => b[1] - a[1])[0][0]) as "positive" | "neutral" | "negative";
+      const sentimentTopic = results[0].sentimentTopic;
 
       // If runs disagree on mentioned, lower confidence
       const allAgree = results.every(r => r.mentioned === mentioned);
@@ -683,7 +719,7 @@ export async function* runScan(
       averaged.push({
         platform, query,
         responseText: bestResponse.responseText,
-        mentioned, sentiment, confidence,
+        mentioned, sentiment, sentimentScore: avgSentimentScore, sentimentTopic, confidence,
         position: avgPosition,
         sourceType: results[0].sourceType,
         crossValidated: null,

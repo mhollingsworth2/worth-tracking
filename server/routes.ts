@@ -6,7 +6,7 @@ import {
   businesses, platforms, searchRecords, optimizedPrompts, referrals,
   competitors, aiSnapshots, alerts, contentGaps, locations,
   apiKeys, scanJobs, apiUsage, apiSettings, clickEvents,
-  users, userBusinesses, agencySettings, platformHealth, citations, loginSchema,
+  users, userBusinesses, agencySettings, platformHealth, citations, botVisits, geoActions, loginSchema,
   insertBusinessSchema, insertSearchRecordSchema,
   insertCompetitorSchema, insertAlertSchema, insertLocationSchema,
 } from "@shared/schema";
@@ -273,6 +273,174 @@ async function generateContentGaps(businessId: number) {
   } catch (err: any) {
     console.error(`[ContentGaps] Error generating gaps for business #${businessId}:`, err.message);
   }
+}
+
+// ── Query Categorization Helper ──────────────────────────────────────────────
+function categorizeQuery(query: string): string {
+  const lq = query.toLowerCase();
+  if (lq.includes("buy") || lq.includes("hire") || lq.includes("cost") || lq.includes("price") || lq.includes("best") || lq.includes("top") || lq.includes("recommend")) return "purchase_intent";
+  if (lq.includes("vs ") || lq.includes("compare") || lq.includes("alternative")) return "comparison";
+  if (lq.includes("review") || lq.includes("reputation") || lq.includes("rating")) return "reputation";
+  if (lq.includes("near") || lq.includes("in ") || lq.includes("local")) return "local";
+  if (lq.includes("how") || lq.includes("what") || lq.includes("tips") || lq.includes("guide")) return "educational";
+  return "general";
+}
+
+// ── GEO Roadmap Action Generator ────────────────────────────────────────────
+// Turns content gaps and scan data into a prioritized action queue split into
+// Owned Media (create content) and Earned Media (get listed/mentioned).
+async function generateGeoActions(businessId: number) {
+  const biz = await storage.getBusiness(businessId);
+  if (!biz) return;
+
+  const gaps = await storage.getContentGaps(businessId);
+  const records = db.select().from(searchRecords)
+    .where(sql`business_id = ${businessId} AND competitor_id IS NULL`)
+    .all();
+  const allCitations = db.select().from(citations).where(sql`business_id = ${businessId}`).all();
+
+  // Clear old actions
+  db.delete(geoActions).where(sql`business_id = ${businessId}`).run();
+  const now = new Date().toISOString();
+  const actions: { actionType: string; title: string; description: string; category: string; opportunityScore: string; relatedQuery: string | null }[] = [];
+
+  // ── Owned Media actions from content gaps ──
+  for (const gap of gaps) {
+    const priority = gap.priority === "high" ? "high" : "medium";
+    actions.push({
+      actionType: "owned_media",
+      title: `Create ${gap.contentType.replace(/_/g, " ")} for "${gap.query}"`,
+      description: gap.recommendedContent,
+      category: gap.category,
+      opportunityScore: priority,
+      relatedQuery: gap.query,
+    });
+  }
+
+  // ── Check for missing schema markup ──
+  if (biz.website) {
+    try {
+      let fullUrl = biz.website.trim();
+      if (!fullUrl.startsWith("http")) fullUrl = "https://" + fullUrl;
+      const r = await fetch(fullUrl, {
+        headers: { "User-Agent": "Mozilla/5.0 (compatible; WorthTracking/1.0)", Accept: "text/html" },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (r.ok) {
+        const html = await r.text();
+        if (!html.includes("application/ld+json")) {
+          actions.push({
+            actionType: "owned_media",
+            title: "Add JSON-LD schema markup to your website",
+            description: "AI platforms strongly prefer websites with structured data. Add LocalBusiness, FAQPage, and AggregateRating schema to help AI understand your business.",
+            category: "Schema",
+            opportunityScore: "high",
+            relatedQuery: null,
+          });
+        }
+        if (!html.includes("FAQPage") && !html.includes("faqpage")) {
+          actions.push({
+            actionType: "owned_media",
+            title: "Create an FAQ page with FAQ schema",
+            description: "FAQ content is one of the most frequently cited content types by AI platforms. Create a comprehensive FAQ page and add FAQPage schema markup.",
+            category: "Content",
+            opportunityScore: "high",
+            relatedQuery: null,
+          });
+        }
+      }
+    } catch { /* skip */ }
+  }
+
+  // ── Earned Media actions ──
+  const bizDomain = biz.website?.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "") || "";
+  const ownCitationCount = allCitations.filter(c => c.isOwnDomain).length;
+  const totalCitations = allCitations.length;
+
+  if (totalCitations > 0 && ownCitationCount / totalCitations < 0.1) {
+    actions.push({
+      actionType: "earned_media",
+      title: "Increase your citation rate — only " + Math.round((ownCitationCount / totalCitations) * 100) + "% of AI citations link to you",
+      description: "AI platforms are citing other sources instead of your website. Focus on building authoritative, citable content and getting listed on directories and industry sites that AI platforms trust.",
+      category: "Citations",
+      opportunityScore: "high",
+      relatedQuery: null,
+    });
+  }
+
+  // Check top cited domains — if competitors dominate, suggest outreach
+  const domainCounts = new Map<string, number>();
+  for (const c of allCitations) {
+    if (!c.isOwnDomain) {
+      domainCounts.set(c.domain, (domainCounts.get(c.domain) ?? 0) + 1);
+    }
+  }
+  const topExternal = [...domainCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3);
+  for (const [domain, count] of topExternal) {
+    if (count >= 3 && !domain.includes("wikipedia") && !domain.includes("google")) {
+      actions.push({
+        actionType: "earned_media",
+        title: `Get listed on ${domain} (cited ${count} times by AI)`,
+        description: `AI platforms frequently cite ${domain} when answering queries about your industry. Ensure your business is listed or mentioned on this site, or pitch a guest article / listing.`,
+        category: "Directory",
+        opportunityScore: count >= 5 ? "high" : "medium",
+        relatedQuery: null,
+      });
+    }
+  }
+
+  // Check for Reddit/forum mentions
+  const redditCitations = allCitations.filter(c => c.domain.includes("reddit.com")).length;
+  if (redditCitations >= 2) {
+    actions.push({
+      actionType: "earned_media",
+      title: "Engage on Reddit — AI platforms cite it heavily",
+      description: `Reddit was cited ${redditCitations} times in AI responses about your industry. Monitor relevant subreddits, provide helpful answers, and build your brand presence there.`,
+      category: "Community",
+      opportunityScore: "medium",
+      relatedQuery: null,
+    });
+  }
+
+  // Platform-specific weak spots
+  const platformMentionRates = new Map<string, { mentioned: number; total: number }>();
+  for (const r of records) {
+    const platNames: Record<number, string> = { 1: "ChatGPT", 2: "Perplexity", 3: "Google Gemini", 4: "Claude" };
+    const name = platNames[r.platformId] ?? `Platform ${r.platformId}`;
+    if (!platformMentionRates.has(name)) platformMentionRates.set(name, { mentioned: 0, total: 0 });
+    const p = platformMentionRates.get(name)!;
+    p.total++;
+    if (r.mentioned) p.mentioned++;
+  }
+  for (const [platform, data] of platformMentionRates) {
+    if (data.total >= 5 && data.mentioned / data.total < 0.2) {
+      actions.push({
+        actionType: "owned_media",
+        title: `Improve visibility on ${platform} (only ${Math.round(data.mentioned / data.total * 100)}% mention rate)`,
+        description: `${platform} rarely mentions your business. Focus on the content signals ${platform} values — structured data, authoritative content, and third-party citations.`,
+        category: "Platform",
+        opportunityScore: "high",
+        relatedQuery: null,
+      });
+    }
+  }
+
+  // Store actions
+  for (const a of actions.slice(0, 25)) {
+    db.insert(geoActions).values({
+      businessId,
+      actionType: a.actionType,
+      title: a.title,
+      description: a.description,
+      category: a.category,
+      opportunityScore: a.opportunityScore,
+      status: "pending",
+      relatedQuery: a.relatedQuery,
+      createdAt: now,
+    }).run();
+  }
+
+  console.log(`[GEO Actions] Generated ${Math.min(actions.length, 25)} actions for business #${businessId}`);
 }
 
 // ── Ranking Drop Alert System ────────────────────────────────────────────────
@@ -584,6 +752,8 @@ async function autoScanBusiness(businessId: number) {
         crossValidated: result.crossValidated === null ? null : result.crossValidated ? 1 : 0,
         date: dateStr,
       });
+      // Store granular sentiment data
+      db.run(sql`UPDATE search_records SET sentiment_score = ${(result as any).sentimentScore ?? 50}, sentiment_topic = ${(result as any).sentimentTopic ?? 'general'} WHERE id = ${record.id}`);
 
       // Extract citations — prefer structured citedUrls from AI providers, fall back to regex
       const citedUrls: string[] = (result as any).citedUrls ?? [];
@@ -713,6 +883,7 @@ async function autoScanBusiness(businessId: number) {
             competitorId: comp.id,
             date: dateStr,
           });
+          db.run(sql`UPDATE search_records SET sentiment_score = ${(result as any).sentimentScore ?? 50}, sentiment_topic = ${(result as any).sentimentTopic ?? 'general'} WHERE id = ${compRecord.id}`);
 
           // Extract citations — prefer structured citedUrls, fall back to regex
           const compCitedUrls: string[] = (result as any).citedUrls ?? [];
@@ -765,6 +936,7 @@ async function autoScanBusiness(businessId: number) {
     await generateScanAlerts(businessId);
     await generateOptimizedPrompts(businessId);
     await generateContentGaps(businessId);
+    await generateGeoActions(businessId);
 
   } catch (err: any) {
     console.error(`[Auto-Scan] Error for business ${businessId}:`, err.message);
@@ -1072,6 +1244,33 @@ export async function registerRoutes(
     date TEXT NOT NULL
   )`);
 
+  db.run(sql`CREATE TABLE IF NOT EXISTS bot_visits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    business_id INTEGER NOT NULL,
+    bot_name TEXT NOT NULL,
+    page_url TEXT NOT NULL,
+    status_code INTEGER,
+    date TEXT NOT NULL,
+    timestamp TEXT NOT NULL
+  )`);
+
+  db.run(sql`CREATE TABLE IF NOT EXISTS geo_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    business_id INTEGER NOT NULL,
+    action_type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    category TEXT NOT NULL,
+    opportunity_score TEXT NOT NULL DEFAULT 'medium',
+    status TEXT NOT NULL DEFAULT 'pending',
+    related_query TEXT,
+    created_at TEXT NOT NULL
+  )`);
+
+  // Add sentiment_score and sentiment_topic columns to search_records
+  try { db.run(sql`ALTER TABLE search_records ADD COLUMN sentiment_score INTEGER DEFAULT 50`); } catch (_e) { /* exists */ }
+  try { db.run(sql`ALTER TABLE search_records ADD COLUMN sentiment_topic TEXT DEFAULT 'general'`); } catch (_e) { /* exists */ }
+
   console.log("[init] Core tables created successfully");
 
   // === DATABASE INDEXES for query performance ===
@@ -1090,6 +1289,10 @@ export async function registerRoutes(
     ON citations(business_id, date)`);
   db.run(sql`CREATE INDEX IF NOT EXISTS idx_citations_business_domain
     ON citations(business_id, domain)`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_bot_visits_business_date
+    ON bot_visits(business_id, date)`);
+  db.run(sql`CREATE INDEX IF NOT EXISTS idx_geo_actions_business_status
+    ON geo_actions(business_id, status)`);
   console.log("[init] Database indexes created successfully");
 
   // Ensure archive tables exist
@@ -2215,6 +2418,325 @@ Include 3-6 sections in the outline, each with 2-4 bullet points. Include 5-10 k
     });
   });
 
+  // === SENTIMENT ANALYTICS ===
+  app.get("/api/businesses/:id/sentiment", async (req, res) => {
+    const businessId = parseInt(req.params.id);
+    const records = db.select().from(searchRecords)
+      .where(sql`business_id = ${businessId} AND competitor_id IS NULL AND mentioned = 1`)
+      .all();
+
+    if (records.length === 0) return res.json({ overallScore: 50, topicBreakdown: [], trend: [], recentMentions: [] });
+
+    // Overall average sentiment score
+    const scores = records.map(r => (r as any).sentiment_score ?? (r as any).sentimentScore ?? 50);
+    const overallScore = Math.round(scores.reduce((a: number, b: number) => a + b, 0) / scores.length);
+
+    // Breakdown by topic
+    const topicMap = new Map<string, { scores: number[]; count: number }>();
+    for (const r of records) {
+      const topic = (r as any).sentiment_topic ?? (r as any).sentimentTopic ?? "general";
+      if (!topicMap.has(topic)) topicMap.set(topic, { scores: [], count: 0 });
+      const t = topicMap.get(topic)!;
+      t.scores.push((r as any).sentiment_score ?? (r as any).sentimentScore ?? 50);
+      t.count++;
+    }
+    const topicBreakdown = [...topicMap.entries()].map(([topic, data]) => ({
+      topic,
+      avgScore: Math.round(data.scores.reduce((a, b) => a + b, 0) / data.scores.length),
+      count: data.count,
+      sentiment: data.scores.reduce((a, b) => a + b, 0) / data.scores.length >= 65 ? "positive" : data.scores.reduce((a, b) => a + b, 0) / data.scores.length <= 35 ? "negative" : "neutral",
+    })).sort((a, b) => b.count - a.count);
+
+    // Trend over time (by date)
+    const dateMap = new Map<string, number[]>();
+    for (const r of records) {
+      if (!dateMap.has(r.date)) dateMap.set(r.date, []);
+      dateMap.get(r.date)!.push((r as any).sentiment_score ?? (r as any).sentimentScore ?? 50);
+    }
+    const trend = [...dateMap.entries()]
+      .map(([date, scores]) => ({ date, avgScore: Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) }))
+      .sort((a, b) => a.date.localeCompare(b.date))
+      .slice(-30);
+
+    // Recent strong mentions (positive or negative)
+    const recentMentions = records
+      .filter(r => {
+        const score = (r as any).sentiment_score ?? (r as any).sentimentScore ?? 50;
+        return score >= 75 || score <= 25;
+      })
+      .sort((a, b) => b.date.localeCompare(a.date))
+      .slice(0, 10)
+      .map(r => ({
+        query: r.query,
+        sentiment: r.sentiment,
+        sentimentScore: (r as any).sentiment_score ?? (r as any).sentimentScore ?? 50,
+        topic: (r as any).sentiment_topic ?? (r as any).sentimentTopic ?? "general",
+        date: r.date,
+      }));
+
+    res.json({ overallScore, topicBreakdown, trend, recentMentions });
+  });
+
+  // === GEO ROADMAP (Actionable Tasks) ===
+  app.get("/api/businesses/:id/geo-actions", async (req, res) => {
+    const businessId = parseInt(req.params.id);
+    const actions = db.select().from(geoActions)
+      .where(sql`business_id = ${businessId}`)
+      .all();
+    res.json(actions);
+  });
+
+  app.patch("/api/geo-actions/:id", async (req, res) => {
+    const actionId = parseInt(req.params.id);
+    const { status } = req.body;
+    if (!["pending", "in_progress", "done", "dismissed"].includes(status)) {
+      return res.status(400).json({ error: "Invalid status" });
+    }
+    db.run(sql`UPDATE geo_actions SET status = ${status} WHERE id = ${actionId}`);
+    res.json({ success: true });
+  });
+
+  app.post("/api/businesses/:id/generate-geo-actions", async (req, res) => {
+    const businessId = parseInt(req.params.id);
+    try {
+      await generateGeoActions(businessId);
+      const actions = db.select().from(geoActions).where(sql`business_id = ${businessId}`).all();
+      res.json(actions);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // === BOT CRAWLER ANALYTICS ===
+  app.get("/api/businesses/:id/bot-analytics", async (req, res) => {
+    const businessId = parseInt(req.params.id);
+    const visits = db.select().from(botVisits).where(sql`business_id = ${businessId}`).all();
+
+    // Group by bot
+    const botMap = new Map<string, { count: number; pages: Set<string>; lastSeen: string }>();
+    for (const v of visits) {
+      if (!botMap.has(v.botName)) botMap.set(v.botName, { count: 0, pages: new Set(), lastSeen: "" });
+      const b = botMap.get(v.botName)!;
+      b.count++;
+      b.pages.add(v.pageUrl);
+      if (v.date > b.lastSeen) b.lastSeen = v.date;
+    }
+
+    const bots = [...botMap.entries()].map(([name, data]) => ({
+      botName: name,
+      visitCount: data.count,
+      uniquePages: data.pages.size,
+      lastSeen: data.lastSeen,
+    })).sort((a, b) => b.visitCount - a.visitCount);
+
+    // Daily trend
+    const dayMap = new Map<string, number>();
+    for (const v of visits) {
+      dayMap.set(v.date, (dayMap.get(v.date) ?? 0) + 1);
+    }
+    const dailyTrend = [...dayMap.entries()]
+      .map(([date, count]) => ({ date, count }))
+      .sort((a, b) => a.date.localeCompare(b.date))
+      .slice(-30);
+
+    res.json({ totalVisits: visits.length, bots, dailyTrend, recentVisits: visits.slice(-20).reverse() });
+  });
+
+  // Ingest bot visits from website (called by embedded snippet or server log parser)
+  app.post("/api/businesses/:id/bot-visits", async (req, res) => {
+    const businessId = parseInt(req.params.id);
+    const { botName, pageUrl, statusCode } = req.body;
+    if (!botName || !pageUrl) return res.status(400).json({ error: "botName and pageUrl required" });
+    const now = new Date();
+    db.insert(botVisits).values({
+      businessId,
+      botName,
+      pageUrl,
+      statusCode: statusCode ?? null,
+      date: now.toISOString().split("T")[0],
+      timestamp: now.toISOString(),
+    }).run();
+    res.json({ success: true });
+  });
+
+  // === PROMPT VOLUME / AI SEARCH DEMAND ===
+  app.get("/api/businesses/:id/prompt-demand", async (req, res) => {
+    const businessId = parseInt(req.params.id);
+    const records = db.select().from(searchRecords)
+      .where(sql`business_id = ${businessId} AND competitor_id IS NULL`)
+      .all();
+
+    if (records.length === 0) return res.json({ queries: [] });
+
+    // Group by query — estimate "demand" by consistency of responses
+    const queryMap = new Map<string, { mentioned: number; total: number; platforms: Set<string>; dates: Set<string> }>();
+    for (const r of records) {
+      if (!queryMap.has(r.query)) queryMap.set(r.query, { mentioned: 0, total: 0, platforms: new Set(), dates: new Set() });
+      const q = queryMap.get(r.query)!;
+      q.total++;
+      if (r.mentioned) q.mentioned++;
+      // Get platform name from platformId
+      const platNames: Record<number, string> = { 1: "ChatGPT", 2: "Perplexity", 3: "Google Gemini", 4: "Claude" };
+      q.platforms.add(platNames[r.platformId] ?? `Platform ${r.platformId}`);
+      q.dates.add(r.date);
+    }
+
+    const queries = [...queryMap.entries()].map(([query, data]) => {
+      const mentionRate = Math.round((data.mentioned / data.total) * 100);
+      // Estimate popularity: queries that appear across more platforms and dates = higher demand
+      const platformCoverage = data.platforms.size / 4; // out of 4 platforms
+      const dateCoverage = data.dates.size;
+      const demandScore = Math.round(((platformCoverage * 50) + Math.min(dateCoverage * 10, 50)));
+
+      return {
+        query,
+        mentionRate,
+        totalResults: data.total,
+        platforms: [...data.platforms],
+        scanCount: data.dates.size,
+        estimatedDemand: demandScore >= 70 ? "high" : demandScore >= 40 ? "medium" : "low",
+        demandScore,
+        topic: categorizeQuery(query),
+      };
+    }).sort((a, b) => b.demandScore - a.demandScore);
+
+    res.json({ queries });
+  });
+
+  // === DATA EXPORT API (BI Integration) ===
+  app.get("/api/businesses/:id/export/json", async (req, res) => {
+    const businessId = parseInt(req.params.id);
+    const biz = await storage.getBusiness(businessId);
+    if (!biz) return res.status(404).json({ error: "Business not found" });
+
+    const records = await storage.getSearchRecords(businessId);
+    const stats = await storage.getSearchStats(businessId);
+    const gaps = await storage.getContentGaps(businessId);
+    const snaps = await storage.getAiSnapshots(businessId);
+    const allCitations = db.select().from(citations).where(sql`business_id = ${businessId}`).all();
+    const actions = db.select().from(geoActions).where(sql`business_id = ${businessId}`).all();
+
+    res.json({
+      exportDate: new Date().toISOString(),
+      business: biz,
+      stats,
+      records,
+      citations: allCitations,
+      contentGaps: gaps,
+      geoActions: actions,
+      snapshots: snaps.map(s => ({ ...s, responseText: s.responseText.substring(0, 500) })),
+    });
+  });
+
+  app.get("/api/businesses/:id/export/looker-csv", async (req, res) => {
+    const businessId = parseInt(req.params.id);
+    const records = await storage.getSearchRecords(businessId);
+    const biz = await storage.getBusiness(businessId);
+    if (!biz) return res.status(404).json({ error: "Business not found" });
+
+    const platNames: Record<number, string> = { 1: "ChatGPT", 2: "Perplexity", 3: "Google Gemini", 4: "Claude" };
+    const header = "date,query,platform,mentioned,position,sentiment,sentiment_score,sentiment_topic,confidence,source_type,cross_validated\n";
+    const rows = records.map(r =>
+      `${r.date},"${r.query.replace(/"/g, '""')}",${platNames[r.platformId] ?? r.platformId},${r.mentioned},${r.position ?? ""},${r.sentiment ?? ""},${(r as any).sentiment_score ?? (r as any).sentimentScore ?? ""},${(r as any).sentiment_topic ?? (r as any).sentimentTopic ?? ""},${r.confidence ?? ""},${r.sourceType ?? ""},${r.crossValidated ?? ""}`
+    ).join("\n");
+
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", `attachment; filename="${biz.name.replace(/[^a-zA-Z0-9]/g, "_")}_looker_data.csv"`);
+    res.send(header + rows);
+  });
+
+  // === CONTENT DRAFT SUGGESTIONS ===
+  app.get("/api/businesses/:id/content-drafts", async (req, res) => {
+    const businessId = parseInt(req.params.id);
+    const biz = await storage.getBusiness(businessId);
+    if (!biz) return res.status(404).json({ error: "Business not found" });
+    const gaps = await storage.getContentGaps(businessId);
+
+    const drafts = gaps.slice(0, 10).map(gap => {
+      const lq = gap.query.toLowerCase();
+      let outline: string[] = [];
+      let suggestedTitle = "";
+      let wordCount = 0;
+
+      if (gap.contentType === "blog_post") {
+        suggestedTitle = `${gap.query} — A Complete Guide by ${biz.name}`;
+        wordCount = 1200;
+        outline = [
+          `Introduction — Why "${gap.query}" matters`,
+          `What to look for when choosing ${biz.industry ?? "a provider"}`,
+          `How ${biz.name} approaches this (your unique value)`,
+          `Key factors: pricing, quality, experience, and reviews`,
+          `Customer testimonials and case studies`,
+          `FAQ section (3-5 common questions)`,
+          `Call to action — contact ${biz.name}`,
+        ];
+      } else if (gap.contentType === "landing_page") {
+        suggestedTitle = `${biz.name} — ${gap.query.replace(/best |top /gi, "")}`;
+        wordCount = 800;
+        outline = [
+          `Hero section with headline and CTA`,
+          `Services overview — what ${biz.name} offers`,
+          `Why choose ${biz.name} (differentiators)`,
+          `Pricing or "Get a Free Quote" section`,
+          `Customer reviews and star ratings`,
+          `Location and contact information`,
+          `Schema markup: LocalBusiness + Service`,
+        ];
+      } else if (gap.contentType === "faq") {
+        suggestedTitle = `Frequently Asked Questions — ${biz.name}`;
+        wordCount = 600;
+        outline = [
+          `What services does ${biz.name} offer?`,
+          `How much does ${gap.query.replace(/best |top /gi, "")} cost?`,
+          `What areas does ${biz.name} serve?`,
+          `What makes ${biz.name} different from competitors?`,
+          `How can I get started / get a quote?`,
+          `Add FAQPage schema markup for each Q&A pair`,
+        ];
+      } else if (gap.contentType === "schema_markup") {
+        suggestedTitle = "Schema Markup Implementation";
+        wordCount = 0;
+        outline = [
+          `Add LocalBusiness JSON-LD with name, address, phone, hours`,
+          `Add AggregateRating with your current review score`,
+          `Add Service schema for each service offered`,
+          `Add FAQPage schema if you have FAQ content`,
+          `Test with Google Rich Results Test tool`,
+        ];
+      } else {
+        suggestedTitle = `${gap.query} — ${biz.name}`;
+        wordCount = 800;
+        outline = [
+          `Introduction to the topic`,
+          `How ${biz.name} addresses this`,
+          `Key benefits and differentiators`,
+          `Customer proof points`,
+          `Call to action`,
+        ];
+      }
+
+      return {
+        gapId: gap.id,
+        query: gap.query,
+        category: gap.category,
+        priority: gap.priority,
+        contentType: gap.contentType,
+        suggestedTitle,
+        targetWordCount: wordCount,
+        outline,
+        seoTips: [
+          `Include "${gap.query}" naturally in the title and first paragraph`,
+          `Mention ${biz.name} and ${biz.location ?? "your location"} explicitly`,
+          `Add internal links to related service pages`,
+          `Include specific numbers, stats, and customer testimonials`,
+          `Write in natural language that AI models can easily cite`,
+        ],
+      };
+    });
+
+    res.json({ drafts });
+  });
+
   // === LOCATIONS ===
   app.get("/api/businesses/:id/locations", async (req, res) => {
     const id = parseInt(req.params.id);
@@ -2777,6 +3299,80 @@ Extract real information from the content. If a field isn't clear from the websi
       edgeScore = Math.min(100, edgeScore);
       categories.push({ name: "Competitive Edge", score: edgeScore, tips: edgeTips, details: edgeDetails.join(", ") });
 
+      // ── AI Crawlability & Citability ──
+      let crawlScore = 0;
+      const crawlTips: string[] = [];
+      const crawlDetails: string[] = [];
+
+      // Check robots.txt for AI bot access
+      if (websiteUrl) {
+        try {
+          let robotsUrl = websiteUrl.replace(/\/$/, "") + "/robots.txt";
+          if (!robotsUrl.startsWith("http")) robotsUrl = "https://" + robotsUrl;
+          const robotsRes = await fetch(robotsUrl, {
+            headers: { "User-Agent": "Mozilla/5.0 (compatible; WorthTracking/1.0)" },
+            signal: AbortSignal.timeout(5000),
+          });
+          if (robotsRes.ok) {
+            const robotsTxt = await robotsRes.text();
+            const robotsLower = robotsTxt.toLowerCase();
+            crawlScore += 10; crawlDetails.push("✓ robots.txt accessible");
+
+            // Check if AI bots are blocked
+            const aiBots = ["gptbot", "claudebot", "perplexitybot", "google-extended", "ccbot", "anthropic"];
+            const blockedBots = aiBots.filter(bot => robotsLower.includes(`user-agent: ${bot}`) && robotsLower.includes("disallow: /"));
+            if (blockedBots.length === 0) {
+              crawlScore += 30; crawlDetails.push("✓ No AI bots blocked");
+            } else {
+              crawlTips.push(`Your robots.txt blocks these AI crawlers: ${blockedBots.join(", ")}. Consider allowing them to index your content.`);
+            }
+
+            // Check for sitemap reference
+            if (robotsLower.includes("sitemap:")) {
+              crawlScore += 15; crawlDetails.push("✓ Sitemap referenced in robots.txt");
+            } else {
+              crawlTips.push("Add a sitemap reference to your robots.txt");
+            }
+          } else {
+            crawlTips.push("No robots.txt found — add one to guide AI crawlers");
+          }
+        } catch { crawlTips.push("Could not check robots.txt"); }
+      }
+
+      // Check if content is JS-heavy (bad for AI crawlers)
+      if (fullHtml) {
+        const scriptCount = (fullHtml.match(/<script/gi) || []).length;
+        const bodyTextRatio = websiteText.length / Math.max(fullHtml.length, 1);
+        if (bodyTextRatio > 0.15) {
+          crawlScore += 15; crawlDetails.push("✓ Good text-to-HTML ratio");
+        } else if (bodyTextRatio > 0.05) {
+          crawlDetails.push("Moderate text-to-HTML ratio");
+          crawlTips.push("Your site may be JS-heavy. Ensure key content is in server-rendered HTML, not loaded via JavaScript");
+        } else {
+          crawlTips.push("Very low text-to-HTML ratio — AI crawlers may not see your content. Use server-side rendering.");
+        }
+
+        // Check for conversational/citable content
+        const sentences = websiteText.split(/[.!?]+/).filter(s => s.trim().length > 20);
+        if (sentences.length >= 10) {
+          crawlScore += 15; crawlDetails.push(`✓ ${sentences.length} citable sentences found`);
+        } else {
+          crawlTips.push("Add more complete sentences — AI models cite well-structured, factual statements");
+        }
+
+        // Check for statistics (numbers + context = highly citable)
+        const statPatterns = /\d+%|\d+\s*(years?|clients?|customers?|projects?|locations?|employees?)/gi;
+        const statsFound = websiteText.match(statPatterns)?.length ?? 0;
+        if (statsFound >= 3) {
+          crawlScore += 15; crawlDetails.push(`✓ ${statsFound} statistics/numbers found (highly citable)`);
+        } else {
+          crawlTips.push("Add specific statistics (e.g., '15 years experience', '500+ customers') — these are highly cited by AI");
+        }
+      }
+
+      crawlScore = Math.min(100, crawlScore);
+      categories.push({ name: "AI Crawlability", score: crawlScore, tips: crawlTips, details: crawlDetails.join(", ") });
+
       // 3. Get latest scan stats for context
       const stats = await storage.getSearchStats(businessId);
 
@@ -2904,6 +3500,7 @@ Extract real information from the content. If a field isn't clear from the websi
           crossValidated: result.crossValidated === null ? null : result.crossValidated ? 1 : 0,
           date: dateStr,
         });
+        db.run(sql`UPDATE search_records SET sentiment_score = ${(result as any).sentimentScore ?? 50}, sentiment_topic = ${(result as any).sentimentTopic ?? 'general'} WHERE id = ${record.id}`);
 
         // Extract citations — prefer structured citedUrls, fall back to regex
         const autoScanCitedUrls: string[] = (result as any).citedUrls ?? [];
@@ -3029,6 +3626,7 @@ Extract real information from the content. If a field isn't clear from the websi
               competitorId: comp.id,
               date: dateStr,
             });
+            db.run(sql`UPDATE search_records SET sentiment_score = ${(result as any).sentimentScore ?? 50}, sentiment_topic = ${(result as any).sentimentTopic ?? 'general'} WHERE id = ${compRecord.id}`);
 
             // Extract citations — prefer structured citedUrls, fall back to regex
             const autoCompCitedUrls: string[] = (result as any).citedUrls ?? [];
@@ -3058,10 +3656,11 @@ Extract real information from the content. If a field isn't clear from the websi
         }
       }
 
-      // Generate alerts, prompts, and content gaps based on scan results
+      // Generate alerts, prompts, content gaps, and GEO actions based on scan results
       await generateScanAlerts(businessId);
       await generateOptimizedPrompts(businessId);
       await generateContentGaps(businessId);
+      await generateGeoActions(businessId);
 
       res.json({
         jobId: job.id,
