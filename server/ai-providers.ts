@@ -15,7 +15,7 @@ export interface AIQueryResult {
 }
 
 // Retry wrapper for transient failures (rate limits & server errors)
-const API_TIMEOUT_MS = 30_000; // 30s per API call — prevents hanging forever
+const API_TIMEOUT_MS = 20_000; // 20s per API call — most calls finish in <10s
 
 async function fetchWithRetry(url: string, options: RequestInit, maxRetries = 2): Promise<Response> {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -667,9 +667,8 @@ export async function verifyCitations(responseText: string, businessName: string
   // Also check short name variants (first word, last word) in case the page uses a shortened name
   const nameWords = nameLower.split(/\s+/).filter(w => w.length > 3);
 
-  const results: { url: string; valid: boolean; mentionsBusiness: boolean }[] = [];
-
-  for (const url of urls) {
+  // Fetch all URLs in parallel instead of sequentially
+  const results = await Promise.all(urls.map(async (url): Promise<{ url: string; valid: boolean; mentionsBusiness: boolean }> => {
     try {
       const res = await fetch(url, {
         method: "GET",
@@ -677,10 +676,8 @@ export async function verifyCitations(responseText: string, businessName: string
         signal: AbortSignal.timeout(8000),
         redirect: "follow",
       });
-      if (res.status >= 400) {
-        results.push({ url, valid: false, mentionsBusiness: false });
-        continue;
-      }
+      if (res.status >= 400) return { url, valid: false, mentionsBusiness: false };
+
       // Read page text, strip HTML tags, check for business name
       const html = await res.text();
       const text = html
@@ -693,11 +690,11 @@ export async function verifyCitations(responseText: string, businessName: string
       const mentionsBusiness = text.includes(nameLower) ||
         (nameWords.length >= 2 && nameWords.every(w => text.includes(w)));
 
-      results.push({ url, valid: true, mentionsBusiness });
+      return { url, valid: true, mentionsBusiness };
     } catch {
-      results.push({ url, valid: false, mentionsBusiness: false });
+      return { url, valid: false, mentionsBusiness: false };
     }
-  }
+  }));
 
   return {
     verified: results.filter(r => r.valid && r.mentionsBusiness).length,
@@ -1094,101 +1091,54 @@ export async function* runScan(
   extraTerms?: string[],
   businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }
 ): AsyncGenerator<AIQueryResult> {
-  const RUNS_PER_QUERY = 1; // Single run — deterministic text matching doesn't need averaging
+  // Process queries in batches of 2 concurrently — halves wall-clock time
+  // without hammering APIs the way a full parallel blast would.
+  const CONCURRENT_QUERIES = 2;
 
-  for (const query of queries) {
-    // Run all platforms × all runs in parallel for speed
-    const runPromises = Array.from({ length: RUNS_PER_QUERY }, (_, run) => {
-      const platformPromises = keys.map(async (key) => {
-        const fn = PROVIDER_FN[key.provider];
-        if (!fn) return null;
-        try {
-          const result = await fn(key.apiKey, query, businessName, extraTerms, businessContext);
-          if (isGenericResponse(result.responseText)) {
-            console.log(`[Scan] Generic response detected from ${result.platform} for "${query}" (run ${run + 1})`);
-            result.confidence = "low";
-          }
-          return result;
-        } catch (err: any) {
-          console.error(`[AI Scan] ${key.provider} run ${run + 1} failed for query "${query}":`, err.message);
-          return null;
+  async function runOneQuery(query: string): Promise<AIQueryResult[]> {
+    const platformPromises = keys.map(async (key) => {
+      const fn = PROVIDER_FN[key.provider];
+      if (!fn) return null;
+      try {
+        const result = await fn(key.apiKey, query, businessName, extraTerms, businessContext);
+        if (isGenericResponse(result.responseText)) {
+          console.log(`[Scan] Generic response detected from ${result.platform} for "${query}"`);
+          result.confidence = "low";
         }
-      });
-      return Promise.all(platformPromises).then(results => results.filter((r): r is AIQueryResult => r !== null));
+        return result;
+      } catch (err: any) {
+        console.error(`[AI Scan] ${key.provider} failed for query "${query}":`, err.message);
+        return null;
+      }
     });
 
-    // Race all platform calls against a per-query timeout.
-    // If the query stalls (e.g. one provider hangs past retries), skip it and
-    // move on — no API credits are wasted and the rest of the scan continues.
-    let allRuns: AIQueryResult[][];
-    try {
-      allRuns = await Promise.race([
-        Promise.all(runPromises),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error(`Query timed out after ${QUERY_TIMEOUT_MS / 1000}s`)), QUERY_TIMEOUT_MS)
-        ),
-      ]);
-    } catch (err: any) {
-      console.warn(`[Scan] Skipping query (${err.message}): "${query.substring(0, 80)}..."`);
-      continue; // skip to next query — scan continues normally
-    }
+    const raw = await Promise.race([
+      Promise.all(platformPromises),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`Query timed out after ${QUERY_TIMEOUT_MS / 1000}s`)), QUERY_TIMEOUT_MS)
+      ),
+    ]);
 
-    // Average results per platform across runs
-    const platformResults = new Map<string, AIQueryResult[]>();
-    for (const runResults of allRuns) {
-      for (const result of runResults) {
-        if (!platformResults.has(result.platform)) platformResults.set(result.platform, []);
-        platformResults.get(result.platform)!.push(result);
-      }
-    }
-
-    const averaged: AIQueryResult[] = [];
-    for (const [platform, results] of platformResults) {
-      if (results.length === 0) continue;
-
-      // Mentioned if ANY run detected the name (avoids false negatives from even-count majority vote)
-      const mentionedCount = results.filter(r => r.mentioned).length;
-      const mentioned = mentionedCount >= 1;
-
-      // Average position (only from runs where mentioned)
-      const positions = results.filter(r => r.mentioned && r.position !== null).map(r => r.position!);
-      const avgPosition = positions.length > 0 ? Math.round((positions.reduce((a, b) => a + b, 0) / positions.length) * 10) / 10 : null;
-
-      // Average sentiment score + majority vote on sentiment category
-      const avgSentimentScore = Math.round(results.reduce((sum, r) => sum + r.sentimentScore, 0) / results.length);
-      const sentimentCounts = { positive: 0, neutral: 0, negative: 0 };
-      for (const r of results) sentimentCounts[r.sentiment]++;
-      const sentiment = (Object.entries(sentimentCounts).sort((a, b) => b[1] - a[1])[0][0]) as "positive" | "neutral" | "negative";
-      const sentimentTopic = results[0].sentimentTopic;
-
-      // If runs disagree on mentioned, lower confidence
-      const allAgree = results.every(r => r.mentioned === mentioned);
-      let confidence = results[0].confidence;
-      if (!allAgree) confidence = confidence === "high" ? "medium" : "low";
-
-      // Use the longest response text (most informative)
-      const bestResponse = [...results].sort((a, b) => b.responseText.length - a.responseText.length)[0];
-
-      // Merge all cited URLs from all runs
-      const allCitedUrls = [...new Set(results.flatMap(r => r.citedUrls || []))];
-
-      averaged.push({
-        platform, query,
-        responseText: bestResponse.responseText,
-        mentioned, sentiment, sentimentScore: avgSentimentScore, sentimentTopic, confidence,
-        position: avgPosition,
-        sourceType: results[0].sourceType,
-        crossValidated: null,
-        citedUrls: allCitedUrls,
-      });
-    }
-
-    // Cross-validate the averaged batch, then yield
-    const validated = crossValidateResults(averaged);
+    const results = raw.filter((r): r is AIQueryResult => r !== null);
+    const validated = crossValidateResults(results);
     const mentionedInQuery = validated.filter(r => r.mentioned).length;
     console.log(`[Scan] Query "${query.substring(0, 60)}..." → ${mentionedInQuery}/${validated.length} platforms mentioned`);
-    for (const result of validated) {
-      yield result;
+    return validated;
+  }
+
+  // Slide a window of CONCURRENT_QUERIES over the query list
+  for (let i = 0; i < queries.length; i += CONCURRENT_QUERIES) {
+    const batch = queries.slice(i, i + CONCURRENT_QUERIES);
+    const batchResults = await Promise.allSettled(batch.map(q => runOneQuery(q)));
+
+    for (const outcome of batchResults) {
+      if (outcome.status === "rejected") {
+        console.warn(`[Scan] Skipping query (${outcome.reason?.message ?? "timeout"})`);
+        continue;
+      }
+      for (const result of outcome.value) {
+        yield result;
+      }
     }
   }
 }
