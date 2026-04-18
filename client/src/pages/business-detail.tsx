@@ -615,10 +615,6 @@ export default function BusinessDetail() {
               <Link2 className="w-3.5 h-3.5 mr-1.5" />
               Citations
             </TabsTrigger>
-            <TabsTrigger value="sentiment" data-testid="tab-sentiment">
-              <Activity className="w-3.5 h-3.5 mr-1.5" />
-              Sentiment
-            </TabsTrigger>
             <TabsTrigger value="geo-roadmap" data-testid="tab-geo-roadmap">
               <Crosshair className="w-3.5 h-3.5 mr-1.5" />
               GEO Roadmap
@@ -1123,11 +1119,6 @@ export default function BusinessDetail() {
           {/* ========== CITATIONS TAB ========== */}
           <TabsContent value="citations" className="space-y-6 mt-4">
             <CitationsSection businessId={id} />
-          </TabsContent>
-
-          {/* ========== SENTIMENT TAB ========== */}
-          <TabsContent value="sentiment" className="space-y-6 mt-4">
-            <SentimentSection businessId={id} />
           </TabsContent>
 
           {/* ========== GEO ROADMAP TAB ========== */}

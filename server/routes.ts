@@ -299,25 +299,27 @@ async function generateGeoActions(businessId: number) {
     .all();
   const allCitations = db.select().from(citations).where(sql`business_id = ${businessId}`).all();
 
+  // Load competitor domains so we never recommend "get listed on a competitor's site"
+  const comps = await storage.getCompetitors(businessId);
+  const competitorDomains = new Set(
+    comps
+      .map(c => (c.website ?? "").toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, ""))
+      .filter(Boolean)
+  );
+  // Also block the competitor names as domain substrings (e.g. "brightsmiles" matches "brightsmilesdental.com")
+  const competitorNameSlugs = comps.map(c => c.name.toLowerCase().replace(/[^a-z0-9]/g, ""));
+
   // Clear old actions
   db.delete(geoActions).where(sql`business_id = ${businessId}`).run();
   const now = new Date().toISOString();
   const actions: { actionType: string; title: string; description: string; category: string; opportunityScore: string; relatedQuery: string | null }[] = [];
 
-  // ── Owned Media actions from content gaps ──
-  for (const gap of gaps) {
-    const priority = gap.priority === "high" ? "high" : "medium";
-    actions.push({
-      actionType: "owned_media",
-      title: `Create ${gap.contentType.replace(/_/g, " ")} for "${gap.query}"`,
-      description: gap.recommendedContent,
-      category: gap.category,
-      opportunityScore: priority,
-      relatedQuery: gap.query,
-    });
-  }
+  // ── Fetch website HTML once — used for schema check AND existing-page detection ──
+  const bizDomain = biz.website?.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "") || "";
+  let existingPageKeywords = new Set<string>();
+  let hasSchema = false;
+  let hasFAQ = false;
 
-  // ── Check for missing schema markup ──
   if (biz.website) {
     try {
       let fullUrl = biz.website.trim();
@@ -328,81 +330,133 @@ async function generateGeoActions(businessId: number) {
       });
       if (r.ok) {
         const html = await r.text();
-        if (!html.includes("application/ld+json")) {
-          actions.push({
-            actionType: "owned_media",
-            title: "Add JSON-LD schema markup to your website",
-            description: "AI platforms strongly prefer websites with structured data. Add LocalBusiness, FAQPage, and AggregateRating schema to help AI understand your business.",
-            category: "Schema",
-            opportunityScore: "high",
-            relatedQuery: null,
-          });
-        }
-        if (!html.includes("FAQPage") && !html.includes("faqpage")) {
-          actions.push({
-            actionType: "owned_media",
-            title: "Create an FAQ page with FAQ schema",
-            description: "FAQ content is one of the most frequently cited content types by AI platforms. Create a comprehensive FAQ page and add FAQPage schema markup.",
-            category: "Content",
-            opportunityScore: "high",
-            relatedQuery: null,
-          });
+        hasSchema = html.includes("application/ld+json");
+        hasFAQ = html.includes("FAQPage") || html.includes("faqpage") ||
+                 /<a[^>]+href="[^"]*\/faq/i.test(html);
+
+        // Extract all internal hrefs to detect pages that already exist
+        const hrefRegex = /href="([^"#?]+)"/g;
+        let m: RegExpExecArray | null;
+        while ((m = hrefRegex.exec(html)) !== null) {
+          const href = m[1].toLowerCase();
+          if (href.startsWith("/") || href.includes(bizDomain)) {
+            // Break the path into words and store them as existing-page keywords
+            href.split(/[\/\-_\s]+/).filter(w => w.length > 3).forEach(w => existingPageKeywords.add(w));
+          }
         }
       }
-    } catch { /* skip */ }
+    } catch { /* skip — website unreachable */ }
   }
 
-  // ── Earned Media actions ──
-  const bizDomain = biz.website?.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "") || "";
+  // ── Content gap actions — detect if page likely already exists ──
+  for (const gap of gaps) {
+    const topicWords = gap.query.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+    const pageLikelyExists = topicWords.filter(w => existingPageKeywords.has(w)).length >= 2;
+
+    if (pageLikelyExists) {
+      // Page seems to exist — recommend optimizing it instead of creating it
+      actions.push({
+        actionType: "owned_media",
+        title: `Optimize existing "${gap.query}" page for AI visibility`,
+        description: `You likely already have content covering this topic. Strengthen it by adding structured data (Schema.org markup), a clear H1 that matches how users search, and specific facts/stats that AI can cite directly. ${gap.recommendedContent}`,
+        category: gap.category,
+        opportunityScore: gap.priority === "high" ? "medium" : "low",
+        relatedQuery: gap.query,
+      });
+    } else {
+      actions.push({
+        actionType: "owned_media",
+        title: `Create ${gap.contentType.replace(/_/g, " ")} for "${gap.query}"`,
+        description: gap.recommendedContent,
+        category: gap.category,
+        opportunityScore: gap.priority === "high" ? "high" : "medium",
+        relatedQuery: gap.query,
+      });
+    }
+  }
+
+  // ── Schema markup ──
+  if (!hasSchema) {
+    actions.push({
+      actionType: "owned_media",
+      title: "Add JSON-LD schema markup to your website",
+      description: "AI platforms strongly prefer websites with structured data. Add LocalBusiness, FAQPage, and AggregateRating schema to help AI understand and cite your business.",
+      category: "Schema",
+      opportunityScore: "high",
+      relatedQuery: null,
+    });
+  }
+
+  // ── FAQ page ──
+  if (!hasFAQ) {
+    actions.push({
+      actionType: "owned_media",
+      title: "Create an FAQ page with FAQPage schema",
+      description: "FAQ content is one of the most-cited content types by AI platforms. Create a page answering your most common customer questions and mark it up with FAQPage schema.",
+      category: "Content",
+      opportunityScore: "high",
+      relatedQuery: null,
+    });
+  }
+
+  // ── Citation rate ──
   const ownCitationCount = allCitations.filter(c => c.isOwnDomain).length;
   const totalCitations = allCitations.length;
-
   if (totalCitations > 0 && ownCitationCount / totalCitations < 0.1) {
     actions.push({
       actionType: "earned_media",
-      title: "Increase your citation rate — only " + Math.round((ownCitationCount / totalCitations) * 100) + "% of AI citations link to you",
-      description: "AI platforms are citing other sources instead of your website. Focus on building authoritative, citable content and getting listed on directories and industry sites that AI platforms trust.",
+      title: `Increase your citation rate — only ${Math.round((ownCitationCount / totalCitations) * 100)}% of AI citations link to you`,
+      description: "AI platforms are citing third-party sources instead of your website. Build authoritative content with specific facts, statistics, and expert quotes that AI can cite directly.",
       category: "Citations",
       opportunityScore: "high",
       relatedQuery: null,
     });
   }
 
-  // Check top cited domains — if competitors dominate, suggest outreach
+  // ── Top cited external domains — skip competitor sites and social/search platforms ──
+  const BLOCKED_DOMAIN_FRAGMENTS = [
+    "wikipedia", "google", "facebook", "instagram", "twitter", "linkedin",
+    "youtube", "tiktok", "bing", "yahoo", "apple", "amazon",
+  ];
   const domainCounts = new Map<string, number>();
   for (const c of allCitations) {
-    if (!c.isOwnDomain) {
+    if (!c.isOwnDomain && c.domain) {
       domainCounts.set(c.domain, (domainCounts.get(c.domain) ?? 0) + 1);
     }
   }
-  const topExternal = [...domainCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3);
+  const topExternal = [...domainCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5);
   for (const [domain, count] of topExternal) {
-    if (count >= 3 && !domain.includes("wikipedia") && !domain.includes("google")) {
-      actions.push({
-        actionType: "earned_media",
-        title: `Get listed on ${domain} (cited ${count} times by AI)`,
-        description: `AI platforms frequently cite ${domain} when answering queries about your industry. Ensure your business is listed or mentioned on this site, or pitch a guest article / listing.`,
-        category: "Directory",
-        opportunityScore: count >= 5 ? "high" : "medium",
-        relatedQuery: null,
-      });
-    }
+    if (count < 3) continue;
+    if (BLOCKED_DOMAIN_FRAGMENTS.some(f => domain.includes(f))) continue;
+    if (bizDomain && domain.includes(bizDomain)) continue;
+    // Skip competitor domains
+    if (competitorDomains.has(domain)) continue;
+    if (competitorNameSlugs.some(slug => slug.length > 4 && domain.replace(/[^a-z0-9]/g, "").includes(slug))) continue;
+
+    actions.push({
+      actionType: "earned_media",
+      title: `Get listed on ${domain} (cited ${count}× by AI)`,
+      description: `AI platforms cited ${domain} ${count} times when answering queries in your industry. Getting your business listed or featured there could directly improve how often AI recommends you.`,
+      category: "Directory",
+      opportunityScore: count >= 5 ? "high" : "medium",
+      relatedQuery: null,
+    });
   }
 
-  // Check for Reddit/forum mentions
+  // ── Reddit / forum engagement ──
   const redditCitations = allCitations.filter(c => c.domain.includes("reddit.com")).length;
   if (redditCitations >= 2) {
     actions.push({
       actionType: "earned_media",
       title: "Engage on Reddit — AI platforms cite it heavily",
-      description: `Reddit was cited ${redditCitations} times in AI responses about your industry. Monitor relevant subreddits, provide helpful answers, and build your brand presence there.`,
+      description: `Reddit appeared ${redditCitations} times in AI responses about your industry. Find relevant subreddits, answer questions helpfully, and build a reputation there — AI models frequently pull recommendations from Reddit threads.`,
       category: "Community",
       opportunityScore: "medium",
       relatedQuery: null,
     });
   }
 
-  // Platform-specific weak spots
+  // ── Platform-specific weak spots ──
   const platformMentionRates = new Map<string, { mentioned: number; total: number }>();
   for (const r of records) {
     const platNames: Record<number, string> = { 1: "ChatGPT", 2: "Perplexity", 3: "Google Gemini", 4: "Claude" };
@@ -416,8 +470,8 @@ async function generateGeoActions(businessId: number) {
     if (data.total >= 5 && data.mentioned / data.total < 0.2) {
       actions.push({
         actionType: "owned_media",
-        title: `Improve visibility on ${platform} (only ${Math.round(data.mentioned / data.total * 100)}% mention rate)`,
-        description: `${platform} rarely mentions your business. Focus on the content signals ${platform} values — structured data, authoritative content, and third-party citations.`,
+        title: `Improve visibility on ${platform} (${Math.round(data.mentioned / data.total * 100)}% mention rate)`,
+        description: `${platform} rarely includes your business in responses. Prioritize the content types that ${platform} cites most — detailed service pages, structured data, and third-party directory listings.`,
         category: "Platform",
         opportunityScore: "high",
         relatedQuery: null,
@@ -425,7 +479,7 @@ async function generateGeoActions(businessId: number) {
     }
   }
 
-  // Store actions
+  // Store up to 25 actions
   for (const a of actions.slice(0, 25)) {
     db.insert(geoActions).values({
       businessId,
