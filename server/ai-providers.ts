@@ -647,8 +647,20 @@ export async function verifyCitations(responseText: string, businessName: string
   irrelevant: number;
   urls: { url: string; valid: boolean; mentionsBusiness: boolean }[];
 }> {
+  // Domains that are AI infrastructure, not real external citations
+  const BLOCKED_CITATION_DOMAINS = [
+    "vertexaisearch.cloud.google.com",
+    "grounding-api.google.com",
+    "openai.com",
+    "anthropic.com",
+    "perplexity.ai",
+  ];
+
   const urlRegex = /https?:\/\/[^\s\)\]"'<>]+/g;
-  const urls = [...new Set(responseText.match(urlRegex) || [])].slice(0, 5);
+  const allUrls = [...new Set(responseText.match(urlRegex) || [])];
+  const urls = allUrls
+    .filter(u => !BLOCKED_CITATION_DOMAINS.some(d => u.includes(d)))
+    .slice(0, 5);
   if (urls.length === 0) return { verified: 0, failed: 0, irrelevant: 0, urls: [] };
 
   const nameLower = businessName.toLowerCase();
