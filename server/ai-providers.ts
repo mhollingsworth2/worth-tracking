@@ -942,6 +942,11 @@ function crossValidateResults(results: AIQueryResult[]): AIQueryResult[] {
   });
 }
 
+// Max time to wait for all platforms to respond to a single query.
+// If exceeded, the query is skipped entirely so the scan keeps moving.
+// Set to 2× the single-call timeout + buffer for the analysis sub-call.
+const QUERY_TIMEOUT_MS = 75_000; // 75s per query
+
 export async function* runScan(
   businessName: string,
   queries: string[],
@@ -972,7 +977,21 @@ export async function* runScan(
       return Promise.all(platformPromises).then(results => results.filter((r): r is AIQueryResult => r !== null));
     });
 
-    const allRuns = await Promise.all(runPromises);
+    // Race all platform calls against a per-query timeout.
+    // If the query stalls (e.g. one provider hangs past retries), skip it and
+    // move on — no API credits are wasted and the rest of the scan continues.
+    let allRuns: AIQueryResult[][];
+    try {
+      allRuns = await Promise.race([
+        Promise.all(runPromises),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`Query timed out after ${QUERY_TIMEOUT_MS / 1000}s`)), QUERY_TIMEOUT_MS)
+        ),
+      ]);
+    } catch (err: any) {
+      console.warn(`[Scan] Skipping query (${err.message}): "${query.substring(0, 80)}..."`);
+      continue; // skip to next query — scan continues normally
+    }
 
     // Average results per platform across runs
     const platformResults = new Map<string, AIQueryResult[]>();
