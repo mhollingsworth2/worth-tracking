@@ -540,32 +540,159 @@ export async function detectHallucinations(
     }
   }
 
+  // ── Check 6: AI-powered contradiction detection ───────────────────────
+  // Send known facts + AI response to a cheap model to catch hallucinations
+  // that regex can't catch (wrong phone, wrong services, invented awards, etc.)
+  try {
+    const aiIssues = await checkHallucinationsWithAI(businessFacts, responseText);
+    for (const issue of aiIssues) {
+      if (!issues.some(existing => existing.toLowerCase().includes(issue.toLowerCase().slice(0, 30)))) {
+        issues.push(issue);
+      }
+    }
+  } catch (err) {
+    console.error(`[Hallucination] AI check failed, using regex results only:`, (err as Error).message);
+  }
+
   console.log(`[Hallucination] "${businessFacts.name}": ${issues.length} issue(s) found`);
   return { hasHallucinations: issues.length > 0, issues };
 }
 
+async function checkHallucinationsWithAI(
+  businessFacts: { name: string; location: string | null; website: string | null; services: string | null },
+  responseText: string,
+): Promise<string[]> {
+  const openaiKey = process.env.OPENAI_API_KEY;
+  const anthropicKey = process.env.ANTHROPIC_API_KEY;
+  if (!openaiKey && !anthropicKey) return [];
+
+  // Only send a trimmed excerpt to keep costs low (first 1500 chars is usually enough)
+  const excerpt = responseText.slice(0, 1500);
+
+  const factSummary = [
+    `Business name: ${businessFacts.name}`,
+    businessFacts.location ? `Location: ${businessFacts.location}` : null,
+    businessFacts.website ? `Website: ${businessFacts.website}` : null,
+    businessFacts.services ? `Services/description: ${businessFacts.services}` : null,
+  ].filter(Boolean).join("\n");
+
+  const prompt = `You are a fact-checker. Given the verified business facts below and an AI-generated response excerpt, identify any DIRECT CONTRADICTIONS — claims in the response that clearly conflict with the known facts. Do NOT flag speculation, opinions, or missing info — only clear contradictions.
+
+Known facts:
+${factSummary}
+
+AI response excerpt:
+${excerpt}
+
+Reply with a JSON array of strings, each describing one contradiction. If none, reply with []. Example: ["Wrong city: response says Denver but business is in Chicago"].`;
+
+  try {
+    if (openaiKey) {
+      const res = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${openaiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          messages: [{ role: "user", content: prompt }],
+          temperature: 0,
+          max_tokens: 300,
+          response_format: { type: "json_object" },
+        }),
+        signal: AbortSignal.timeout(15000),
+      });
+      if (res.ok) {
+        const data = await res.json() as { choices: Array<{ message: { content: string } }> };
+        const raw = data.choices?.[0]?.message?.content ?? "[]";
+        // Model may return {"contradictions": [...]} or just [...]
+        const parsed = JSON.parse(raw);
+        const arr: string[] = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.contradictions) ? parsed.contradictions : []);
+        return arr.filter((s: unknown) => typeof s === "string" && s.length > 0);
+      }
+    } else if (anthropicKey) {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "x-api-key": anthropicKey,
+          "anthropic-version": "2023-06-01",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 300,
+          messages: [{ role: "user", content: prompt }],
+        }),
+        signal: AbortSignal.timeout(15000),
+      });
+      if (res.ok) {
+        const data = await res.json() as { content: Array<{ text: string }> };
+        const raw = data.content?.[0]?.text ?? "[]";
+        const jsonMatch = raw.match(/\[[\s\S]*\]/);
+        if (jsonMatch) {
+          const arr = JSON.parse(jsonMatch[0]);
+          return Array.isArray(arr) ? arr.filter((s: unknown) => typeof s === "string" && s.length > 0) : [];
+        }
+      }
+    }
+  } catch (err) {
+    console.error(`[checkHallucinationsWithAI] error:`, (err as Error).message);
+  }
+  return [];
+}
+
 // ── Citation Verification ──────────────────────────────────────────────────
-// For grounded platforms (Perplexity, Gemini), verify that cited URLs actually exist.
-export async function verifyCitations(responseText: string, businessName: string): Promise<{ verified: number; failed: number; urls: { url: string; valid: boolean }[] }> {
+// For grounded platforms (Perplexity, Gemini), verify cited URLs exist AND mention the business.
+export async function verifyCitations(responseText: string, businessName: string): Promise<{
+  verified: number;
+  failed: number;
+  irrelevant: number;
+  urls: { url: string; valid: boolean; mentionsBusiness: boolean }[];
+}> {
   const urlRegex = /https?:\/\/[^\s\)\]"'<>]+/g;
   const urls = [...new Set(responseText.match(urlRegex) || [])].slice(0, 5);
-  if (urls.length === 0) return { verified: 0, failed: 0, urls: [] };
+  if (urls.length === 0) return { verified: 0, failed: 0, irrelevant: 0, urls: [] };
 
-  const results: { url: string; valid: boolean }[] = [];
+  const nameLower = businessName.toLowerCase();
+  // Also check short name variants (first word, last word) in case the page uses a shortened name
+  const nameWords = nameLower.split(/\s+/).filter(w => w.length > 3);
+
+  const results: { url: string; valid: boolean; mentionsBusiness: boolean }[] = [];
+
   for (const url of urls) {
     try {
       const res = await fetch(url, {
-        method: "HEAD",
+        method: "GET",
         headers: { "User-Agent": "Mozilla/5.0 (compatible; WorthTracking/1.0)" },
-        signal: AbortSignal.timeout(5000),
+        signal: AbortSignal.timeout(8000),
         redirect: "follow",
       });
-      results.push({ url, valid: res.status < 400 });
+      if (res.status >= 400) {
+        results.push({ url, valid: false, mentionsBusiness: false });
+        continue;
+      }
+      // Read page text, strip HTML tags, check for business name
+      const html = await res.text();
+      const text = html
+        .replace(/<script[\s\S]*?<\/script>/gi, " ")
+        .replace(/<style[\s\S]*?<\/style>/gi, " ")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s+/g, " ")
+        .toLowerCase();
+
+      const mentionsBusiness = text.includes(nameLower) ||
+        (nameWords.length >= 2 && nameWords.every(w => text.includes(w)));
+
+      results.push({ url, valid: true, mentionsBusiness });
     } catch {
-      results.push({ url, valid: false });
+      results.push({ url, valid: false, mentionsBusiness: false });
     }
   }
-  return { verified: results.filter(r => r.valid).length, failed: results.filter(r => !r.valid).length, urls: results };
+
+  return {
+    verified: results.filter(r => r.valid && r.mentionsBusiness).length,
+    failed: results.filter(r => !r.valid).length,
+    irrelevant: results.filter(r => r.valid && !r.mentionsBusiness).length,
+    urls: results,
+  };
 }
 
 // ── Platform Health Tracking ────────────────────────────────────────────────

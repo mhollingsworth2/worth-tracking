@@ -878,7 +878,10 @@ async function autoScanBusiness(businessId: number) {
         checks.push(
           verifyCitations(result.responseText, biz.name).then(citationResult => {
             if (citationResult.failed > 0) {
-              issues.push(`Citation: ${citationResult.failed} of ${citationResult.verified + citationResult.failed} cited URLs are broken/invalid`);
+              issues.push(`Citation: ${citationResult.failed} of ${citationResult.verified + citationResult.failed + citationResult.irrelevant} cited URLs are broken/invalid`);
+            }
+            if (citationResult.irrelevant > 0) {
+              issues.push(`Citation: ${citationResult.irrelevant} cited URL(s) are live but don't mention the business — possible hallucinated sources`);
             }
           }).catch(() => {})
         );
@@ -3634,7 +3637,10 @@ Extract real information from the content. If a field isn't clear from the websi
           checks.push(
             verifyCitations(result.responseText, business.name).then(citationResult => {
               if (citationResult.failed > 0) {
-                issues.push(`Citation: ${citationResult.failed} of ${citationResult.verified + citationResult.failed} cited URLs are broken/invalid`);
+                issues.push(`Citation: ${citationResult.failed} of ${citationResult.verified + citationResult.failed + citationResult.irrelevant} cited URLs are broken/invalid`);
+              }
+              if (citationResult.irrelevant > 0) {
+                issues.push(`Citation: ${citationResult.irrelevant} cited URL(s) are live but don't mention the business — possible hallucinated sources`);
               }
             }).catch(() => {})
           );
