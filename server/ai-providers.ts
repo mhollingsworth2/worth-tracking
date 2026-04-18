@@ -11,6 +11,7 @@ export interface AIQueryResult {
   sourceType: "grounded" | "knowledge";
   crossValidated: boolean | null; // null = not yet validated (single-platform)
   citedUrls: string[]; // URLs cited by the AI platform as sources
+  actualCost?: number; // real cost computed from token usage (when available)
 }
 
 // Retry wrapper for transient failures (rate limits & server errors)
@@ -72,15 +73,290 @@ export function setAnalysisKeys(keys: { provider: string; apiKey: string }[]) {
   analysisKeys = keys;
 }
 
-// ── Deterministic text-based analysis ──────────────────────────────────────
-// Simple and reliable: if the business name is in the response, it's mentioned.
-// Only exception: pure refusal responses where the AI says nothing useful.
-function analyzeWithAI(businessName: string, query: string, responseText: string, _businessContext?: any): AnalysisResult {
+// ── Topic classifier (deterministic, no AI needed) ────────────────────────
+function classifyTopic(queryLower: string): string {
+  if (queryLower.includes("buy") || queryLower.includes("purchase") || queryLower.includes("hire") ||
+      queryLower.includes("cost") || queryLower.includes("price") || queryLower.includes("worth it") ||
+      queryLower.includes("should i") || queryLower.includes("best") || queryLower.includes("top") ||
+      queryLower.includes("recommend")) return "purchase_intent";
+  if (queryLower.includes("vs ") || queryLower.includes("compare") || queryLower.includes("between") ||
+      queryLower.includes("alternative") || queryLower.includes("better than")) return "comparison";
+  if (queryLower.includes("review") || queryLower.includes("reputation") || queryLower.includes("rating") ||
+      queryLower.includes("experience with")) return "reputation";
+  if (queryLower.includes("near") || queryLower.includes(" in ") || queryLower.includes("local") ||
+      queryLower.includes("city") || queryLower.includes("area")) return "local";
+  if (queryLower.includes("how") || queryLower.includes("what is") || queryLower.includes("tips") ||
+      queryLower.includes("guide") || queryLower.includes("explain")) return "educational";
+  return "general";
+}
+
+// ── Negation detection ────────────────────────────────────────────────────
+// Returns true if the word at `keywordStart` in `text` is preceded by a
+// negation word within ~40 characters (roughly 5-7 words).
+function isNegated(text: string, keywordStart: number): boolean {
+  const negations = [
+    "not ", "never ", "no ", "isn't ", "aren't ", "wasn't ", "weren't ",
+    "doesn't ", "don't ", "didn't ", "won't ", "can't ", "cannot ", "hardly ",
+    "barely ", "scarcely ", "without ", "lack of ", "far from ",
+  ];
+  const window = text.slice(Math.max(0, keywordStart - 45), keywordStart);
+  return negations.some(neg => window.endsWith(neg) || window.includes(neg));
+}
+
+// ── AI-powered mention & sentiment analysis ────────────────────────────────
+// Uses a cheap AI model (gpt-4o-mini or claude-haiku) to accurately classify
+// mentions and sentiment — handles negation, sarcasm, and negative framing
+// that pure keyword matching misses.
+async function callAnalysisAI(businessName: string, query: string, responseText: string): Promise<AnalysisResult | null> {
+  if (analysisKeys.length === 0) return null;
+
+  // Prefer cheapest provider for analysis (no web search needed — just text classification)
+  const preferenceOrder = ["openai", "google", "perplexity", "anthropic"];
+  const key = preferenceOrder.map(p => analysisKeys.find(k => k.provider === p)).find(Boolean) ?? analysisKeys[0];
+  if (!key) return null;
+
+  // Truncate to ~750 tokens to keep cost minimal
+  const truncated = responseText.length > 3000 ? responseText.substring(0, 3000) + "..." : responseText;
+
+  const prompt = `Analyze this AI chatbot response to classify whether a business is mentioned and with what sentiment.
+
+Business name: "${businessName}"
+Query asked: "${query}"
+Chatbot response:
+---
+${truncated}
+---
+
+Reply with JSON only (no markdown):
+{
+  "mentioned": true or false,
+  "mentionContext": "positive_recommendation" | "negative_warning" | "neutral_mention" | "echo_only" | "not_mentioned",
+  "sentiment": "positive" | "neutral" | "negative",
+  "sentimentScore": 0-100,
+  "confidence": "high" | "medium" | "low",
+  "position": null or integer
+}
+
+Rules:
+- mentioned=true: business is genuinely discussed (even negatively)
+- mentioned=false: name only echoed from query without real discussion, OR not present
+- echo_only → mentioned=false (AI just quoted the query without discussing the business)
+- negative_warning: mentioned with complaints/warnings/avoid language → mentioned=true, sentiment=negative
+- sentimentScore: 0=very negative, 50=neutral, 100=very positive
+- position: integer list position if in a numbered/bulleted list, else null
+- confidence=high: AI independently mentioned business; medium: business was in query; low: ambiguous`;
+
+  try {
+    let result: any;
+
+    if (key.provider === "openai") {
+      const res = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${key.apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          max_tokens: 200,
+          response_format: { type: "json_object" },
+          messages: [{ role: "user", content: prompt }],
+        }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!res.ok) throw new Error(`OpenAI analysis ${res.status}`);
+      const data = await res.json();
+      result = JSON.parse(data.choices?.[0]?.message?.content || "{}");
+
+    } else if (key.provider === "anthropic") {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "x-api-key": key.apiKey, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 200,
+          messages: [{ role: "user", content: prompt }],
+        }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!res.ok) throw new Error(`Anthropic analysis ${res.status}`);
+      const data = await res.json();
+      const text = data.content?.filter((b: any) => b.type === "text").map((b: any) => b.text).join("") || "";
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      result = JSON.parse(jsonMatch?.[0] || "{}");
+
+    } else if (key.provider === "google") {
+      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${key.apiKey}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { responseMimeType: "application/json", maxOutputTokens: 200 },
+        }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!res.ok) throw new Error(`Google analysis ${res.status}`);
+      const data = await res.json();
+      const text = data.candidates?.[0]?.content?.parts?.map((p: any) => p.text).join("") || "";
+      result = JSON.parse(text);
+
+    } else if (key.provider === "perplexity") {
+      const res = await fetch("https://api.perplexity.ai/chat/completions", {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${key.apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "sonar-pro",
+          max_tokens: 200,
+          messages: [{ role: "user", content: prompt }],
+        }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!res.ok) throw new Error(`Perplexity analysis ${res.status}`);
+      const data = await res.json();
+      const text = data.choices?.[0]?.message?.content || "";
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      result = JSON.parse(jsonMatch?.[0] || "{}");
+    }
+
+    if (!result || typeof result.mentioned !== "boolean") return null;
+
+    const mentioned = result.mentioned;
+    const sentiment: "positive" | "neutral" | "negative" =
+      ["positive", "neutral", "negative"].includes(result.sentiment) ? result.sentiment : "neutral";
+    const sentimentScore = typeof result.sentimentScore === "number"
+      ? Math.max(0, Math.min(100, Math.round(result.sentimentScore))) : 50;
+    const confidence: "high" | "medium" | "low" =
+      ["high", "medium", "low"].includes(result.confidence) ? result.confidence : "medium";
+    const position = typeof result.position === "number" && result.position > 0
+      ? Math.round(result.position) : null;
+
+    console.log(`[Analysis AI] "${businessName}" → mentioned:${mentioned} sentiment:${sentiment}(${sentimentScore}) confidence:${confidence} context:${result.mentionContext ?? "?"}`);
+    return { mentioned, sentiment, sentimentScore, sentimentTopic: "general", confidence, position };
+
+  } catch (err: any) {
+    console.warn(`[Analysis AI] Failed (${key.provider}): ${err.message} — falling back to deterministic`);
+    return null;
+  }
+}
+
+// ── Deterministic fallback analysis ──────────────────────────────────────
+// Used when AI analysis keys are unavailable or the AI call fails.
+// Includes negation detection and negative-framing detection for better accuracy.
+function deterministicAnalysis(
+  businessName: string,
+  lower: string,
+  queryLower: string,
+  queryContainsName: boolean,
+  searchVariants: string[],
+  sentimentTopic: string,
+  responseLength: number,
+): AnalysisResult {
+  // ── Mention detection ──────────────────────────────────────────────────
+  const nameFoundInResponse = searchVariants.some(v => lower.includes(v));
+  let mentioned = false;
+  if (nameFoundInResponse) {
+    const pureRefusals = [
+      "i don't have specific information",
+      "i don't have any information",
+      "no verified information available",
+      "i'm not familiar with this business",
+    ];
+    const isPureRefusal = responseLength < 300 && pureRefusals.some(r => lower.includes(r));
+    mentioned = !isPureRefusal;
+  }
+
+  // ── Position detection ──────────────────────────────────────────────────
+  let position: number | null = null;
+  if (mentioned) {
+    // We need the original (non-lowered) text for line parsing; reconstruct from lower is fine for positions
+    const lines = lower.split("\n");
+    let listIndex = 0;
+    for (const line of lines) {
+      const listMatch = line.match(/^[\s]*(?:(\d+)[.\):\-]|\*|\-|•)\s/);
+      if (listMatch) {
+        listIndex++;
+        if (searchVariants.some(v => line.includes(v))) {
+          position = listMatch[1] ? parseInt(listMatch[1]) : listIndex;
+          break;
+        }
+      }
+    }
+  }
+
+  // ── Sentiment with negation detection ─────────────────────────────────
+  let sentiment: "positive" | "neutral" | "negative" = "neutral";
+  let sentimentScore = 50;
+
+  if (mentioned) {
+    const matchedVariant = searchVariants.find(v => lower.includes(v))!;
+    const nameIndex = lower.indexOf(matchedVariant);
+    const context = lower.slice(Math.max(0, nameIndex - 200), Math.min(lower.length, nameIndex + 500));
+
+    // Explicit negative framing near the business name → force negative regardless of other words
+    const negativeFraming = [
+      "avoid", "beware", "warning:", "do not use", "don't use", "stay away",
+      "would not recommend", "wouldn't recommend", "don't recommend",
+      "not recommend", "terrible experience", "poor service", "worst",
+    ];
+    if (negativeFraming.some(f => context.includes(f))) {
+      sentimentScore = 15;
+      sentiment = "negative";
+    } else {
+      const strongPositive = ["highly recommend", "excellent", "outstanding", "exceptional", "best choice",
+        "top-rated", "industry leader", "go-to", "first choice", "can't go wrong"];
+      const mildPositive = ["recommend", "great", "good", "reliable", "professional", "quality",
+        "reputable", "well-known", "popular", "trusted", "solid", "experienced", "strong",
+        "impressive", "thorough", "praised", "favorable", "dependable"];
+      const mildNegative = ["mixed reviews", "some complaints", "could improve", "not the cheapest",
+        "limited hours", "slow response", "inconsistent", "varying quality", "hit or miss"];
+      const strongNegative = ["avoid", "poor", "bad", "worst", "unreliable", "overpriced",
+        "unprofessional", "disappointing", "beware", "scam", "terrible", "horrible", "do not recommend"];
+
+      let score = 50;
+      // Score each keyword, accounting for negation (negated positive → mild negative, negated negative → mild positive)
+      for (const word of strongPositive) {
+        const idx = context.indexOf(word);
+        if (idx !== -1) score += isNegated(context, idx) ? -5 : 10;
+      }
+      for (const word of mildPositive) {
+        const idx = context.indexOf(word);
+        if (idx !== -1) score += isNegated(context, idx) ? -3 : 5;
+      }
+      for (const word of mildNegative) {
+        const idx = context.indexOf(word);
+        if (idx !== -1) score += isNegated(context, idx) ? 3 : -5;
+      }
+      for (const word of strongNegative) {
+        const idx = context.indexOf(word);
+        if (idx !== -1) score += isNegated(context, idx) ? 5 : -10;
+      }
+      sentimentScore = Math.max(0, Math.min(100, score));
+      if (sentimentScore >= 65) sentiment = "positive";
+      else if (sentimentScore <= 35) sentiment = "negative";
+      else sentiment = "neutral";
+    }
+  }
+
+  // ── Confidence ─────────────────────────────────────────────────────────
+  let confidence: "high" | "medium" | "low" = "medium";
+  if (mentioned && !queryContainsName) confidence = "high";
+  else if (mentioned && queryContainsName) confidence = "medium";
+  else {
+    const isGeneric = ["i don't have", "i cannot", "search google", "check yelp",
+      "i recommend checking", "you might want to search"].some(p => lower.includes(p));
+    confidence = isGeneric ? "low" : "high";
+  }
+
+  console.log(`[Analysis] "${businessName}" DETERMINISTIC ${mentioned ? "✓" : "✗"} | sentiment:${sentiment}(${sentimentScore}) confidence:${confidence}`);
+  return { mentioned, sentiment, sentimentScore, sentimentTopic, confidence, position };
+}
+
+// ── analyzeWithAI — main entry point ──────────────────────────────────────
+// 1. Fast path: if the name isn't in the response at all, skip AI call (free).
+// 2. Name found: use AI-powered analysis for accurate sentiment + mention classification.
+// 3. Fallback: deterministic analysis with negation detection if AI is unavailable.
+async function analyzeWithAI(businessName: string, query: string, responseText: string, _businessContext?: any): Promise<AnalysisResult> {
   const lower = responseText.toLowerCase();
   const nameLower = businessName.toLowerCase();
   const queryLower = query.toLowerCase();
 
-  // Build search variants: full name, and partial names (2+ word combos)
   const nameWords = nameLower.split(/\s+/).filter(w => w.length > 2);
   const searchVariants: string[] = [nameLower];
   if (nameWords.length >= 2) {
@@ -89,115 +365,28 @@ function analyzeWithAI(businessName: string, query: string, responseText: string
     }
   }
 
-  // Does the business name appear in the response text?
   const nameFoundInResponse = searchVariants.some(v => lower.includes(v));
   const queryContainsName = searchVariants.some(v => queryLower.includes(v));
+  const sentimentTopic = classifyTopic(queryLower);
 
-  // ── Mention detection — simple rule ─────────────────────────────────────
-  // If the name is in the response → mentioned.
-  // ONLY exception: the entire response is a short refusal with no substance.
-  let mentioned = false;
-
-  if (nameFoundInResponse) {
-    // Only reject if the response is PURELY a refusal — short and says nothing useful
-    const pureRefusals = [
-      "i don't have specific information",
-      "i don't have any information",
-      "no verified information available",
-      "i'm not familiar with this business",
-    ];
-    const isPureRefusal = responseText.length < 300 && pureRefusals.some(r => lower.includes(r));
-    mentioned = !isPureRefusal;
+  // ── Fast path: name not in response → not mentioned, no AI call needed ──
+  if (!nameFoundInResponse) {
+    const isGeneric = ["i don't have", "i cannot", "search google", "check yelp",
+      "i recommend checking", "you might want to search"].some(p => lower.includes(p));
+    console.log(`[Analysis] "${businessName}" NOT FOUND ✗ | responseLen:${responseText.length} | confidence:${isGeneric ? "low" : "high"}`);
+    return { mentioned: false, sentiment: "neutral", sentimentScore: 50, sentimentTopic, confidence: isGeneric ? "low" : "high", position: null };
   }
 
-  // ── Position detection ──────────────────────────────────────────────────
-  let position: number | null = null;
-  if (mentioned) {
-    const lines = responseText.split("\n");
-    let listIndex = 0;
-    for (const line of lines) {
-      const listMatch = line.match(/^[\s]*(?:(\d+)[.\):\-]|\*|\-|•)\s/);
-      if (listMatch) {
-        listIndex++;
-        const lineLower = line.toLowerCase();
-        if (searchVariants.some(v => lineLower.includes(v))) {
-          position = listMatch[1] ? parseInt(listMatch[1]) : listIndex;
-          break;
-        }
-      }
+  // ── AI-powered analysis (accurate sentiment, negation, sarcasm, echo detection) ──
+  if (analysisKeys.length > 0) {
+    const aiResult = await callAnalysisAI(businessName, query, responseText);
+    if (aiResult) {
+      return { ...aiResult, sentimentTopic };
     }
   }
 
-  // ── Topic classification ─────────────────────────────────────────────────
-  let sentimentTopic = "general";
-  const ql = queryLower;
-  if (ql.includes("buy") || ql.includes("purchase") || ql.includes("hire") || ql.includes("cost") || ql.includes("price") || ql.includes("worth it") || ql.includes("should i")) {
-    sentimentTopic = "purchase_intent";
-  } else if (ql.includes("vs ") || ql.includes("compare") || ql.includes("between") || ql.includes("alternative") || ql.includes("better than")) {
-    sentimentTopic = "comparison";
-  } else if (ql.includes("review") || ql.includes("reputation") || ql.includes("rating") || ql.includes("experience with")) {
-    sentimentTopic = "reputation";
-  } else if (ql.includes("near") || ql.includes("in ") || ql.includes("local") || ql.includes("city") || ql.includes("area")) {
-    sentimentTopic = "local";
-  } else if (ql.includes("how") || ql.includes("what is") || ql.includes("tips") || ql.includes("guide") || ql.includes("explain")) {
-    sentimentTopic = "educational";
-  } else if (ql.includes("best") || ql.includes("top") || ql.includes("recommend")) {
-    sentimentTopic = "purchase_intent";
-  }
-
-  // ── Sentiment analysis (granular 0-100 scoring) ────────────────────────
-  let sentiment: "positive" | "neutral" | "negative" = "neutral";
-  let sentimentScore = 50; // neutral baseline
-  if (mentioned) {
-    const strongPositive = ["highly recommend", "excellent", "outstanding", "exceptional", "best choice",
-      "top-rated", "industry leader", "go-to", "first choice", "can't go wrong"];
-    const mildPositive = ["recommend", "great", "good", "reliable", "professional", "quality",
-      "reputable", "well-known", "popular", "trusted", "solid", "experienced", "strong",
-      "impressive", "thorough", "praised", "favorable", "dependable"];
-    const mildNegative = ["mixed reviews", "some complaints", "could improve", "not the cheapest",
-      "limited hours", "slow response", "inconsistent", "varying quality", "hit or miss"];
-    const strongNegative = ["avoid", "poor", "bad", "worst", "unreliable", "overpriced",
-      "unprofessional", "disappointing", "beware", "scam", "terrible", "horrible", "do not recommend"];
-
-    const matchedVariant = searchVariants.find(v => lower.includes(v))!;
-    const nameIndex = lower.indexOf(matchedVariant);
-    const context = lower.slice(Math.max(0, nameIndex - 200), Math.min(lower.length, nameIndex + 500));
-
-    const strongPosCount = strongPositive.filter(w => context.includes(w)).length;
-    const mildPosCount = mildPositive.filter(w => context.includes(w)).length;
-    const mildNegCount = mildNegative.filter(w => context.includes(w)).length;
-    const strongNegCount = strongNegative.filter(w => context.includes(w)).length;
-
-    // Score: each strong word = 10 points, mild = 5 points
-    sentimentScore = 50 + (strongPosCount * 10) + (mildPosCount * 5) - (strongNegCount * 10) - (mildNegCount * 5);
-    sentimentScore = Math.max(0, Math.min(100, sentimentScore));
-
-    // Map to category
-    if (sentimentScore >= 65) sentiment = "positive";
-    else if (sentimentScore <= 35) sentiment = "negative";
-    else sentiment = "neutral";
-  } else {
-    sentimentScore = 50; // not mentioned = neutral
-  }
-
-  // ── Confidence ──────────────────────────────────────────────────────────
-  let confidence: "high" | "medium" | "low" = "medium";
-  if (mentioned && !queryContainsName) {
-    confidence = "high"; // AI independently brought up the business
-  } else if (mentioned && queryContainsName) {
-    confidence = "medium"; // Business was in query, so mention is less surprising
-  } else {
-    const isGeneric = ["i don't have", "i cannot", "search google", "check yelp",
-      "i recommend checking", "you might want to search"].some(p => lower.includes(p));
-    confidence = isGeneric ? "low" : "high";
-  }
-
-  console.log(`[Analysis] "${businessName}" ${mentioned ? "FOUND ✓" : "NOT FOUND ✗"} | queryHadName: ${queryContainsName} | nameInResponse: ${nameFoundInResponse} | responseLen: ${responseText.length} | position: ${position} | sentiment: ${sentiment}(${sentimentScore}) | topic: ${sentimentTopic} | confidence: ${confidence}`);
-  if (!mentioned && !nameFoundInResponse) {
-    console.log(`[Analysis] Response preview (first 200 chars): ${responseText.substring(0, 200).replace(/\n/g, " ")}`);
-  }
-
-  return { mentioned, sentiment, sentimentScore, sentimentTopic, confidence, position };
+  // ── Deterministic fallback ────────────────────────────────────────────────
+  return deterministicAnalysis(businessName, lower, queryLower, queryContainsName, searchVariants, sentimentTopic, responseText.length);
 }
 
 // ── Response Fingerprinting ──────────────────────────────────────────────
@@ -244,11 +433,9 @@ export function isGenericResponse(responseText: string): boolean {
 // After confirming a business IS mentioned, check if the AI fabricated any
 // facts about it (wrong location, made-up services, etc.)
 
-// ── Deterministic hallucination detection ─────────────────────────────────
-// The old approach used a knowledge-only AI to fact-check web-grounded responses,
-// which caused massive false positives (the checker couldn't verify real web data
-// and flagged it as "hallucinated"). Now we only check for direct contradictions
-// with known business facts — no AI needed, just text matching.
+// ── Hallucination Detection ────────────────────────────────────────────────
+// Checks for direct contradictions with known business facts using text matching.
+// Covers wrong location, wrong URL, identity confusion, and contradictory service claims.
 export async function detectHallucinations(
   businessFacts: {
     name: string;
@@ -260,63 +447,92 @@ export async function detectHallucinations(
   _platform: string,
 ): Promise<{ hasHallucinations: boolean; issues: string[] }> {
   const lower = responseText.toLowerCase();
+  const nameLower = businessFacts.name.toLowerCase();
   const issues: string[] = [];
 
-  // Check 1: If response mentions a DIFFERENT city/state than the known location
+  // ── Check 1: Wrong location claim ─────────────────────────────────────
   if (businessFacts.location) {
     const locParts = businessFacts.location.toLowerCase().split(",").map(s => s.trim());
     const city = locParts[0]; // e.g., "elmhurst"
-    const state = locParts[1]; // e.g., "il"
 
-    // Look for "located in [wrong city]" or "based in [wrong city]" patterns
-    const locationClaims = lower.match(/(?:located|based|headquartered|operates|serving)\s+(?:in|out of|from)\s+([a-z\s]+?)(?:[,.\n]|$)/g);
-    if (locationClaims) {
+    // Broader set of location-claim verbs and prepositions (case-insensitive via `lower`)
+    const locationClaims = lower.match(
+      /(?:located|based|headquartered|operates|operating|office|clinic|store|shop|practice|branch|serving)\s+(?:in|at|out of|from|near)\s+([a-z][a-z\s]{2,30?})(?:[,.\n]|$)/g
+    );
+    if (locationClaims && city) {
       for (const claim of locationClaims) {
-        const claimLower = claim.toLowerCase();
-        // Only flag if the claim mentions a specific city that contradicts ours
-        if (city && !claimLower.includes(city) && !claimLower.includes("area") && !claimLower.includes("region")) {
-          // Make sure it's actually naming a different place, not just a generic phrase
-          const hasSpecificPlace = /(?:located|based|headquartered|operates|serving)\s+(?:in|out of|from)\s+[A-Z]/.test(claim);
-          if (hasSpecificPlace) {
-            issues.push(`Response says "${claim.trim()}" but business is in ${businessFacts.location}`);
+        if (!claim.includes(city) && !claim.includes("area") && !claim.includes("region") &&
+            !claim.includes("nationwide") && !claim.includes("online")) {
+          // Verify the claim is actually naming a specific place (starts with a city-like word)
+          if (/[a-z]{3,}/.test(claim.replace(/(?:located|based|headquartered|operates|operating|office|clinic|store|shop|practice|branch|serving)\s+(?:in|at|out of|from|near)\s+/, ""))) {
+            issues.push(`Location mismatch: response says "${claim.trim()}" but business is in ${businessFacts.location}`);
           }
         }
       }
     }
   }
 
-  // Check 2: If response mentions a wrong website URL
+  // ── Check 2: Wrong website URL ────────────────────────────────────────
   if (businessFacts.website) {
-    const knownDomain = businessFacts.website.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "");
+    const knownDomain = businessFacts.website.toLowerCase()
+      .replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "");
     const urlRegex = /https?:\/\/[^\s\)\]"'<>]+/g;
     const urls = responseText.match(urlRegex) || [];
     for (const url of urls) {
       const urlDomain = url.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "");
-      // Only flag if the response attributes a different website to THIS business
-      if (urlDomain !== knownDomain && lower.includes(businessFacts.name.toLowerCase()) && lower.includes(urlDomain)) {
-        // Check if the URL is near the business name mention (within ~200 chars)
-        const nameIdx = lower.indexOf(businessFacts.name.toLowerCase());
-        const urlIdx = lower.indexOf(urlDomain);
-        if (Math.abs(nameIdx - urlIdx) < 200) {
-          issues.push(`Response links to ${urlDomain} but business website is ${knownDomain}`);
+      if (urlDomain === knownDomain) continue; // correct URL — not a hallucination
+      // Only flag if this URL is mentioned close to the business name
+      const nameIdx = lower.indexOf(nameLower);
+      const urlIdx = lower.indexOf(urlDomain);
+      if (nameIdx !== -1 && urlIdx !== -1 && Math.abs(nameIdx - urlIdx) < 250) {
+        issues.push(`URL mismatch: response links to ${urlDomain} but business website is ${knownDomain}`);
+      }
+    }
+  }
+
+  // ── Check 3: Identity confusion (renamed, "also known as") ────────────
+  const escapedName = nameLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const confusionPatterns = [
+    new RegExp(`${escapedName}[^.]{0,60}(?:also known as|formerly|now called|renamed to|rebranded as)\\s+([^,.]{3,40})`, "i"),
+  ];
+  for (const pattern of confusionPatterns) {
+    const match = responseText.match(pattern);
+    if (match) {
+      issues.push(`Identity confusion: "${match[0].trim()}"`);
+    }
+  }
+
+  // ── Check 4: Contradictory ownership/affiliation claims ────────────────
+  // Flags statements like "owned by [different company]" or "subsidiary of X" near the name
+  const affiliationPattern = new RegExp(
+    `${escapedName}[^.]{0,80}(?:owned by|subsidiary of|division of|part of|acquired by)\\s+([^,.]{3,50})`,
+    "i"
+  );
+  const affiliationMatch = responseText.match(affiliationPattern);
+  if (affiliationMatch) {
+    issues.push(`Affiliation claim: "${affiliationMatch[0].trim()}" — verify this is accurate`);
+  }
+
+  // ── Check 5: Wildly wrong hours/closure claims ────────────────────────
+  // If response says "permanently closed" or "out of business" for a known active business
+  const closurePatterns = [
+    /permanently closed/i, /out of business/i, /no longer operating/i, /has closed/i, /went out of business/i,
+  ];
+  for (const pattern of closurePatterns) {
+    if (pattern.test(responseText)) {
+      const matchResult = responseText.match(pattern);
+      // Only flag if this closure claim is near the business name
+      if (matchResult) {
+        const closureIdx = lower.indexOf(matchResult[0].toLowerCase());
+        const nameIdx = lower.indexOf(nameLower);
+        if (nameIdx !== -1 && closureIdx !== -1 && Math.abs(nameIdx - closureIdx) < 300) {
+          issues.push(`Closure claim: response says "${matchResult[0]}" — verify business is still active`);
         }
       }
     }
   }
 
-  // Check 3: If response confuses the business with a different company name entirely
-  const nameLower = businessFacts.name.toLowerCase();
-  const confusionPatterns = [
-    new RegExp(`${nameLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[^.]*(?:also known as|formerly|now called|renamed to)\\s+([^,.]+)`, "i"),
-  ];
-  for (const pattern of confusionPatterns) {
-    const match = responseText.match(pattern);
-    if (match) {
-      issues.push(`Response may confuse business identity: "${match[0].trim()}"`);
-    }
-  }
-
-  console.log(`[Hallucination] "${businessFacts.name}": ${issues.length} issues found`);
+  console.log(`[Hallucination] "${businessFacts.name}": ${issues.length} issue(s) found`);
   return { hasHallucinations: issues.length > 0, issues };
 }
 
@@ -408,10 +624,17 @@ async function queryOpenAI(apiKey: string, query: string, businessName: string, 
       citedUrls.push(...(responseText.match(urlRegex) || []));
     }
 
-    const analysis = analyzeWithAI(businessName, query, responseText, businessContext);
+    const analysis = await analyzeWithAI(businessName, query, responseText, businessContext);
+
+    // Compute actual cost from real token counts
+    const usage = data.usage ?? {};
+    const inputTokens: number = usage.input_tokens ?? usage.prompt_tokens ?? 0;
+    const outputTokens: number = usage.output_tokens ?? usage.completion_tokens ?? 0;
+    const pricing = TOKEN_PRICING["openai"];
+    const actualCost = (inputTokens * pricing.input) + (outputTokens * pricing.output) + pricing.toolCost;
 
     healthCallback?.("openai", "success", Date.now() - startTime);
-    return { platform: "ChatGPT", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null, citedUrls: [...new Set(citedUrls)] };
+    return { platform: "ChatGPT", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null, citedUrls: [...new Set(citedUrls)], actualCost };
   } catch (err: any) {
     healthCallback?.("openai", "error", Date.now() - startTime, err.message);
     throw err;
@@ -472,10 +695,16 @@ async function queryAnthropic(apiKey: string, query: string, businessName: strin
       citedUrls.push(...(responseText.match(urlRegex) || []));
     }
 
-    const analysis = analyzeWithAI(businessName, query, responseText, businessContext);
+    const analysis = await analyzeWithAI(businessName, query, responseText, businessContext);
+
+    const usage = data.usage ?? {};
+    const inputTokens: number = usage.input_tokens ?? 0;
+    const outputTokens: number = usage.output_tokens ?? 0;
+    const pricing = TOKEN_PRICING["anthropic"];
+    const actualCost = (inputTokens * pricing.input) + (outputTokens * pricing.output) + pricing.toolCost;
 
     healthCallback?.("anthropic", "success", Date.now() - startTime);
-    return { platform: "Claude", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null, citedUrls: [...new Set(citedUrls)] };
+    return { platform: "Claude", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null, citedUrls: [...new Set(citedUrls)], actualCost };
   } catch (err: any) {
     healthCallback?.("anthropic", "error", Date.now() - startTime, err.message);
     throw err;
@@ -487,7 +716,7 @@ async function queryGemini(apiKey: string, query: string, businessName: string, 
   try {
     // Google Search grounding — matches what real Gemini users see
     // No system instruction — real users don't have one
-    const res = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
+    const res = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${apiKey}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -524,10 +753,16 @@ async function queryGemini(apiKey: string, query: string, businessName: string, 
       citedUrls.push(...(responseText.match(urlRegex) || []));
     }
 
-    const analysis = analyzeWithAI(businessName, query, responseText, businessContext);
+    const analysis = await analyzeWithAI(businessName, query, responseText, businessContext);
+
+    const usageMeta = data.usageMetadata ?? {};
+    const inputTokens: number = usageMeta.promptTokenCount ?? 0;
+    const outputTokens: number = usageMeta.candidatesTokenCount ?? 0;
+    const pricing = TOKEN_PRICING["google"];
+    const actualCost = (inputTokens * pricing.input) + (outputTokens * pricing.output) + pricing.toolCost;
 
     healthCallback?.("google", "success", Date.now() - startTime);
-    return { platform: "Google Gemini", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null, citedUrls: [...new Set(citedUrls)] };
+    return { platform: "Google Gemini", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null, citedUrls: [...new Set(citedUrls)], actualCost };
   } catch (err: any) {
     healthCallback?.("google", "error", Date.now() - startTime, err.message);
     throw err;
@@ -573,10 +808,16 @@ async function queryPerplexity(apiKey: string, query: string, businessName: stri
       citedUrls.push(...(responseText.match(urlRegex) || []));
     }
 
-    const analysis = analyzeWithAI(businessName, query, responseText, businessContext);
+    const analysis = await analyzeWithAI(businessName, query, responseText, businessContext);
+
+    const usage = data.usage ?? {};
+    const inputTokens: number = usage.prompt_tokens ?? usage.input_tokens ?? 0;
+    const outputTokens: number = usage.completion_tokens ?? usage.output_tokens ?? 0;
+    const pricing = TOKEN_PRICING["perplexity"];
+    const actualCost = (inputTokens * pricing.input) + (outputTokens * pricing.output) + pricing.toolCost;
 
     healthCallback?.("perplexity", "success", Date.now() - startTime);
-    return { platform: "Perplexity", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null, citedUrls: [...new Set(citedUrls)] };
+    return { platform: "Perplexity", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null, citedUrls: [...new Set(citedUrls)], actualCost };
   } catch (err: any) {
     healthCallback?.("perplexity", "error", Date.now() - startTime, err.message);
     throw err;
@@ -597,13 +838,37 @@ const PROVIDER_PLATFORM: Record<string, string> = {
   perplexity: "Perplexity",
 };
 
-// Estimated cost per API call (input + output for ~1024 tokens)
-// These are conservative estimates based on 2026 pricing
+// Per-token pricing (input + output) plus fixed per-call tool costs (2026 rates).
+// Used to compute actual cost from real token counts returned by each API.
+const TOKEN_PRICING: Record<string, { input: number; output: number; toolCost: number }> = {
+  openai: {
+    input: 0.15 / 1_000_000,   // gpt-4o-mini: $0.15/1M input tokens
+    output: 0.60 / 1_000_000,  // gpt-4o-mini: $0.60/1M output tokens
+    toolCost: 0.025,            // web_search_preview: ~$25/1000 calls
+  },
+  anthropic: {
+    input: 3.0 / 1_000_000,    // claude-sonnet-4: $3/1M input tokens
+    output: 15.0 / 1_000_000,  // claude-sonnet-4: $15/1M output tokens
+    toolCost: 0.002,            // web_search tool overhead (estimated per use)
+  },
+  google: {
+    input: 0.10 / 1_000_000,   // gemini-2.0-flash-lite: $0.10/1M input tokens
+    output: 0.40 / 1_000_000,  // gemini-2.0-flash-lite: $0.40/1M output tokens
+    toolCost: 0.035,            // Google Search grounding: $35/1000 grounded queries
+  },
+  perplexity: {
+    input: 3.0 / 1_000_000,    // sonar-pro: $3/1M input tokens
+    output: 15.0 / 1_000_000,  // sonar-pro: $15/1M output tokens
+    toolCost: 0.0,              // web search included in per-token price
+  },
+};
+
+// Fallback flat-rate estimates used when token counts are unavailable.
 export const PROVIDER_COST_PER_CALL: Record<string, number> = {
-  openai: 0.025,      // gpt-4o-mini + web_search_preview ($25/1K calls)
-  anthropic: 0.008,   // claude-sonnet-4 + web_search tool
-  google: 0.004,      // gemini-2.0-flash + google_search grounding (~$14-35/1K)
-  perplexity: 0.005,  // sonar-pro (web search built-in)
+  openai: 0.025,
+  anthropic: 0.008,
+  google: 0.004,
+  perplexity: 0.005,
 };
 
 // ── Cross-Platform Validation ──────────────────────────────────────────────
@@ -612,7 +877,11 @@ export const PROVIDER_COST_PER_CALL: Record<string, number> = {
 // crossValidated = true (boosted confidence). Outliers get crossValidated = false
 // and their confidence is downgraded.
 function crossValidateResults(results: AIQueryResult[]): AIQueryResult[] {
-  if (results.length < 2) return results; // can't validate with <2 platforms
+  // Need at least 3 platforms for meaningful cross-validation — with only 2, a
+  // 50/50 split produces no majority and any "consensus" is misleading.
+  if (results.length < 3) {
+    return results.map(r => ({ ...r, crossValidated: null }));
+  }
 
   const mentionCount = results.filter(r => r.mentioned).length;
   const noMentionCount = results.length - mentionCount;

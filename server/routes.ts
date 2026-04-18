@@ -784,9 +784,8 @@ async function autoScanBusiness(businessId: number) {
         return pMap[k.provider] === result.platform;
       });
       if (providerKey) {
-        const baseCost = PROVIDER_COST_PER_CALL[providerKey.provider] ?? 0.005;
-        const analysisCost = 0.001; // follow-up analysis call is cheap (~256 tokens)
-        const cost = baseCost + analysisCost;
+        // Use actual token-based cost from result; fall back to flat-rate estimate
+        const cost = (result as any).actualCost ?? (PROVIDER_COST_PER_CALL[providerKey.provider] ?? 0.005);
         db.insert(apiUsage).values({
           provider: providerKey.provider,
           estimatedCost: cost.toFixed(6),
@@ -1656,18 +1655,24 @@ export async function registerRoutes(
   });
 
   // === BUSINESSES ===
+  // Mark demo businesses so frontends can warn users not to treat the data as real.
+  const DEMO_MARKER = "[DEMO]";
+  function withDemoFlag<T extends { description?: string | null }>(biz: T): T & { isDemo: boolean } {
+    return { ...biz, isDemo: (biz.description ?? "").includes(DEMO_MARKER) };
+  }
+
   app.get("/api/businesses", async (req, res) => {
     const allBiz = await storage.getBusinesses();
-    if (req.user?.role === "admin") return res.json(allBiz);
+    if (req.user?.role === "admin") return res.json(allBiz.map(withDemoFlag));
     const allowed = await storage.getUserBusinessIds(req.user!.userId);
-    res.json(allBiz.filter((b) => allowed.includes(b.id)));
+    res.json(allBiz.filter((b) => allowed.includes(b.id)).map(withDemoFlag));
   });
 
   app.get("/api/businesses/:id", async (req, res) => {
     const id = parseInt(req.params.id);
     const business = await storage.getBusiness(id);
     if (!business) return res.status(404).json({ error: "Business not found" });
-    res.json(business);
+    res.json(withDemoFlag(business));
   });
 
   app.post("/api/businesses", async (req, res) => {
@@ -3943,6 +3948,22 @@ Extract real information from the content. If a field isn't clear from the websi
 
     const ts = timestamp || new Date().toISOString();
 
+    // Dedup: reject clicks that look like duplicates within a 30-second window.
+    // Same business + landing page + referrer within 30s = double-click or bot replay.
+    const thirtySecsAgo = new Date(Date.now() - 30_000).toISOString();
+    const recentDuplicate = db.select({ id: clickEvents.id })
+      .from(clickEvents)
+      .where(sql`business_id = ${businessId}
+        AND landing_page IS ${landingPage || null}
+        AND referrer IS ${referrer || null}
+        AND timestamp > ${thirtySecsAgo}`)
+      .get();
+
+    if (recentDuplicate) {
+      console.log(`[Click] Duplicate suppressed (businessId:${businessId}, within 30s, original id:${recentDuplicate.id})`);
+      return res.json({ success: true, clickId: recentDuplicate.id, deduplicated: true });
+    }
+
     // Store raw click event
     const clickEvent = db.insert(clickEvents).values({
       businessId,
@@ -3957,13 +3978,35 @@ Extract real information from the content. If a field isn't clear from the websi
       timestamp: ts,
     }).returning().get();
 
-    // Also create a referral entry so the click shows up in the referrals dashboard.
-    // We use platform_id = 1 (ChatGPT) as a fallback; utm_source is the real signal.
+    // Create a referral entry so the click shows up in the referrals dashboard.
+    // Match platform from utmSource first, then fall back to matching by referrer domain.
+    // If we can't determine the platform at all, skip the referral (no false attribution).
     const allPlatforms = await storage.getPlatforms();
-    const matchedPlatform = allPlatforms.find(
+
+    // Domain → platform name mapping for referrer-based fallback
+    const REFERRER_DOMAIN_MAP: Record<string, string> = {
+      "chatgpt.com": "ChatGPT", "chat.openai.com": "ChatGPT",
+      "perplexity.ai": "Perplexity",
+      "gemini.google.com": "Google Gemini", "bard.google.com": "Google Gemini",
+      "claude.ai": "Claude",
+      "copilot.microsoft.com": "Copilot", "bing.com": "Copilot",
+      "meta.ai": "Meta AI",
+    };
+
+    let matchedPlatform = allPlatforms.find(
       (p) => p.name.toLowerCase().replace(/\s+/g, "-") === (utmSource || "").toLowerCase()
         || p.name.toLowerCase() === (utmSource || "").toLowerCase()
-    ) ?? allPlatforms[0];
+    );
+
+    // Try referrer domain if utmSource didn't match
+    if (!matchedPlatform && referrer) {
+      const refLower = referrer.toLowerCase();
+      const domainMatch = Object.entries(REFERRER_DOMAIN_MAP).find(([domain]) => refLower.includes(domain));
+      if (domainMatch) {
+        const platformName = domainMatch[1];
+        matchedPlatform = allPlatforms.find(p => p.name === platformName);
+      }
+    }
 
     if (matchedPlatform) {
       const dateStr = ts.split("T")[0] || new Date().toISOString().split("T")[0];
@@ -3984,6 +4027,8 @@ Extract real information from the content. If a field isn't clear from the websi
         date: dateStr,
         timestamp: ts,
       });
+    } else {
+      console.log(`[Click] Could not attribute platform for businessId:${businessId} utmSource:"${utmSource}" referrer:"${referrer}" — referral record skipped`);
     }
 
     res.json({ success: true, clickId: clickEvent.id });
