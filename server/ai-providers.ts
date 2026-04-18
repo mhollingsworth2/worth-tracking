@@ -183,17 +183,25 @@ Rules:
       result = JSON.parse(jsonMatch?.[0] || "{}");
 
     } else if (key.provider === "google") {
-      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${key.apiKey}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { responseMimeType: "application/json", maxOutputTokens: 200 },
-        }),
-        signal: AbortSignal.timeout(10_000),
-      });
-      if (!res.ok) throw new Error(`Google analysis ${res.status}`);
-      const data = await res.json();
+      const GEMINI_MODELS = ["gemini-2.5-flash-preview-04-17", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-flash"];
+      let gRes: Response | null = null;
+      for (const model of GEMINI_MODELS) {
+        const attempt = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key.apiKey}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { responseMimeType: "application/json", maxOutputTokens: 200 },
+          }),
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (attempt.status === 404) { console.warn(`[Gemini analysis] ${model} not available, trying next...`); continue; }
+        gRes = attempt;
+        break;
+      }
+      if (!gRes) throw new Error("Google analysis: no available model");
+      if (!gRes.ok) throw new Error(`Google analysis ${gRes.status}`);
+      const data = await gRes.json();
       const text = data.candidates?.[0]?.content?.parts?.map((p: any) => p.text).join("") || "";
       result = JSON.parse(text);
 
@@ -714,17 +722,37 @@ async function queryAnthropic(apiKey: string, query: string, businessName: strin
 async function queryGemini(apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }): Promise<AIQueryResult> {
   const startTime = Date.now();
   try {
-    // Google Search grounding — matches what real Gemini users see
-    // No system instruction — real users don't have one
-    const res = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${apiKey}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: query }] }],
-        tools: [{ google_search: {} }],
-      }),
-    });
+    // Try models in order — Google deprecates models frequently for new API keys
+    const GEMINI_MODELS = [
+      "gemini-2.5-flash-preview-04-17",
+      "gemini-2.5-flash",
+      "gemini-2.0-flash",
+      "gemini-2.0-flash-lite",
+      "gemini-1.5-flash",
+    ];
 
+    let res: Response | null = null;
+    let lastError = "";
+    for (const model of GEMINI_MODELS) {
+      const attempt = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: query }] }],
+          tools: [{ google_search: {} }],
+        }),
+        signal: AbortSignal.timeout(API_TIMEOUT_MS),
+      });
+      if (attempt.status === 404) {
+        lastError = `${model} not available`;
+        console.warn(`[Gemini] Model ${model} not available, trying next...`);
+        continue;
+      }
+      res = attempt;
+      break;
+    }
+
+    if (!res) throw new Error(`Gemini API error: no available model found. Last error: ${lastError}`);
     if (!res.ok) {
       const text = await res.text();
       throw new Error(`Gemini API error ${res.status}: ${text}`);
