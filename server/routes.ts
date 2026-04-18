@@ -3475,6 +3475,12 @@ Extract real information from the content. If a field isn't clear from the websi
       startedAt: new Date().toISOString(),
     });
 
+    // Respond immediately so Railway's HTTP gateway doesn't time out.
+    // The client polls /api/businesses/:id/scan-jobs for live progress.
+    res.json({ jobId: job.id, status: "started", totalQueries, platforms: activeKeys.length });
+
+    // Run the scan in the background (fire-and-forget).
+    (async () => {
     const allPlatforms = await storage.getPlatforms();
     const platformMap = Object.fromEntries(allPlatforms.map((p) => [p.name, p.id]));
 
@@ -3530,15 +3536,13 @@ Extract real information from the content. If a field isn't clear from the websi
           }).run();
         }
 
-        // Track API cost (original query + analysis follow-up)
+        // Track API cost — use real token-based cost from result, fall back to flat rate
         const providerKey = keyInputs.find(k => {
           const pMap: Record<string, string> = { openai: "ChatGPT", anthropic: "Claude", google: "Google Gemini", perplexity: "Perplexity" };
           return pMap[k.provider] === result.platform;
         });
         if (providerKey) {
-          const baseCost = PROVIDER_COST_PER_CALL[providerKey.provider] ?? 0.005;
-          const analysisCost = 0.001;
-          const cost = baseCost + analysisCost;
+          const cost = (result as any).actualCost ?? (PROVIDER_COST_PER_CALL[providerKey.provider] ?? 0.005);
           db.insert(apiUsage).values({
             provider: providerKey.provider,
             estimatedCost: cost.toFixed(6),
@@ -3667,20 +3671,16 @@ Extract real information from the content. If a field isn't clear from the websi
       await generateContentGaps(businessId);
       await generateGeoActions(businessId);
 
-      res.json({
-        jobId: job.id,
-        totalQueries: completed,
-        platforms: activeKeys.length,
-        mentions: mentionCount,
-      });
+      console.log(`[Scan] Completed "${business.name}": ${completed} queries, ${mentionCount} mentions`);
     } catch (err: any) {
       await storage.updateScanJob(job.id, {
         status: "failed",
         error: err.message,
         completedAt: new Date().toISOString(),
       });
-      res.status(500).json({ error: err.message });
+      console.error(`[Scan] Background scan failed for "${business.name}":`, err.message);
     }
+    })(); // end background IIFE
   });
 
   app.get("/api/businesses/:id/scan-jobs", async (req, res) => {
