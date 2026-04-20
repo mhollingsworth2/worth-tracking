@@ -1003,6 +1003,8 @@ async function autoScanBusiness(businessId: number) {
 // Supports per-business scan frequencies: manual, daily, weekly, biweekly.
 // Checks every hour for businesses that are due for a scan and runs them.
 let scheduledScanRunning = false;
+let nightlyScanRunning = false;
+let lastNightlyScanDate: string | null = null;
 
 async function runAllBusinessScans(trigger: string) {
   if (nightlyScanRunning) {
@@ -3741,6 +3743,67 @@ Extract real information from the content. If a field isn't clear from the websi
       console.error(`[Scan] Background scan failed for "${business.name}":`, err.message);
     }
     })(); // end background IIFE
+  });
+
+  // ── Real People Search Queries ──────────────────────────────────────────
+  // Uses Google Autocomplete (free, no API key) to surface actual queries
+  // people type when searching for services like this business.
+  app.get("/api/businesses/:id/real-queries", async (req, res) => {
+    const id = parseInt(req.params.id);
+    const biz = await storage.getBusiness(id);
+    if (!biz) return res.status(404).json({ error: "Business not found" });
+
+    const industry = (biz.industry ?? "").trim();
+    const location = (biz.location ?? "").trim();
+    const city = location.split(",")[0]?.trim() ?? location;
+
+    if (!industry) return res.json({ queries: [], source: "google_autocomplete" });
+
+    // Seed phrases that cover the most common search intents
+    const seeds = [
+      `${industry} ${city}`,
+      `best ${industry} in ${city}`,
+      `${industry} near me`,
+      `affordable ${industry} ${city}`,
+      `${industry} services ${city}`,
+      `top ${industry} ${city}`,
+      `how to find ${industry} ${city}`,
+    ].filter(Boolean);
+
+    const seen = new Set<string>();
+    const queries: { query: string; seed: string }[] = [];
+
+    await Promise.allSettled(seeds.map(async (seed) => {
+      try {
+        const url = `https://suggestqueries.google.com/complete/search?client=firefox&q=${encodeURIComponent(seed)}&output=firefox`;
+        const resp = await fetch(url, {
+          headers: { "User-Agent": "Mozilla/5.0 (compatible; WorthTracking/1.0)" },
+          signal: AbortSignal.timeout(5000),
+        });
+        if (!resp.ok) return;
+        const data = await resp.json() as [string, string[]];
+        const suggestions: string[] = data[1] ?? [];
+        for (const s of suggestions) {
+          const normalized = s.toLowerCase().trim();
+          if (!seen.has(normalized) && normalized.length > 5) {
+            seen.add(normalized);
+            queries.push({ query: s, seed });
+          }
+        }
+      } catch {
+        // silently skip failed seeds
+      }
+    }));
+
+    // Sort: exact city matches first, then by length (shorter = more specific intent)
+    queries.sort((a, b) => {
+      const aHasCity = a.query.toLowerCase().includes(city.toLowerCase()) ? 0 : 1;
+      const bHasCity = b.query.toLowerCase().includes(city.toLowerCase()) ? 0 : 1;
+      if (aHasCity !== bHasCity) return aHasCity - bHasCity;
+      return a.query.length - b.query.length;
+    });
+
+    res.json({ queries: queries.slice(0, 30), source: "google_autocomplete", industry, location });
   });
 
   app.get("/api/businesses/:id/scan-jobs", async (req, res) => {

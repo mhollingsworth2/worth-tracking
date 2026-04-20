@@ -345,6 +345,17 @@ export default function BusinessDetail() {
     queryFn: async () => { const res = await fetch(`/api/businesses/${id}/visibility-scores`); return res.json(); },
   });
 
+  const { data: realQueriesData, isLoading: realQueriesLoading } = useQuery<{
+    queries: { query: string; seed: string }[];
+    source: string;
+    industry: string;
+    location: string;
+  }>({
+    queryKey: ["/api/businesses", id, "real-queries"],
+    queryFn: async () => { const res = await fetch(`/api/businesses/${id}/real-queries`); return res.json(); },
+    staleTime: 1000 * 60 * 60, // cache for 1 hour — Google autocomplete doesn't change minute-to-minute
+  });
+
   // Poll scan jobs to detect background scans (e.g. auto-scan on creation)
   const { data: scanJobs } = useQuery<any[]>({
     queryKey: ["/api/businesses", id, "scan-jobs"],
@@ -614,6 +625,10 @@ export default function BusinessDetail() {
             <TabsTrigger value="citations" data-testid="tab-citations">
               <Link2 className="w-3.5 h-3.5 mr-1.5" />
               Citations
+            </TabsTrigger>
+            <TabsTrigger value="real-searches" data-testid="tab-real-searches">
+              <Search className="w-3.5 h-3.5 mr-1.5" />
+              Real Searches
             </TabsTrigger>
             <TabsTrigger value="geo-roadmap" data-testid="tab-geo-roadmap">
               <Crosshair className="w-3.5 h-3.5 mr-1.5" />
@@ -1122,6 +1137,97 @@ export default function BusinessDetail() {
           </TabsContent>
 
           {/* ========== GEO ROADMAP TAB ========== */}
+          {/* ========== REAL SEARCHES TAB ========== */}
+          <TabsContent value="real-searches" className="space-y-6 mt-4">
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-sm font-medium flex items-center gap-2">
+                  <Search className="w-4 h-4 text-blue-500" />
+                  What People Are Actually Searching For
+                </CardTitle>
+                <p className="text-xs text-muted-foreground mt-1">
+                  Real autocomplete queries from Google for <strong>{business?.industry}</strong> in <strong>{business?.location}</strong>. These are the exact phrases potential customers type — use them to inform your content and AI scan queries.
+                </p>
+              </CardHeader>
+              <CardContent>
+                {realQueriesLoading ? (
+                  <div className="space-y-2">
+                    {Array.from({ length: 8 }).map((_, i) => (
+                      <Skeleton key={i} className="h-9 w-full rounded-md" />
+                    ))}
+                  </div>
+                ) : !realQueriesData?.queries?.length ? (
+                  <div className="text-center py-8 text-muted-foreground text-sm">
+                    <Search className="w-8 h-8 mx-auto mb-2 opacity-30" />
+                    No real search data available. Make sure your business has an industry and location set.
+                  </div>
+                ) : (
+                  <div className="space-y-4">
+                    {/* Group by seed phrase intent */}
+                    {["near me", "best", "affordable", "top", "how to", "services"].map((intent) => {
+                      const group = realQueriesData.queries.filter(q =>
+                        q.seed.toLowerCase().includes(intent) || q.query.toLowerCase().includes(intent)
+                      );
+                      if (group.length === 0) return null;
+                      const label: Record<string, string> = {
+                        "near me": "📍 Local Intent",
+                        "best": "⭐ Best / Recommendations",
+                        "affordable": "💰 Price-Conscious",
+                        "top": "🏆 Top Picks",
+                        "how to": "❓ Informational",
+                        "services": "🔧 Service Discovery",
+                      };
+                      return (
+                        <div key={intent}>
+                          <p className="text-xs font-semibold text-muted-foreground mb-2 uppercase tracking-wide">{label[intent]}</p>
+                          <div className="flex flex-wrap gap-2">
+                            {group.slice(0, 6).map((item, i) => (
+                              <span
+                                key={i}
+                                className="inline-flex items-center gap-1.5 text-xs bg-muted hover:bg-muted/80 border rounded-full px-3 py-1.5 cursor-default transition-colors"
+                                title={`From seed: "${item.seed}"`}
+                              >
+                                <Search className="w-3 h-3 opacity-50" />
+                                {item.query}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })}
+
+                    {/* All queries flat list */}
+                    <div className="border-t pt-4 mt-2">
+                      <p className="text-xs font-semibold text-muted-foreground mb-3 uppercase tracking-wide">All {realQueriesData.queries.length} Queries</p>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        {realQueriesData.queries.map((item, i) => (
+                          <div
+                            key={i}
+                            className="flex items-center gap-2 text-sm p-2.5 rounded-lg border bg-card hover:bg-muted/50 transition-colors group"
+                          >
+                            <Search className="w-3.5 h-3.5 text-muted-foreground flex-shrink-0" />
+                            <span className="flex-1 min-w-0 truncate">{item.query}</span>
+                            <button
+                              onClick={() => navigator.clipboard.writeText(item.query)}
+                              className="opacity-0 group-hover:opacity-100 transition-opacity ml-auto"
+                              title="Copy query"
+                            >
+                              <Copy className="w-3.5 h-3.5 text-muted-foreground hover:text-foreground" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    <p className="text-xs text-muted-foreground text-center pt-2">
+                      Source: Google Autocomplete · Data refreshes every hour
+                    </p>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </TabsContent>
+
           <TabsContent value="geo-roadmap" className="space-y-6 mt-4">
             <GeoRoadmapSection businessId={id} />
           </TabsContent>
