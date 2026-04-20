@@ -1689,11 +1689,12 @@ function CompetitorsSection({ businessId, competitors, stats }: { businessId: nu
   const [website, setWebsite] = useState("");
   const { toast } = useToast();
 
-  const { data: compVisibility } = useQuery<any[]>({
+  const { data: compVisibilityData } = useQuery<{ myMentionRate: number; competitors: any[] }>({
     queryKey: ["/api/businesses", businessId, "competitor-visibility"],
     queryFn: async () => { const res = await fetch(`/api/businesses/${businessId}/competitor-visibility`); return res.json(); },
     enabled: competitors.length > 0,
   });
+  const compVisibility = compVisibilityData?.competitors;
 
   const addMutation = useMutation({
     mutationFn: async () => {
@@ -1718,7 +1719,9 @@ function CompetitorsSection({ businessId, competitors, stats }: { businessId: nu
     },
   });
 
-  const myMentionRate = stats?.mentionRate ?? 0;
+  // Use mention rate on the same queries competitors were scanned on (apples-to-apples).
+  // Falls back to overall stats if no competitor data yet.
+  const myMentionRate = compVisibilityData?.myMentionRate ?? stats?.mentionRate ?? 0;
   const hasCompVisData = compVisibility && compVisibility.some((c: any) => c.totalQueries > 0);
 
   return (

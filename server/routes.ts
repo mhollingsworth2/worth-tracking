@@ -1989,8 +1989,9 @@ export async function registerRoutes(
     const comps = await storage.getCompetitors(businessId);
 
     // Fetch all competitor search records for this business
-    const rows = db.select({
+    const compRows = db.select({
       competitorId: sql<number>`competitor_id`,
+      query: searchRecords.query,
       platformId: searchRecords.platformId,
       total: sql<number>`count(*)`,
       mentions: sql<number>`sum(case when mentioned = 1 then 1 else 0 end)`,
@@ -1998,8 +1999,26 @@ export async function registerRoutes(
     })
       .from(searchRecords)
       .where(sql`business_id = ${businessId} AND competitor_id IS NOT NULL`)
-      .groupBy(sql`competitor_id, platform_id`)
+      .groupBy(sql`competitor_id, query, platform_id`)
       .all();
+
+    // Collect the distinct queries used for competitor scans so we can compare
+    // the business on the same query set (apples-to-apples).
+    const compQuerySet = new Set(compRows.map((r) => r.query));
+
+    // Business mention rate on the same queries competitors were scanned on
+    let myMentionRate = 0;
+    if (compQuerySet.size > 0) {
+      const queryList = Array.from(compQuerySet).map(q => `'${q.replace(/'/g, "''")}'`).join(",");
+      const myRow = db.select({
+        total: sql<number>`count(*)`,
+        mentions: sql<number>`sum(case when mentioned = 1 then 1 else 0 end)`,
+      })
+        .from(searchRecords)
+        .where(sql`business_id = ${businessId} AND competitor_id IS NULL AND query IN (${sql.raw(queryList)})`)
+        .get();
+      myMentionRate = myRow && myRow.total > 0 ? Math.round((myRow.mentions / myRow.total) * 100) : 0;
+    }
 
     // Group by competitor
     const compMap = new Map<number, {
@@ -2023,6 +2042,19 @@ export async function registerRoutes(
         positionCount: 0,
       });
     }
+
+    // Re-aggregate without the query dimension (we needed it above for compQuerySet)
+    const rows = db.select({
+      competitorId: sql<number>`competitor_id`,
+      platformId: searchRecords.platformId,
+      total: sql<number>`count(*)`,
+      mentions: sql<number>`sum(case when mentioned = 1 then 1 else 0 end)`,
+      avgPosition: sql<number>`avg(case when mentioned = 1 then position end)`,
+    })
+      .from(searchRecords)
+      .where(sql`business_id = ${businessId} AND competitor_id IS NOT NULL`)
+      .groupBy(sql`competitor_id, platform_id`)
+      .all();
 
     for (const row of rows) {
       const entry = compMap.get(row.competitorId);
@@ -2053,7 +2085,7 @@ export async function registerRoutes(
       platformBreakdown: e.platformBreakdown.sort((a, b) => b.mentionRate - a.mentionRate),
     }));
 
-    res.json(result);
+    res.json({ myMentionRate, competitors: result });
   });
 
   // === COMPETITIVE PROMPT INTELLIGENCE ===
