@@ -1050,6 +1050,13 @@ function crossValidateResults(results: AIQueryResult[]): AIQueryResult[] {
 
   const mentionCount = results.filter(r => r.mentioned).length;
   const noMentionCount = results.length - mentionCount;
+
+  // Exact tie (e.g. 2/4 mention, 2/4 don't) → no majority, mark all as null
+  // to avoid incorrectly flagging half the results as outliers.
+  if (mentionCount === noMentionCount) {
+    return results.map(r => ({ ...r, crossValidated: null }));
+  }
+
   const majorityMentioned = mentionCount > noMentionCount;
 
   // Strong consensus = supermajority (>= 75% agree)
@@ -1062,11 +1069,9 @@ function crossValidateResults(results: AIQueryResult[]): AIQueryResult[] {
 
     let adjustedConfidence = r.confidence;
     if (strongConsensus && agreesWithMajority) {
-      // Strong consensus + agrees → boost confidence
       if (r.confidence === "low") adjustedConfidence = "medium";
       else if (r.confidence === "medium") adjustedConfidence = "high";
     } else if (strongConsensus && !agreesWithMajority) {
-      // Strong consensus + disagrees → downgrade confidence
       if (r.confidence === "high") adjustedConfidence = "medium";
       else if (r.confidence === "medium") adjustedConfidence = "low";
     }

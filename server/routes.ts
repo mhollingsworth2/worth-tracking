@@ -12,7 +12,6 @@ import {
 } from "@shared/schema";
 import { sql } from "drizzle-orm";
 import { runScan, testApiKey, diagnosticQuery, generateScanQueries, detectCompetitors, setAnalysisKeys, detectHallucinations, verifyCitations, setHealthCallback, PROVIDER_COST_PER_CALL, type BusinessContext } from "./ai-providers";
-import { generateDemoData, clearDemoData } from "./demo-data";
 import { requireAuth, requireAdmin, createSession, deleteSession, getSession } from "./auth";
 import bcrypt from "bcryptjs";
 import { validateSearchRecord, validateReferral, validateAiSnapshot } from "./data-validation";
@@ -1489,47 +1488,6 @@ export async function registerRoutes(
     res.json({ success: true });
   });
 
-  // ── Demo mode: creates a demo user + sample business with realistic data ──
-  app.post("/api/auth/demo", async (req, res) => {
-    try {
-      // Create or find demo user
-      let demoUser = await storage.getUserByUsername("demo");
-      if (!demoUser) {
-        const hash = bcrypt.hashSync("demo-viewer", 10);
-        demoUser = db.insert(users).values({
-          username: "demo",
-          passwordHash: hash,
-          displayName: "Demo Viewer",
-          role: "admin", // admin so they can see everything
-          isActive: 1,
-          createdAt: new Date().toISOString(),
-        }).returning().get();
-      }
-
-      // Generate fresh demo data
-      const { businessId } = await generateDemoData(demoUser.id);
-
-      // Create session
-      const token = createSession(demoUser.id, demoUser.role);
-      res.cookie("session", token, { httpOnly: true, sameSite: "lax", maxAge: 24 * 60 * 60 * 1000 });
-      const { passwordHash, ...safeUser } = demoUser;
-      res.json({ token, user: { ...safeUser, isDemo: true }, businessId });
-    } catch (err: any) {
-      console.error("[Demo] Error generating demo:", err.message);
-      res.status(500).json({ error: "Failed to generate demo data" });
-    }
-  });
-
-  // Clear demo data
-  app.post("/api/auth/demo/clear", async (req, res) => {
-    try {
-      await clearDemoData();
-      res.json({ success: true });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
   app.get("/api/auth/me", (req, res) => {
     const token = req.cookies?.session || req.headers.authorization?.replace("Bearer ", "");
     if (!token) return res.status(401).json({ error: "Not authenticated" });
@@ -1755,24 +1713,18 @@ export async function registerRoutes(
   });
 
   // === BUSINESSES ===
-  // Mark demo businesses so frontends can warn users not to treat the data as real.
-  const DEMO_MARKER = "[DEMO]";
-  function withDemoFlag<T extends { description?: string | null }>(biz: T): T & { isDemo: boolean } {
-    return { ...biz, isDemo: (biz.description ?? "").includes(DEMO_MARKER) };
-  }
-
   app.get("/api/businesses", async (req, res) => {
     const allBiz = await storage.getBusinesses();
-    if (req.user?.role === "admin") return res.json(allBiz.map(withDemoFlag));
+    if (req.user?.role === "admin") return res.json(allBiz);
     const allowed = await storage.getUserBusinessIds(req.user!.userId);
-    res.json(allBiz.filter((b) => allowed.includes(b.id)).map(withDemoFlag));
+    res.json(allBiz.filter((b) => allowed.includes(b.id)));
   });
 
   app.get("/api/businesses/:id", async (req, res) => {
     const id = parseInt(req.params.id);
     const business = await storage.getBusiness(id);
     if (!business) return res.status(404).json({ error: "Business not found" });
-    res.json(withDemoFlag(business));
+    res.json(business);
   });
 
   app.post("/api/businesses", requireAuth, async (req, res) => {
