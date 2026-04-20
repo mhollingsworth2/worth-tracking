@@ -18,6 +18,24 @@ import bcrypt from "bcryptjs";
 import { validateSearchRecord, validateReferral, validateAiSnapshot } from "./data-validation";
 import { ensureArchiveTables, runArchival } from "./data-archival";
 
+// Domains that are AI/search infrastructure — never real external citations.
+// Filter these before storing to the citations table so they don't pollute
+// the "Top Cited Domains" report.
+const BLOCKED_CITATION_DOMAINS = [
+  "vertexaisearch.cloud.google.com",
+  "grounding-api.google.com",
+  "openai.com",
+  "anthropic.com",
+  "perplexity.ai",
+  "bing.com",
+  "google.com",
+];
+
+function isBlockedCitationDomain(url: string): boolean {
+  const domain = url.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").split("/")[0];
+  return BLOCKED_CITATION_DOMAINS.some(blocked => domain === blocked || domain.endsWith(`.${blocked}`));
+}
+
 // Seed default AI platforms
 function seedPlatforms() {
   const existing = db.select().from(platforms).all();
@@ -815,7 +833,7 @@ async function autoScanBusiness(businessId: number) {
         const urlRegex = /https?:\/\/[^\s\)\]"'<>,]+/g;
         citedUrls.push(...(result.responseText.match(urlRegex) || []));
       }
-      const uniqueUrls = [...new Set(citedUrls)];
+      const uniqueUrls = [...new Set(citedUrls)].filter(u => !isBlockedCitationDomain(u));
       const bizDomain = biz.website?.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "") || "";
       for (const url of uniqueUrls.slice(0, 20)) {
         const domain = url.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "");
@@ -947,7 +965,7 @@ async function autoScanBusiness(businessId: number) {
             const urlRegex = /https?:\/\/[^\s\)\]"'<>,]+/g;
             compCitedUrls.push(...(result.responseText.match(urlRegex) || []));
           }
-          const compUniqueUrls = [...new Set(compCitedUrls)];
+          const compUniqueUrls = [...new Set(compCitedUrls)].filter(u => !isBlockedCitationDomain(u));
           const compBizDomain = biz.website?.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "") || "";
           for (const url of compUniqueUrls.slice(0, 20)) {
             const domain = url.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "");
@@ -3578,7 +3596,7 @@ Extract real information from the content. If a field isn't clear from the websi
           const urlRegex = /https?:\/\/[^\s\)\]"'<>,]+/g;
           autoScanCitedUrls.push(...(result.responseText.match(urlRegex) || []));
         }
-        const autoScanUniqueUrls = [...new Set(autoScanCitedUrls)];
+        const autoScanUniqueUrls = [...new Set(autoScanCitedUrls)].filter(u => !isBlockedCitationDomain(u));
         const autoScanBizDomain = business.website?.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "") || "";
         for (const url of autoScanUniqueUrls.slice(0, 20)) {
           const domain = url.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "");
@@ -3705,7 +3723,7 @@ Extract real information from the content. If a field isn't clear from the websi
               const urlRegex = /https?:\/\/[^\s\)\]"'<>,]+/g;
               autoCompCitedUrls.push(...(result.responseText.match(urlRegex) || []));
             }
-            const autoCompUniqueUrls = [...new Set(autoCompCitedUrls)];
+            const autoCompUniqueUrls = [...new Set(autoCompCitedUrls)].filter(u => !isBlockedCitationDomain(u));
             const autoCompBizDomain = business.website?.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "") || "";
             for (const url of autoCompUniqueUrls.slice(0, 20)) {
               const domain = url.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "");
