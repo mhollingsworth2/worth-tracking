@@ -1084,6 +1084,46 @@ function crossValidateResults(results: AIQueryResult[]): AIQueryResult[] {
 // Set to 2× the single-call timeout + buffer for the analysis sub-call.
 const QUERY_TIMEOUT_MS = 75_000; // 75s per query
 
+// Module-level helper — kept outside runScan so esbuild minifies it correctly.
+// Nested async function declarations inside async generators confuse esbuild's
+// minifier and can corrupt module-level variable scoping in the bundle.
+async function runOneQuery(
+  query: string,
+  businessName: string,
+  keys: { provider: string; apiKey: string }[],
+  extraTerms: string[] | undefined,
+  businessContext: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null } | undefined,
+): Promise<AIQueryResult[]> {
+  const platformPromises = keys.map(async (key) => {
+    const fn = PROVIDER_FN[key.provider];
+    if (!fn) return null;
+    try {
+      const result = await fn(key.apiKey, query, businessName, extraTerms, businessContext);
+      if (isGenericResponse(result.responseText)) {
+        console.log(`[Scan] Generic response detected from ${result.platform} for "${query}"`);
+        result.confidence = "low";
+      }
+      return result;
+    } catch (err: any) {
+      console.error(`[AI Scan] ${key.provider} failed for query "${query}":`, err.message);
+      return null;
+    }
+  });
+
+  const raw = await Promise.race([
+    Promise.all(platformPromises),
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`Query timed out after ${QUERY_TIMEOUT_MS / 1000}s`)), QUERY_TIMEOUT_MS)
+    ),
+  ]);
+
+  const results = raw.filter((r): r is AIQueryResult => r !== null);
+  const validated = crossValidateResults(results);
+  const mentionedInQuery = validated.filter(r => r.mentioned).length;
+  console.log(`[Scan] Query "${query.substring(0, 60)}..." → ${mentionedInQuery}/${validated.length} platforms mentioned`);
+  return validated;
+}
+
 export async function* runScan(
   businessName: string,
   queries: string[],
@@ -1091,45 +1131,14 @@ export async function* runScan(
   extraTerms?: string[],
   businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }
 ): AsyncGenerator<AIQueryResult> {
-  // Process queries in batches of 2 concurrently — halves wall-clock time
-  // without hammering APIs the way a full parallel blast would.
   const CONCURRENT_QUERIES = 2;
-
-  async function runOneQuery(query: string): Promise<AIQueryResult[]> {
-    const platformPromises = keys.map(async (key) => {
-      const fn = PROVIDER_FN[key.provider];
-      if (!fn) return null;
-      try {
-        const result = await fn(key.apiKey, query, businessName, extraTerms, businessContext);
-        if (isGenericResponse(result.responseText)) {
-          console.log(`[Scan] Generic response detected from ${result.platform} for "${query}"`);
-          result.confidence = "low";
-        }
-        return result;
-      } catch (err: any) {
-        console.error(`[AI Scan] ${key.provider} failed for query "${query}":`, err.message);
-        return null;
-      }
-    });
-
-    const raw = await Promise.race([
-      Promise.all(platformPromises),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error(`Query timed out after ${QUERY_TIMEOUT_MS / 1000}s`)), QUERY_TIMEOUT_MS)
-      ),
-    ]);
-
-    const results = raw.filter((r): r is AIQueryResult => r !== null);
-    const validated = crossValidateResults(results);
-    const mentionedInQuery = validated.filter(r => r.mentioned).length;
-    console.log(`[Scan] Query "${query.substring(0, 60)}..." → ${mentionedInQuery}/${validated.length} platforms mentioned`);
-    return validated;
-  }
 
   // Slide a window of CONCURRENT_QUERIES over the query list
   for (let i = 0; i < queries.length; i += CONCURRENT_QUERIES) {
     const batch = queries.slice(i, i + CONCURRENT_QUERIES);
-    const batchResults = await Promise.allSettled(batch.map(q => runOneQuery(q)));
+    const batchResults = await Promise.allSettled(
+      batch.map(q => runOneQuery(q, businessName, keys, extraTerms, businessContext))
+    );
 
     for (const outcome of batchResults) {
       if (outcome.status === "rejected") {
