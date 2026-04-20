@@ -185,12 +185,12 @@ export function SnippetModal({ businessId, businessName, open, onOpenChange }: S
               <h3 className="text-sm font-medium">What it tracks</h3>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-1.5 text-xs text-muted-foreground">
                 {[
-                  "✓ Clicks on links and buttons",
-                  "✓ Referrer (which AI platform sent them)",
+                  "✓ Page visits from AI platforms (on load)",
+                  "✓ Clicks on links and buttons (higher intent)",
+                  "✓ Which AI platform sent the visitor",
                   "✓ Landing page path",
                   "✓ UTM parameters",
                   "✓ Device type (desktop / mobile / tablet)",
-                  "✓ Timestamp",
                   "✗ No IP addresses",
                   "✗ No cookies or local storage",
                   "✗ No form data or personal info",

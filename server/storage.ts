@@ -494,13 +494,24 @@ export class DatabaseStorage implements IStorage {
 
     const referralCount = totalReferrals?.count ?? 0;
     const conversionCount = totalConversions?.count ?? 0;
-    const mentionCount = totalMentions?.count ?? 0;
+
+    // Count visits (page loads) vs clicks separately using the query prefix labels
+    const visitCount = db.select({ count: sql<number>`count(*)` })
+      .from(referrals)
+      .where(sql`business_id = ${businessId} AND query LIKE '[ai-visit]%'`)
+      .get()?.count ?? 0;
+
+    const clickCount = db.select({ count: sql<number>`count(*)` })
+      .from(referrals)
+      .where(sql`business_id = ${businessId} AND query LIKE '[ai-click]%'`)
+      .get()?.count ?? 0;
 
     return {
       totalReferrals: referralCount,
+      totalVisits: visitCount,
+      totalClicks: clickCount,
       totalConversions: conversionCount,
       conversionRate: referralCount > 0 ? Math.round((conversionCount / referralCount) * 100) : 0,
-      clickThroughRate: mentionCount > 0 ? Math.round((referralCount / mentionCount) * 100) : 0,
       avgSessionDuration: avgSessionDuration?.avg ? Math.round(avgSessionDuration.avg) : 0,
       avgPagesViewed: avgPagesViewed?.avg ? Math.round(avgPagesViewed.avg * 10) / 10 : 0,
     };

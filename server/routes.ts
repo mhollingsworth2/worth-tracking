@@ -4076,6 +4076,7 @@ Extract real information from the content. If a field isn't clear from the websi
     if (!business) return res.status(404).json({ error: "Business not found" });
 
     const {
+      eventType,   // "visit" (page load from AI) or "click" (button/link click)
       elementText,
       elementUrl,
       referrer,
@@ -4087,6 +4088,7 @@ Extract real information from the content. If a field isn't clear from the websi
       timestamp,
     } = req.body;
 
+    const isVisit = eventType === "visit";
     const ts = timestamp || new Date().toISOString();
 
     // Dedup: reject clicks that look like duplicates within a 30-second window.
@@ -4151,11 +4153,16 @@ Extract real information from the content. If a field isn't clear from the websi
 
     if (matchedPlatform) {
       const dateStr = ts.split("T")[0] || new Date().toISOString().split("T")[0];
+      // Label the referral query so visits and clicks are distinguishable in the dashboard
+      const referralQuery = isVisit
+        ? `[ai-visit] ${landingPage || "/"} ← ${utmSource || referrer || "ai-platform"}`
+        : `[ai-click] ${elementText || elementUrl || "unknown"}`;
+
       await storage.createReferral({
         businessId,
         platformId: matchedPlatform.id,
         searchRecordId: null,
-        query: `[snippet-click] ${elementText || elementUrl || "unknown"}`,
+        query: referralQuery,
         landingPage: landingPage || "/",
         utmSource: utmSource || null,
         utmMedium: utmMedium || null,
@@ -4195,8 +4202,8 @@ Extract real information from the content. If a field isn't clear from the websi
     const protocol = req.headers["x-forwarded-proto"] || (req.secure ? "https" : "http");
     const apiUrl = `${protocol}://${host}/api/businesses/${businessId}/log-click`;
 
-    const snippet = `<!-- Worth Tracking Click Tracker v1.0 -->
-<!-- Tracks clicks from AI search platforms (ChatGPT, Perplexity, Gemini, etc.) -->
+    const snippet = `<!-- Worth Tracking AI Referral Tracker v2.0 -->
+<!-- Tracks real visitors arriving from AI platforms (ChatGPT, Perplexity, Gemini, etc.) -->
 <!-- No personal data collected. Respects Do Not Track. -->
 <script>
 (function() {
@@ -4214,9 +4221,10 @@ Extract real information from the content. If a field isn't clear from the websi
     'perplexity.ai',
     'gemini.google.com', 'bard.google.com',
     'claude.ai',
-    'copilot.microsoft.com', 'bing.com/chat',
-    'meta.ai', 'llama',
+    'copilot.microsoft.com', 'bing.com',
+    'meta.ai',
     'you.com', 'phind.com', 'kagi.com',
+    'grok.com', 'x.ai',
   ];
 
   function isAiReferrer(ref) {
@@ -4251,7 +4259,7 @@ Extract real information from the content. If a field isn't clear from the websi
     return el.href || el.action || el.dataset.href || '';
   }
 
-  function sendClick(data) {
+  function send(data) {
     try {
       if (navigator.sendBeacon) {
         var blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
@@ -4265,10 +4273,33 @@ Extract real information from the content. If a field isn't clear from the websi
     } catch (e) { /* silent fail */ }
   }
 
+  // ── Page Visit Tracking ─────────────────────────────────────────────────────
+  // Fire immediately when the visitor lands — this is the real referral moment.
+  // Uses sessionStorage so we only count one visit per browser tab session.
+  var referrer = document.referrer;
+  var utmSource = getUtmParam('utm_source');
+  var sessionKey = 'wt_v2_' + BUSINESS_ID + '_' + window.location.pathname;
+
+  if ((isAiReferrer(referrer) || isAiReferrer(utmSource)) && !sessionStorage.getItem(sessionKey)) {
+    try { sessionStorage.setItem(sessionKey, '1'); } catch (e) { /* private browsing */ }
+    var visitSource = utmSource || (referrer ? (referrer.split('/')[2] || referrer) : '');
+    send({
+      eventType: 'visit',
+      referrer: referrer,
+      landingPage: window.location.pathname,
+      utmSource: visitSource,
+      utmMedium: getUtmParam('utm_medium') || 'ai-referral',
+      utmCampaign: getUtmParam('utm_campaign') || '',
+      deviceType: getDeviceType(),
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  // ── Click Tracking ──────────────────────────────────────────────────────────
+  // Also track when the visitor clicks a link or button — signals higher intent.
   function handleClick(e) {
     try {
       var el = e.target;
-      // Walk up to find the nearest link or button
       var depth = 0;
       while (el && el !== document.body && depth < 5) {
         if (el.tagName === 'A' || el.tagName === 'BUTTON' || el.role === 'button') break;
@@ -4277,27 +4308,24 @@ Extract real information from the content. If a field isn't clear from the websi
       }
       if (!el || el === document.body) return;
 
-      var referrer = document.referrer;
-      var utmSource = getUtmParam('utm_source');
-
-      // Only track if visitor came from an AI platform (via referrer or UTM)
+      // Only track if visitor came from an AI platform
       if (!isAiReferrer(referrer) && !isAiReferrer(utmSource)) return;
 
-      sendClick({
+      send({
+        eventType: 'click',
         elementText: getElementText(el),
         elementUrl: getElementUrl(el),
         referrer: referrer,
         landingPage: window.location.pathname,
-        utmSource: utmSource || referrer.split('/')[2] || '',
-        utmMedium: getUtmParam('utm_medium') || 'ai-search',
-        utmCampaign: getUtmParam('utm_campaign') || 'worth-tracking',
+        utmSource: utmSource || (referrer ? (referrer.split('/')[2] || '') : ''),
+        utmMedium: getUtmParam('utm_medium') || 'ai-referral',
+        utmCampaign: getUtmParam('utm_campaign') || '',
         deviceType: getDeviceType(),
         timestamp: new Date().toISOString(),
       });
     } catch (e) { /* silent fail */ }
   }
 
-  // Attach listener after DOM is ready
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', function() {
       document.addEventListener('click', handleClick, true);

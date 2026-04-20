@@ -934,8 +934,8 @@ export default function BusinessDetail() {
               </Button>
             </div>
             <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
-              <KPICard label="Click-throughs" value={referralStats?.totalReferrals ?? 0} icon={MousePointerClick} loading={refStatsLoading} subtitle="From AI mentions" tooltip="How many people visited your website after seeing your business mentioned by an AI platform." />
-              <KPICard label="Click Rate" value={`${referralStats?.clickThroughRate ?? 0}%`} icon={ArrowRightLeft} loading={refStatsLoading} subtitle="Mentions to Visits" tooltip="What percentage of AI mentions resulted in someone actually visiting your website." />
+              <KPICard label="AI Visits" value={referralStats?.totalVisits ?? referralStats?.totalReferrals ?? 0} icon={Eye} loading={refStatsLoading} subtitle="Real people from AI" tooltip="How many real website visitors arrived from an AI platform like ChatGPT, Perplexity, or Gemini. Tracked by the snippet on your site." />
+              <KPICard label="AI Clicks" value={referralStats?.totalClicks ?? 0} icon={MousePointerClick} loading={refStatsLoading} subtitle="Button/link clicks" tooltip="How many AI-referred visitors then clicked a button or link on your website — signals intent beyond just landing." />
               <KPICard label="Conversions" value={referralStats?.totalConversions ?? 0} icon={Target} loading={refStatsLoading} subtitle="Completed actions" tooltip="How many website visitors from AI searches took a meaningful action — like filling out a contact form, making a purchase, or calling." />
               <KPICard label="Conv. Rate" value={`${referralStats?.conversionRate ?? 0}%`} icon={TrendingUp} loading={refStatsLoading} subtitle="Visits to Actions" tooltip="The percentage of AI-referred visitors who converted into leads or customers." />
               <KPICard label="Avg Session" value={formatDuration(referralStats?.avgSessionDuration ?? 0)} icon={Clock} loading={refStatsLoading} subtitle="Time on site" tooltip="How long AI-referred visitors typically spend browsing your website." />
@@ -1806,8 +1806,12 @@ function CompetitorsSection({ businessId, competitors, stats }: { businessId: nu
                 })}
               </div>
             ) : (
-              <div className="text-center py-4">
-                <p className="text-sm text-muted-foreground">Competitor scans run automatically -- data will appear after the next scan</p>
+              <div className="text-center py-6 space-y-2">
+                <Users className="w-8 h-8 mx-auto text-muted-foreground/40" />
+                <p className="text-sm font-medium">No scan data yet for these competitors</p>
+                <p className="text-xs text-muted-foreground max-w-xs mx-auto">
+                  Competitor visibility data is collected during your AI scan. Run a new scan from the Overview tab to populate this chart.
+                </p>
               </div>
             )}
           </CardContent>
