@@ -20,19 +20,25 @@ import { ensureArchiveTables, runArchival } from "./data-archival";
 // Domains that are AI/search infrastructure — never real external citations.
 // Filter these before storing to the citations table so they don't pollute
 // the "Top Cited Domains" report.
-const BLOCKED_CITATION_DOMAINS = [
+// Tree-blocked: domain + all subdomains are rejected.
+const BLOCKED_CITATION_TREES = [
   "vertexaisearch.cloud.google.com",
   "grounding-api.google.com",
   "openai.com",
   "anthropic.com",
   "perplexity.ai",
-  "bing.com",
+];
+// Exact-only blocks: block the bare search homepage but allow legit subdomains
+// (docs.google.com, support.google.com, business.google.com, maps.google.com, etc.)
+const BLOCKED_CITATION_EXACT = [
   "google.com",
+  "bing.com",
 ];
 
 function isBlockedCitationDomain(url: string): boolean {
   const domain = url.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").split("/")[0];
-  return BLOCKED_CITATION_DOMAINS.some(blocked => domain === blocked || domain.endsWith(`.${blocked}`));
+  if (BLOCKED_CITATION_EXACT.includes(domain)) return true;
+  return BLOCKED_CITATION_TREES.some(blocked => domain === blocked || domain.endsWith(`.${blocked}`));
 }
 
 // Seed default AI platforms
@@ -1023,11 +1029,27 @@ async function autoScanBusiness(businessId: number) {
 }
 
 // ── Scheduled auto-scan system ─────────────────────────────────────────────
-// Supports per-business scan frequencies: manual, daily, weekly, biweekly.
-// Checks every hour for businesses that are due for a scan and runs them.
-let scheduledScanRunning = false;
+// Runs once per UTC day at/after 06:00 UTC (≈01:00–02:00 ET depending on DST).
+// The "last run" date is persisted in api_settings.last_nightly_scan_date so
+// server restarts don't skip or re-trigger the scan.
 let nightlyScanRunning = false;
-let lastNightlyScanDate: string | null = null;
+
+function getLastNightlyScanDate(): string | null {
+  try {
+    const row = db.select({ v: sql<string>`last_nightly_scan_date` }).from(apiSettings).get() as any;
+    return row?.v ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function setLastNightlyScanDate(date: string) {
+  try {
+    db.run(sql`UPDATE api_settings SET last_nightly_scan_date = ${date}`);
+  } catch (err: any) {
+    console.error(`[Scheduler] Failed to persist last_nightly_scan_date:`, err.message);
+  }
+}
 
 async function runAllBusinessScans(trigger: string) {
   if (nightlyScanRunning) {
@@ -1067,7 +1089,7 @@ async function runAllBusinessScans(trigger: string) {
       await autoScanBusiness(biz.id);
     }
 
-    lastNightlyScanDate = today;
+    setLastNightlyScanDate(today);
     console.log(`[Scheduler] ${trigger}: all scans complete`);
   } catch (err: any) {
     console.error(`[Scheduler] Error during ${trigger} scan:`, err.message);
@@ -1076,20 +1098,19 @@ async function runAllBusinessScans(trigger: string) {
   }
 }
 
-// Check every 30 minutes if it's past 2 AM and we haven't scanned today yet
+// Check every 30 minutes. Run once per UTC day at or after 06:00 UTC.
 function startNightlyScheduler() {
   setInterval(() => {
     const now = new Date();
-    const hour = now.getHours();
-    const today = now.toISOString().split("T")[0];
+    const hourUTC = now.getUTCHours();
+    const todayUTC = now.toISOString().split("T")[0];
 
-    // Run at 2 AM if we haven't run today
-    if (hour >= 2 && lastNightlyScanDate !== today) {
-      runAllBusinessScans("nightly-2am");
+    if (hourUTC >= 6 && getLastNightlyScanDate() !== todayUTC) {
+      runAllBusinessScans("nightly-06utc");
     }
   }, 30 * 60 * 1000); // check every 30 min
 
-  console.log("[Scheduler] Nightly 2 AM scan scheduler started");
+  console.log("[Scheduler] Nightly 06:00 UTC scan scheduler started");
 }
 
 export async function registerRoutes(
@@ -1142,6 +1163,29 @@ export async function registerRoutes(
   try { db.run(sql`ALTER TABLE search_records ADD COLUMN source_type TEXT`); } catch (_e) { /* exists */ }
   try { db.run(sql`ALTER TABLE search_records ADD COLUMN cross_validated INTEGER`); } catch (_e) { /* exists */ }
   try { db.run(sql`ALTER TABLE search_records ADD COLUMN competitor_id INTEGER`); } catch (_e) { /* exists */ }
+
+  // De-dup prior duplicate rows BEFORE creating the unique index. Keep the row
+  // with the lowest id per (business_id, platform_id, query, date, competitor_id)
+  // tuple. Running unscanned businesses that were double-scanned the same day
+  // would otherwise block the index creation.
+  try {
+    db.run(sql`
+      DELETE FROM search_records
+      WHERE id NOT IN (
+        SELECT MIN(id) FROM search_records
+        GROUP BY business_id, platform_id, query, date, COALESCE(competitor_id, -1)
+      )
+    `);
+  } catch (err: any) {
+    console.error("[Migration] search_records de-dup failed:", err.message);
+  }
+  // Prevent future duplicates: one record per (business, platform, query, date, competitor) tuple.
+  try {
+    db.run(sql`CREATE UNIQUE INDEX IF NOT EXISTS idx_search_records_unique
+      ON search_records (business_id, platform_id, query, date, COALESCE(competitor_id, -1))`);
+  } catch (err: any) {
+    console.error("[Migration] search_records unique index creation failed:", err.message);
+  }
 
   db.run(sql`CREATE TABLE IF NOT EXISTS optimized_prompts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1278,6 +1322,12 @@ export async function registerRoutes(
     daily_budget TEXT NOT NULL DEFAULT '10.00',
     auto_pause_enabled INTEGER NOT NULL DEFAULT 1
   )`);
+  try { db.run(sql`ALTER TABLE api_settings ADD COLUMN last_nightly_scan_date TEXT`); } catch (_e) { /* exists */ }
+  // Ensure there's exactly one settings row
+  try {
+    const existing = db.select().from(apiSettings).get();
+    if (!existing) db.run(sql`INSERT INTO api_settings (daily_budget, auto_pause_enabled) VALUES ('10.00', 1)`);
+  } catch (_e) { /* safe */ }
 
   db.run(sql`CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2043,18 +2093,27 @@ export async function registerRoutes(
       });
     }
 
-    // Re-aggregate without the query dimension (we needed it above for compQuerySet)
-    const rows = db.select({
-      competitorId: sql<number>`competitor_id`,
-      platformId: searchRecords.platformId,
-      total: sql<number>`count(*)`,
-      mentions: sql<number>`sum(case when mentioned = 1 then 1 else 0 end)`,
-      avgPosition: sql<number>`avg(case when mentioned = 1 then position end)`,
-    })
-      .from(searchRecords)
-      .where(sql`business_id = ${businessId} AND competitor_id IS NOT NULL`)
-      .groupBy(sql`competitor_id, platform_id`)
-      .all();
+    // Re-aggregate per-competitor per-platform rates from the SAME per-query rows
+    // we already pulled. This guarantees the bars reflect the same query set as
+    // myMentionRate — true apples-to-apples. Summing by (competitor_id,
+    // platform_id) collapses the per-query granularity back down.
+    const aggKey = (r: { competitorId: number; platformId: number }) => `${r.competitorId}::${r.platformId}`;
+    const aggMap = new Map<string, { competitorId: number; platformId: number; total: number; mentions: number; posSum: number; posCount: number }>();
+    for (const r of compRows) {
+      const k = aggKey(r);
+      const cur = aggMap.get(k) ?? { competitorId: r.competitorId, platformId: r.platformId, total: 0, mentions: 0, posSum: 0, posCount: 0 };
+      cur.total += r.total;
+      cur.mentions += r.mentions;
+      if (r.avgPosition) { cur.posSum += r.avgPosition * r.mentions; cur.posCount += r.mentions; }
+      aggMap.set(k, cur);
+    }
+    const rows = Array.from(aggMap.values()).map((e) => ({
+      competitorId: e.competitorId,
+      platformId: e.platformId,
+      total: e.total,
+      mentions: e.mentions,
+      avgPosition: e.posCount > 0 ? e.posSum / e.posCount : null,
+    }));
 
     for (const row of rows) {
       const entry = compMap.get(row.competitorId);

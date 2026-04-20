@@ -257,17 +257,55 @@ function deterministicAnalysis(
   responseLength: number,
 ): AnalysisResult {
   // ── Mention detection ──────────────────────────────────────────────────
+  // When the query contains the business name, AI often echoes it back even
+  // when it has no real information. We need to guard against that false
+  // positive.
   const nameFoundInResponse = searchVariants.some(v => lower.includes(v));
   let mentioned = false;
   if (nameFoundInResponse) {
-    const pureRefusals = [
-      "i don't have specific information",
-      "i don't have any information",
-      "no verified information available",
-      "i'm not familiar with this business",
+    // Refusal phrases — if any of these appear, the model is saying "I don't
+    // know this business" and the echoed name is NOT a real mention.
+    // We drop the responseLength cap because models often pad refusals with
+    // generic industry context that pushes length >300 while still saying
+    // "I don't know this specific business."
+    const refusalPhrases = [
+      "don't have specific information",
+      "don't have any information",
+      "don't have information",
+      "no verified information",
+      "no specific information",
+      "i'm not familiar with",
+      "not familiar with this",
+      "i don't know specifically",
+      "can't provide specific information",
+      "no details available",
+      "unable to provide specific",
+      "do not have details about",
+      "cannot confirm",
     ];
-    const isPureRefusal = responseLength < 300 && pureRefusals.some(r => lower.includes(r));
-    mentioned = !isPureRefusal;
+    const hasRefusal = refusalPhrases.some(r => lower.includes(r));
+
+    // If the query contains the business name, the response must mention it
+    // OUTSIDE the echoed query text to count as a real mention. We strip the
+    // query from the response and require the name to still appear.
+    let nameAppearsOutsideQuery = !queryContainsName;
+    if (queryContainsName && queryLower) {
+      const stripped = lower.split(queryLower).join(" ");
+      nameAppearsOutsideQuery = searchVariants.some(v => stripped.includes(v));
+    }
+
+    // Count occurrences — a single echo is weak signal; 2+ mentions with
+    // substantive content between them is a real mention.
+    const matchedVariant = searchVariants.find(v => lower.includes(v))!;
+    const occurrences = lower.split(matchedVariant).length - 1;
+
+    if (hasRefusal && occurrences < 2) {
+      mentioned = false;
+    } else if (queryContainsName && !nameAppearsOutsideQuery && occurrences < 2) {
+      mentioned = false;
+    } else {
+      mentioned = true;
+    }
   }
 
   // ── Position detection ──────────────────────────────────────────────────

@@ -190,7 +190,28 @@ export class DatabaseStorage implements IStorage {
   }
 
   async createSearchRecord(record: InsertSearchRecord): Promise<SearchRecord> {
-    return db.insert(searchRecords).values(record).returning().get();
+    // Upsert: re-running a scan the same day overwrites the prior record
+    // instead of inserting a duplicate row. Prevents double-counted stats.
+    // Unique key: (business_id, platform_id, query, date, COALESCE(competitor_id,-1)).
+    try {
+      return db.insert(searchRecords).values(record).returning().get();
+    } catch (err: any) {
+      const msg = String(err?.message ?? "");
+      if (!msg.includes("UNIQUE") && !msg.includes("unique")) throw err;
+      // Duplicate — update the existing row and return it.
+      const existing = db.select().from(searchRecords).where(and(
+        eq(searchRecords.businessId, record.businessId),
+        eq(searchRecords.platformId, record.platformId),
+        eq(searchRecords.query, record.query),
+        eq(searchRecords.date, record.date),
+        record.competitorId != null
+          ? eq(searchRecords.competitorId, record.competitorId)
+          : sql`competitor_id IS NULL`,
+      )).get();
+      if (!existing) throw err;
+      db.update(searchRecords).set(record).where(eq(searchRecords.id, existing.id)).run();
+      return { ...existing, ...record } as SearchRecord;
+    }
   }
 
   async getSearchStats(businessId: number): Promise<any> {
