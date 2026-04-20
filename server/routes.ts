@@ -746,7 +746,13 @@ async function autoScanBusiness(businessId: number) {
     let biz = await storage.getBusiness(businessId);
     if (!biz) return;
 
-    const keys = await storage.getApiKeys();
+    // Look up the business owner to use their API keys
+    const ownerRow = db.select().from(userBusinesses).where(sql`business_id = ${businessId}`).limit(1).get();
+    if (!ownerRow) {
+      console.log(`[Auto-Scan] No owner found for business "${biz.name}" — skipping scan`);
+      return;
+    }
+    const keys = await storage.getApiKeys(ownerRow.userId);
     const activeKeys = keys.filter((k) => k.isActive);
     if (activeKeys.length === 0) {
       console.log(`[Auto-Scan] No API keys configured — skipping initial scan for "${biz.name}"`);
@@ -1032,13 +1038,6 @@ async function runAllBusinessScans(trigger: string) {
   nightlyScanRunning = true;
 
   try {
-    const keys = await storage.getApiKeys();
-    const activeKeys = keys.filter((k) => k.isActive);
-    if (activeKeys.length === 0) {
-      console.log(`[Scheduler] No API keys configured — skipping ${trigger} scan`);
-      return;
-    }
-
     // Check daily budget
     const settings = db.select().from(apiSettings).get() as any;
     const dailyBudget = parseFloat(settings?.dailyBudget ?? settings?.daily_budget ?? "10.00");
@@ -1231,6 +1230,30 @@ export async function registerRoutes(
     is_active INTEGER NOT NULL DEFAULT 1,
     last_used TEXT
   )`);
+  try { db.run(sql`ALTER TABLE api_keys ADD COLUMN user_id INTEGER`); } catch (_e) { /* exists */ }
+
+  // One-time migration: link any businesses that have no user_businesses row
+  // to the first admin user so existing setups keep working after the per-user
+  // API key change.
+  try {
+    const firstAdmin = db.get<{ id: number }>(sql`SELECT id FROM users WHERE role = 'admin' ORDER BY id ASC LIMIT 1`);
+    if (firstAdmin) {
+      const unlinked = db.all<{ id: number }>(sql`
+        SELECT b.id FROM businesses b
+        WHERE NOT EXISTS (SELECT 1 FROM user_businesses ub WHERE ub.business_id = b.id)
+      `);
+      for (const biz of unlinked) {
+        try {
+          db.run(sql`INSERT INTO user_businesses (user_id, business_id) VALUES (${firstAdmin.id}, ${biz.id})`);
+        } catch (_e) { /* already linked */ }
+      }
+      if (unlinked.length > 0) {
+        console.log(`[Migration] Linked ${unlinked.length} existing businesses to admin user #${firstAdmin.id}`);
+      }
+    }
+  } catch (err: any) {
+    console.error("[Migration] user_businesses backfill failed:", err.message);
+  }
 
   db.run(sql`CREATE TABLE IF NOT EXISTS scan_jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1752,10 +1775,13 @@ export async function registerRoutes(
     res.json(withDemoFlag(business));
   });
 
-  app.post("/api/businesses", async (req, res) => {
+  app.post("/api/businesses", requireAuth, async (req, res) => {
     const parsed = insertBusinessSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: parsed.error.message });
     const business = await storage.createBusiness(parsed.data);
+
+    // Link this business to the creating user so their API keys are used for scans
+    db.insert(userBusinesses).values({ userId: req.user!.userId, businessId: business.id }).run();
 
     // Fire-and-forget: run an initial AI scan in the background so the user
     // gets real data instead of simulated data. The response returns immediately.
@@ -1818,15 +1844,15 @@ export async function registerRoutes(
   });
 
   // === DIAGNOSTIC: test a single query to see raw AI responses ===
-  app.get("/api/businesses/:id/diagnostic", async (req, res) => {
+  app.get("/api/businesses/:id/diagnostic", requireAuth, async (req, res) => {
     try {
       const businessId = parseInt(req.params.id);
       const biz = await storage.getBusiness(businessId);
       if (!biz) return res.status(404).json({ error: "Business not found" });
 
-      const keys = await storage.getApiKeys();
+      const keys = await storage.getApiKeys(req.user!.userId);
       const activeKeys = keys.filter((k) => k.isActive);
-      if (activeKeys.length === 0) return res.status(400).json({ error: "No API keys configured" });
+      if (activeKeys.length === 0) return res.status(400).json({ error: "No API keys configured. Add your API keys in Settings → API Keys." });
 
       const keyInputs = activeKeys.map((k) => ({ provider: k.provider, apiKey: k.apiKey }));
 
@@ -2252,7 +2278,7 @@ export async function registerRoutes(
 
   // === CONTENT BRIEF GENERATION ===
   // Generates an actionable content brief for a given search query
-  app.post("/api/businesses/:id/content-brief", async (req, res) => {
+  app.post("/api/businesses/:id/content-brief", requireAuth, async (req, res) => {
     const businessId = parseInt(req.params.id);
     const { query } = req.body;
     if (!query || typeof query !== "string") {
@@ -2263,10 +2289,10 @@ export async function registerRoutes(
     if (!business) return res.status(404).json({ error: "Business not found" });
 
     // Get API keys
-    const keys = await storage.getApiKeys();
+    const keys = await storage.getApiKeys(req.user!.userId);
     const activeKeys = keys.filter((k) => k.isActive);
     if (activeKeys.length === 0) {
-      return res.status(400).json({ error: "No API keys configured. Add one in Settings first." });
+      return res.status(400).json({ error: "No API keys configured. Add your API keys in Settings → API Keys." });
     }
 
     const prompt = `You are an SEO content strategist. Generate a detailed content brief for the following business to help them rank for a specific search query.
@@ -2925,9 +2951,9 @@ Include 3-6 sections in the outline, each with 2-4 bullet points. Include 5-10 k
     res.send(csv);
   });
 
-  // === API KEYS (admin only) ===
-  app.get("/api/api-keys", requireAdmin, async (_req, res) => {
-    const keys = await storage.getApiKeys();
+  // === API KEYS (per-user) ===
+  app.get("/api/api-keys", requireAuth, async (req, res) => {
+    const keys = await storage.getApiKeys(req.user!.userId);
     const masked = keys.map((k) => ({
       ...k,
       apiKey: k.apiKey.slice(0, 8) + "...",
@@ -2935,19 +2961,19 @@ Include 3-6 sections in the outline, each with 2-4 bullet points. Include 5-10 k
     res.json(masked);
   });
 
-  app.post("/api/api-keys", requireAdmin, async (req, res) => {
+  app.post("/api/api-keys", requireAuth, async (req, res) => {
     const { provider, apiKey } = req.body;
     if (!provider || !apiKey) return res.status(400).json({ error: "provider and apiKey required" });
-    const key = await storage.upsertApiKey(provider, apiKey);
+    const key = await storage.upsertApiKey(provider, apiKey, req.user!.userId);
     res.json({ ...key, apiKey: key.apiKey.slice(0, 8) + "..." });
   });
 
-  app.delete("/api/api-keys/:provider", requireAdmin, async (req, res) => {
-    await storage.deleteApiKey(req.params.provider as string);
+  app.delete("/api/api-keys/:provider", requireAuth, async (req, res) => {
+    await storage.deleteApiKey(req.params.provider as string, req.user!.userId);
     res.json({ success: true });
   });
 
-  app.post("/api/api-keys/test", requireAdmin, async (req, res) => {
+  app.post("/api/api-keys/test", requireAuth, async (req, res) => {
     const { provider, apiKey } = req.body;
     if (!provider || !apiKey) return res.status(400).json({ error: "provider and apiKey required" });
     const result = await testApiKey(provider, apiKey);
@@ -2997,11 +3023,18 @@ Include 3-6 sections in the outline, each with 2-4 bullet points. Include 5-10 k
         return res.status(400).json({ error: "Could not extract enough text from the website" });
       }
 
-      // 3. Get an API key for analysis
-      const keys = await storage.getApiKeys();
-      const activeKeys = keys.filter((k) => k.isActive);
+      // 3. Get an API key for analysis — use authenticated user's keys if available,
+      //    otherwise fall back to any active global key (for unauthenticated scrape calls)
+      const userKeys = req.user?.userId
+        ? await storage.getApiKeys(req.user.userId)
+        : [];
+      let activeKeys = userKeys.filter((k) => k.isActive);
       if (activeKeys.length === 0) {
-        return res.status(400).json({ error: "No API keys configured. Add one in Settings → API Keys first." });
+        // Fallback: try any globally active key (legacy or admin-set)
+        activeKeys = db.select().from(apiKeys).where(sql`is_active = 1`).limit(1).all();
+      }
+      if (activeKeys.length === 0) {
+        return res.status(400).json({ error: "No API keys configured. Add your API keys in Settings → API Keys." });
       }
 
       // 4. Send to AI for extraction
@@ -3480,15 +3513,15 @@ Extract real information from the content. If a field isn't clear from the websi
   });
 
   // === SCAN ===
-  app.post("/api/businesses/:id/scan", async (req, res) => {
+  app.post("/api/businesses/:id/scan", requireAuth, async (req, res) => {
     const businessId = parseInt(req.params.id);
     const business = await storage.getBusiness(businessId);
     if (!business) return res.status(404).json({ error: "Business not found" });
 
-    const keys = await storage.getApiKeys();
+    const keys = await storage.getApiKeys(req.user!.userId);
     const activeKeys = keys.filter((k) => k.isActive);
     if (activeKeys.length === 0) {
-      return res.status(400).json({ error: "No API keys configured. Add keys in the API Keys page." });
+      return res.status(400).json({ error: "No API keys configured. Add your API keys in Settings → API Keys." });
     }
 
     // Check daily budget before scanning

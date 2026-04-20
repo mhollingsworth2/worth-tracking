@@ -667,27 +667,27 @@ export class DatabaseStorage implements IStorage {
   }
 
   // === API KEYS ===
-  async getApiKeys(): Promise<ApiKey[]> {
-    return db.select().from(apiKeys).all();
+  async getApiKeys(userId: number): Promise<ApiKey[]> {
+    return db.select().from(apiKeys).where(eq(apiKeys.userId, userId)).all();
   }
 
-  async getApiKey(provider: string): Promise<ApiKey | undefined> {
-    return db.select().from(apiKeys).where(eq(apiKeys.provider, provider)).get();
+  async getApiKey(provider: string, userId: number): Promise<ApiKey | undefined> {
+    return db.select().from(apiKeys).where(and(eq(apiKeys.provider, provider), eq(apiKeys.userId, userId))).get();
   }
 
-  async upsertApiKey(provider: string, key: string): Promise<ApiKey> {
-    const existing = await this.getApiKey(provider);
+  async upsertApiKey(provider: string, key: string, userId: number): Promise<ApiKey> {
+    const existing = await this.getApiKey(provider, userId);
     if (existing) {
       return db.update(apiKeys)
         .set({ apiKey: key, isActive: 1, lastUsed: null })
-        .where(eq(apiKeys.provider, provider))
+        .where(and(eq(apiKeys.provider, provider), eq(apiKeys.userId, userId)))
         .returning().get();
     }
-    return db.insert(apiKeys).values({ provider, apiKey: key, isActive: 1 }).returning().get();
+    return db.insert(apiKeys).values({ provider, apiKey: key, isActive: 1, userId }).returning().get();
   }
 
-  async deleteApiKey(provider: string): Promise<void> {
-    db.delete(apiKeys).where(eq(apiKeys.provider, provider)).run();
+  async deleteApiKey(provider: string, userId: number): Promise<void> {
+    db.delete(apiKeys).where(and(eq(apiKeys.provider, provider), eq(apiKeys.userId, userId))).run();
   }
 
   // === DATA QUALITY & VALIDATION ===

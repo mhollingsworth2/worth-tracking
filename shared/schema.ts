@@ -247,6 +247,7 @@ export type UserBusiness = typeof userBusinesses.$inferSelect;
 // API Keys
 export const apiKeys = sqliteTable("api_keys", {
   id: integer("id").primaryKey({ autoIncrement: true }),
+  userId: integer("user_id"),
   provider: text("provider").notNull(),
   apiKey: text("api_key").notNull(),
   isActive: integer("is_active").notNull().default(1),

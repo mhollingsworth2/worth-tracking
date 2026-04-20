@@ -60,7 +60,7 @@ function AppRouter() {
       <Route path="/add" component={AddBusiness} />
       <Route path="/optimizer" component={Optimizer} />
       <Route path="/alerts" component={Alerts} />
-      {isAdmin && <Route path="/api-keys" component={ApiKeys} />}
+      <Route path="/api-keys" component={ApiKeys} />
       {isAdmin && <Route path="/admin" component={Admin} />}
       {isAdmin && <Route path="/agency" component={Agency} />}
       <Route path="/business/:id" component={BusinessDetail} />

@@ -6,7 +6,25 @@
       "Bash(git init:*)",
       "Bash(git branch:*)",
       "Bash([ -f .gitignore ])",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git remote:*)",
+      "Bash(git pull:*)",
+      "Bash(git commit -m ':*)",
+      "Bash(git push:*)",
+      "Bash(git commit --allow-empty -m ':*)",
+      "Bash(npx tsc:*)",
+      "Bash(/usr/local/bin/node ./node_modules/.bin/tsc --noEmit)",
+      "Bash(node ./node_modules/.bin/tsc --noEmit)",
+      "Bash(export PATH=\"/usr/local/bin:/opt/homebrew/bin:$PATH\")",
+      "Bash(/usr/bin/env node:*)",
+      "Read(//usr/local/**)",
+      "Read(//Users/maddyhollingsworth/.nvm/versions/**)",
+      "Read(//opt/homebrew/opt/**)",
+      "Read(//usr/bin/**)",
+      "Bash(node_modules/.bin/tsc --noEmit)",
+      "Bash(ls node_modules/.bin/ts*)",
+      "Bash(git commit -m ' *)",
+      "Bash(/usr/local/bin/npx tsc *)"
     ]
   }
 }
