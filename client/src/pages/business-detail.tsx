@@ -250,6 +250,22 @@ export default function BusinessDetail() {
   const { toast } = useToast();
   const id = parseInt(params?.id ?? "0");
 
+  // ---- Active tab + "visited" tracking for lazy query loading ----
+  // Queries bound to a specific tab only fire once that tab has been visited.
+  // Once visited, the query stays enabled so cached data persists and refreshes.
+  const [activeTab, setActiveTab] = useState<string>("overview");
+  const [visitedTabs, setVisitedTabs] = useState<Set<string>>(() => new Set(["overview"]));
+  const handleTabChange = (v: string) => {
+    setActiveTab(v);
+    setVisitedTabs((prev) => {
+      if (prev.has(v)) return prev;
+      const next = new Set(prev);
+      next.add(v);
+      return next;
+    });
+  };
+  const tabVisited = (t: string) => visitedTabs.has(t);
+
   // ---- Existing queries ----
   const { data: business, isLoading: bizLoading } = useQuery<Business>({
     queryKey: ["/api/businesses", id],
@@ -279,6 +295,7 @@ export default function BusinessDetail() {
   const { data: prompts } = useQuery<OptimizedPrompt[]>({
     queryKey: ["/api/businesses", id, "prompts"],
     queryFn: async () => { const res = await fetch(`/api/businesses/${id}/prompts`); return res.json(); },
+    enabled: tabVisited("prompts"),
   });
 
   const { data: allPlatforms } = useQuery<Platform[]>({ queryKey: ["/api/platforms"] });
@@ -287,52 +304,62 @@ export default function BusinessDetail() {
   const { data: referralStats, isLoading: refStatsLoading } = useQuery<any>({
     queryKey: ["/api/businesses", id, "referral-stats"],
     queryFn: async () => { const res = await fetch(`/api/businesses/${id}/referral-stats`); return res.json(); },
+    enabled: tabVisited("referrals"),
   });
 
   const { data: referralTrend } = useQuery<any[]>({
     queryKey: ["/api/businesses", id, "referral-trend"],
     queryFn: async () => { const res = await fetch(`/api/businesses/${id}/referral-trend`); return res.json(); },
+    enabled: tabVisited("referrals"),
   });
 
   const { data: referralsByPlatform } = useQuery<any[]>({
     queryKey: ["/api/businesses", id, "referrals-by-platform"],
     queryFn: async () => { const res = await fetch(`/api/businesses/${id}/referrals-by-platform`); return res.json(); },
+    enabled: tabVisited("referrals"),
   });
 
   const { data: conversionsByType } = useQuery<any[]>({
     queryKey: ["/api/businesses", id, "conversions-by-type"],
     queryFn: async () => { const res = await fetch(`/api/businesses/${id}/conversions-by-type`); return res.json(); },
+    enabled: tabVisited("referrals"),
   });
 
   const { data: topReferralQueries } = useQuery<any[]>({
     queryKey: ["/api/businesses", id, "top-referral-queries"],
     queryFn: async () => { const res = await fetch(`/api/businesses/${id}/top-referral-queries`); return res.json(); },
+    enabled: tabVisited("referrals"),
   });
 
   const { data: allReferrals } = useQuery<Referral[]>({
     queryKey: ["/api/businesses", id, "referrals"],
     queryFn: async () => { const res = await fetch(`/api/businesses/${id}/referrals`); return res.json(); },
+    enabled: tabVisited("referrals"),
   });
 
   // ---- NEW queries ----
   const { data: competitorsData } = useQuery<Competitor[]>({
     queryKey: ["/api/businesses", id, "competitors"],
     queryFn: async () => { const res = await fetch(`/api/businesses/${id}/competitors`); return res.json(); },
+    enabled: tabVisited("competitors"),
   });
 
   const { data: snapshotsData } = useQuery<AiSnapshot[]>({
     queryKey: ["/api/businesses", id, "snapshots"],
     queryFn: async () => { const res = await fetch(`/api/businesses/${id}/snapshots`); return res.json(); },
+    enabled: tabVisited("snapshots"),
   });
 
   const { data: contentGapsData } = useQuery<ContentGap[]>({
     queryKey: ["/api/businesses", id, "content-gaps"],
     queryFn: async () => { const res = await fetch(`/api/businesses/${id}/content-gaps`); return res.json(); },
+    enabled: tabVisited("content-gaps"),
   });
 
   const { data: locationsData } = useQuery<BizLocation[]>({
     queryKey: ["/api/businesses", id, "locations"],
     queryFn: async () => { const res = await fetch(`/api/businesses/${id}/locations`); return res.json(); },
+    enabled: tabVisited("settings"),
   });
 
   const { data: queryPerf } = useQuery<any[]>({
@@ -354,6 +381,7 @@ export default function BusinessDetail() {
     queryKey: ["/api/businesses", id, "real-queries"],
     queryFn: async () => { const res = await fetch(`/api/businesses/${id}/real-queries`); return res.json(); },
     staleTime: 1000 * 60 * 60, // cache for 1 hour — Google autocomplete doesn't change minute-to-minute
+    enabled: tabVisited("real-searches"),
   });
 
   // Poll scan jobs to detect background scans (e.g. auto-scan on creation)
@@ -599,7 +627,7 @@ export default function BusinessDetail() {
           <KPICard label="Avg Position" value={stats?.avgPosition ?? "N/A"} icon={Hash} loading={statsLoading} subtitle={stats?.avgPosition ? `When mentioned, you typically appear #${stats.avgPosition} in the response` : "Not yet mentioned"} tooltip="When AI mentions your business, this is where you typically appear in the response. #1 means you're mentioned first." />
         </div>
 
-        <Tabs defaultValue="overview">
+        <Tabs value={activeTab} onValueChange={handleTabChange}>
           <TabsList className="flex-wrap h-auto gap-1" data-testid="tabs-nav">
             <TabsTrigger value="overview" data-testid="tab-overview">Overview</TabsTrigger>
             <TabsTrigger value="trends" className="gap-1.5" data-testid="tab-trends">

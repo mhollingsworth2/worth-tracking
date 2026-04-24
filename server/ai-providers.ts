@@ -398,7 +398,7 @@ function deterministicAnalysis(
 // 1. Fast path: if the name isn't in the response at all, skip AI call (free).
 // 2. Name found: use AI-powered analysis for accurate sentiment + mention classification.
 // 3. Fallback: deterministic analysis with negation detection if AI is unavailable.
-async function analyzeWithAI(businessName: string, query: string, responseText: string, _businessContext?: any): Promise<AnalysisResult> {
+async function analyzeWithAI(businessName: string, query: string, responseText: string, _businessContext?: any, deterministicOnly: boolean = false): Promise<AnalysisResult> {
   const lower = responseText.toLowerCase();
   const nameLower = businessName.toLowerCase();
   const queryLower = query.toLowerCase();
@@ -424,7 +424,10 @@ async function analyzeWithAI(businessName: string, query: string, responseText: 
   }
 
   // ── AI-powered analysis (accurate sentiment, negation, sarcasm, echo detection) ──
-  if (analysisKeys.length > 0) {
+  // Skip the secondary AI call in deterministicOnly mode — used for the
+  // ungrounded (knowledge-only) pass where we only need mention/no-mention
+  // for the delta categorization. Halves analysis cost on ungrounded scans.
+  if (!deterministicOnly && analysisKeys.length > 0) {
     const aiResult = await callAnalysisAI(businessName, query, responseText);
     if (aiResult) {
       return { ...aiResult, sentimentTopic };
@@ -813,7 +816,7 @@ async function queryOpenAI(apiKey: string, query: string, businessName: string, 
     healthCallback?.("openai", "success", Date.now() - startTime);
     providerCallSucceeded = true;
 
-    const analysis = await analyzeWithAI(businessName, query, responseText, businessContext);
+    const analysis = await analyzeWithAI(businessName, query, responseText, businessContext, !useWebSearch);
 
     // Compute actual cost from real token counts
     const usage = data.usage ?? {};
@@ -894,7 +897,7 @@ async function queryAnthropic(apiKey: string, query: string, businessName: strin
     healthCallback?.("anthropic", "success", Date.now() - startTime);
     providerCallSucceeded = true;
 
-    const analysis = await analyzeWithAI(businessName, query, responseText, businessContext);
+    const analysis = await analyzeWithAI(businessName, query, responseText, businessContext, !useWebSearch);
 
     const usage = data.usage ?? {};
     const inputTokens: number = usage.input_tokens ?? 0;
@@ -974,7 +977,7 @@ async function queryGemini(apiKey: string, query: string, businessName: string, 
     healthCallback?.("google", "success", Date.now() - startTime);
     providerCallSucceeded = true;
 
-    const analysis = await analyzeWithAI(businessName, query, responseText, businessContext);
+    const analysis = await analyzeWithAI(businessName, query, responseText, businessContext, !useWebSearch);
 
     const usageMeta = data.usageMetadata ?? {};
     const inputTokens: number = usageMeta.promptTokenCount ?? 0;
@@ -1032,7 +1035,8 @@ async function queryPerplexity(apiKey: string, query: string, businessName: stri
     healthCallback?.("perplexity", "success", Date.now() - startTime);
     providerCallSucceeded = true;
 
-    const analysis = await analyzeWithAI(businessName, query, responseText, businessContext);
+    // Perplexity is always grounded, so full AI analysis is always warranted.
+    const analysis = await analyzeWithAI(businessName, query, responseText, businessContext, false);
 
     const usage = data.usage ?? {};
     const inputTokens: number = usage.prompt_tokens ?? usage.input_tokens ?? 0;

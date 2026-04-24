@@ -332,6 +332,7 @@ export const platformHealth = sqliteTable("platform_health", {
   responseTimeMs: integer("response_time_ms"),
   date: text("date").notNull(),
   timestamp: text("timestamp").notNull(),
+  sampleCount: integer("sample_count").notNull().default(1),
 });
 
 export const insertPlatformHealthSchema = createInsertSchema(platformHealth).omit({ id: true });

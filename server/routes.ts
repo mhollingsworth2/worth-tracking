@@ -41,6 +41,40 @@ function isBlockedCitationDomain(url: string): boolean {
   return BLOCKED_CITATION_TREES.some(blocked => domain === blocked || domain.endsWith(`.${blocked}`));
 }
 
+// Create a buffered health callback: accumulates samples in memory during a
+// scan and writes one aggregated row per (provider, status) at flush time.
+// Reduces ~80 inserts per scan to ~4–8.
+function createBufferedHealthRecorder(dateStr: string) {
+  type Bucket = { successCount: number; errorCount: number; totalMs: number; samples: number; lastError: string | null };
+  const buckets = new Map<string, Bucket>();
+
+  const record = (provider: string, status: "success" | "error", responseTimeMs: number, errorMessage?: string) => {
+    const b = buckets.get(provider) ?? { successCount: 0, errorCount: 0, totalMs: 0, samples: 0, lastError: null };
+    if (status === "success") b.successCount++;
+    else { b.errorCount++; b.lastError = errorMessage ?? b.lastError; }
+    b.totalMs += responseTimeMs;
+    b.samples++;
+    buckets.set(provider, b);
+  };
+
+  const flush = () => {
+    const rows: any[] = [];
+    for (const [provider, b] of buckets) {
+      const avgMs = b.samples > 0 ? Math.round(b.totalMs / b.samples) : 0;
+      if (b.successCount > 0) {
+        rows.push({ provider, status: "success", errorMessage: null, responseTimeMs: avgMs, date: dateStr, timestamp: new Date().toISOString(), sampleCount: b.successCount });
+      }
+      if (b.errorCount > 0) {
+        rows.push({ provider, status: "error", errorMessage: b.lastError, responseTimeMs: avgMs, date: dateStr, timestamp: new Date().toISOString(), sampleCount: b.errorCount });
+      }
+    }
+    if (rows.length > 0) db.insert(platformHealth).values(rows).run();
+    buckets.clear();
+  };
+
+  return { record, flush };
+}
+
 // Seed default AI platforms
 function seedPlatforms() {
   const existing = db.select().from(platforms).all();
@@ -814,9 +848,8 @@ async function autoScanBusiness(businessId: number) {
     const keyInputs = activeKeys.map((k) => ({ provider: k.provider, apiKey: k.apiKey }));
     setAnalysisKeys(keyInputs);
     const scanDateStr = new Date().toISOString().split("T")[0];
-    setHealthCallback((provider, status, responseTimeMs, errorMessage) => {
-      db.insert(platformHealth).values({ provider, status, errorMessage: errorMessage ?? null, responseTimeMs, date: scanDateStr, timestamp: new Date().toISOString() }).run();
-    });
+    const healthRecorder = createBufferedHealthRecorder(scanDateStr);
+    setHealthCallback(healthRecorder.record);
 
     for await (const result of runScan(biz.name, queries, keyInputs, extraTerms, { location: biz.location ?? null, website: biz.website ?? null, services: (biz as any).services ?? null, industry: biz.industry ?? null })) {
       completed++;
@@ -846,20 +879,20 @@ async function autoScanBusiness(businessId: number) {
       }
       const uniqueUrls = [...new Set(citedUrls)].filter(u => !isBlockedCitationDomain(u));
       const bizDomain = biz.website?.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "") || "";
-      for (const url of uniqueUrls.slice(0, 20)) {
+      const citationBatch = uniqueUrls.slice(0, 20).map(url => {
         const domain = url.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "");
-        const isOwn = bizDomain && domain.includes(bizDomain) ? 1 : 0;
-        db.insert(citations).values({
+        return {
           businessId,
           searchRecordId: record.id,
           url,
           domain,
-          isOwnDomain: isOwn,
+          isOwnDomain: bizDomain && domain.includes(bizDomain) ? 1 : 0,
           platform: result.platform,
           query: result.query,
           date: dateStr,
-        }).run();
-      }
+        };
+      });
+      if (citationBatch.length > 0) db.insert(citations).values(citationBatch).run();
 
       // Track API cost (original query + analysis follow-up)
       const providerKey = keyInputs.find(k => {
@@ -943,15 +976,16 @@ async function autoScanBusiness(businessId: number) {
 
     console.log(`[Auto-Scan] Finished "${biz.name}": ${completed} queries, ${mentionCount} mentions`);
 
-    // ── Competitor scanning ──────────────────────────────────────────────────
+    // ── Competitor scanning (parallelized with concurrency limit) ────────────
     const comps = await storage.getCompetitors(businessId);
     const compSubset = comps.slice(0, 5); // limit to 5 competitors
     const compQueries = queries.slice(0, 8); // use first 8 representative queries
+    const compBizDomain = biz.website?.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "") || "";
 
-    for (const comp of compSubset) {
-      console.log(`[Auto-Scan] Scanning competitor "${comp.name}" for "${biz.name}"`);
+    async function scanOneCompetitor(comp: { id: number; name: string }) {
+      console.log(`[Auto-Scan] Scanning competitor "${comp.name}" for "${biz!.name}"`);
       try {
-        for await (const result of runScan(comp.name, compQueries, keyInputs, [], { industry: biz.industry ?? null, location: biz.location ?? null, website: null, services: null })) {
+        for await (const result of runScan(comp.name, compQueries, keyInputs, [], { industry: biz!.industry ?? null, location: biz!.location ?? null, website: null, services: null })) {
           const platformId = platformMap[result.platform] ?? 1;
           const dateStr = new Date().toISOString().split("T")[0];
 
@@ -970,30 +1004,27 @@ async function autoScanBusiness(businessId: number) {
           });
           db.run(sql`UPDATE search_records SET sentiment_score = ${(result as any).sentimentScore ?? 50}, sentiment_topic = ${(result as any).sentimentTopic ?? 'general'} WHERE id = ${compRecord.id}`);
 
-          // Extract citations — prefer structured citedUrls, fall back to regex
           const compCitedUrls: string[] = (result as any).citedUrls ?? [];
           if (compCitedUrls.length === 0 && result.responseText) {
             const urlRegex = /https?:\/\/[^\s\)\]"'<>,]+/g;
             compCitedUrls.push(...(result.responseText.match(urlRegex) || []));
           }
           const compUniqueUrls = [...new Set(compCitedUrls)].filter(u => !isBlockedCitationDomain(u));
-          const compBizDomain = biz.website?.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "") || "";
-          for (const url of compUniqueUrls.slice(0, 20)) {
+          const compCitationBatch = compUniqueUrls.slice(0, 20).map(url => {
             const domain = url.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "");
-            const isOwn = compBizDomain && domain.includes(compBizDomain) ? 1 : 0;
-            db.insert(citations).values({
+            return {
               businessId,
               searchRecordId: compRecord.id,
               url,
               domain,
-              isOwnDomain: isOwn,
+              isOwnDomain: compBizDomain && domain.includes(compBizDomain) ? 1 : 0,
               platform: result.platform,
               query: result.query,
               date: dateStr,
-            }).run();
-          }
+            };
+          });
+          if (compCitationBatch.length > 0) db.insert(citations).values(compCitationBatch).run();
 
-          // Track API cost for competitor scans too
           const providerKey = keyInputs.find(k => {
             const pMap: Record<string, string> = { openai: "ChatGPT", anthropic: "Claude", google: "Google Gemini", perplexity: "Perplexity" };
             return pMap[k.provider] === result.platform;
@@ -1009,12 +1040,19 @@ async function autoScanBusiness(businessId: number) {
               timestamp: new Date().toISOString(),
             }).run();
           }
-          // Skip AI snapshots for competitor scans (saves API cost)
         }
-        console.log(`[Auto-Scan] Finished competitor "${comp.name}" for "${biz.name}"`);
+        console.log(`[Auto-Scan] Finished competitor "${comp.name}" for "${biz!.name}"`);
       } catch (compErr: any) {
         console.error(`[Auto-Scan] Error scanning competitor "${comp.name}":`, compErr.message);
       }
+    }
+
+    // Run up to 2 competitor scans in parallel. runScan already parallelizes
+    // queries internally (CONCURRENT_QUERIES=2), so outer=2 × inner=2 = 4
+    // concurrent provider calls per provider — well under typical rate limits.
+    const COMP_CONCURRENCY = 2;
+    for (let i = 0; i < compSubset.length; i += COMP_CONCURRENCY) {
+      await Promise.all(compSubset.slice(i, i + COMP_CONCURRENCY).map(scanOneCompetitor));
     }
 
     // ── Ungrounded (knowledge-only) delta pass ──────────────────────────────
@@ -1065,6 +1103,9 @@ async function autoScanBusiness(businessId: number) {
     } catch (err: any) {
       console.error(`[Auto-Scan] Ungrounded delta pass failed for ${businessId}:`, err.message);
     }
+
+    // Flush buffered platform health samples for this scan
+    try { healthRecorder.flush(); } catch (_e) { /* ignore */ }
 
     // Generate alerts, prompts, and content gaps based on scan results
     await generateScanAlerts(businessId);
@@ -1124,18 +1165,28 @@ async function runAllBusinessScans(trigger: string) {
     const allBiz = await storage.getBusinesses();
     console.log(`[Scheduler] ${trigger}: scanning ${allBiz.length} businesses`);
 
-    for (const biz of allBiz) {
-      // Re-check budget before each business
+    // Process up to 2 businesses at a time. Each scan internally parallelizes
+    // queries (CONCURRENT_QUERIES=2) and competitors (COMP_CONCURRENCY=2), so
+    // outer=2 keeps us well below typical provider rate ceilings while cutting
+    // wall-clock by ~half for multi-business tenants.
+    const BIZ_CONCURRENCY = 2;
+    let budgetHit = false;
+    for (let i = 0; i < allBiz.length; i += BIZ_CONCURRENCY) {
+      if (budgetHit) break;
+
+      // Re-check budget before each batch
       const latestUsage = db.select({ total: sql<string>`coalesce(sum(cast(estimated_cost as real)), 0)` })
         .from(apiUsage).where(sql`date = ${today}`).get();
       const latestSpend = parseFloat(latestUsage?.total ?? "0");
       if (settings?.autoPauseEnabled && latestSpend >= dailyBudget) {
         console.log(`[Scheduler] Budget hit mid-cycle — stopping`);
+        budgetHit = true;
         break;
       }
 
-      console.log(`[Scheduler] Scanning "${biz.name}"...`);
-      await autoScanBusiness(biz.id);
+      const batch = allBiz.slice(i, i + BIZ_CONCURRENCY);
+      console.log(`[Scheduler] Scanning batch: ${batch.map(b => b.name).join(", ")}`);
+      await Promise.all(batch.map(b => autoScanBusiness(b.id)));
     }
 
     setLastNightlyScanDate(today);
@@ -1240,6 +1291,13 @@ export async function registerRoutes(
   } catch (err: any) {
     console.error("[Migration] search_records unique index creation failed:", err.message);
   }
+
+  // Secondary indexes for hot read paths — stats dashboards, trend charts,
+  // and per-platform breakdowns all filter by these keys. Without these,
+  // queries scan the entire search_records table on every request.
+  try { db.run(sql`CREATE INDEX IF NOT EXISTS idx_search_records_biz_date ON search_records (business_id, date)`); } catch (_e) { /* ignore */ }
+  try { db.run(sql`CREATE INDEX IF NOT EXISTS idx_search_records_biz_platform_date ON search_records (business_id, platform_id, date)`); } catch (_e) { /* ignore */ }
+  try { db.run(sql`CREATE INDEX IF NOT EXISTS idx_search_records_biz_competitor ON search_records (business_id, competitor_id)`); } catch (_e) { /* ignore */ }
 
   db.run(sql`CREATE TABLE IF NOT EXISTS optimized_prompts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1434,6 +1492,10 @@ export async function registerRoutes(
     timestamp TEXT NOT NULL
   )`);
 
+  // sample_count lets one row represent N aggregated samples — reduces
+  // platform_health row count by ~80x per scan. Existing rows default to 1.
+  try { db.run(sql`ALTER TABLE platform_health ADD COLUMN sample_count INTEGER NOT NULL DEFAULT 1`); } catch (_e) { /* exists */ }
+
   // One-time migration: historical rows where the "error" came from the
   // secondary analyzeWithAI call were incorrectly attributed to the primary
   // provider. These always contain the word "analysis" in the message.
@@ -1453,6 +1515,14 @@ export async function registerRoutes(
     query TEXT NOT NULL,
     date TEXT NOT NULL
   )`);
+
+  // Indexes for the Citations + Top-Domains reports.
+  try { db.run(sql`CREATE INDEX IF NOT EXISTS idx_citations_biz_date ON citations (business_id, date)`); } catch (_e) { /* ignore */ }
+  try { db.run(sql`CREATE INDEX IF NOT EXISTS idx_citations_biz_domain ON citations (business_id, domain)`); } catch (_e) { /* ignore */ }
+  // Index for the health-dashboard 7-day window query.
+  try { db.run(sql`CREATE INDEX IF NOT EXISTS idx_platform_health_provider_date ON platform_health (provider, date)`); } catch (_e) { /* ignore */ }
+  // Index for daily-budget running total.
+  try { db.run(sql`CREATE INDEX IF NOT EXISTS idx_api_usage_date ON api_usage (date)`); } catch (_e) { /* ignore */ }
 
   db.run(sql`CREATE TABLE IF NOT EXISTS bot_visits (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3770,9 +3840,8 @@ Extract real information from the content. If a field isn't clear from the websi
       const keyInputs = activeKeys.map((k) => ({ provider: k.provider, apiKey: k.apiKey }));
       setAnalysisKeys(keyInputs);
       const manualScanDate = new Date().toISOString().split("T")[0];
-      setHealthCallback((provider, status, responseTimeMs, errorMessage) => {
-        db.insert(platformHealth).values({ provider, status, errorMessage: errorMessage ?? null, responseTimeMs, date: manualScanDate, timestamp: new Date().toISOString() }).run();
-      });
+      const manualHealthRecorder = createBufferedHealthRecorder(manualScanDate);
+      setHealthCallback(manualHealthRecorder.record);
       for await (const result of runScan(business.name, queries, keyInputs, extraTerms, { location: business.location ?? null, website: (business as any).website ?? null, services: (business as any).services ?? null, industry: business.industry ?? null })) {
         completed++;
         const platformId = platformMap[result.platform] ?? 1;
@@ -3800,20 +3869,20 @@ Extract real information from the content. If a field isn't clear from the websi
         }
         const autoScanUniqueUrls = [...new Set(autoScanCitedUrls)].filter(u => !isBlockedCitationDomain(u));
         const autoScanBizDomain = business.website?.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "") || "";
-        for (const url of autoScanUniqueUrls.slice(0, 20)) {
+        const autoScanCitationBatch = autoScanUniqueUrls.slice(0, 20).map(url => {
           const domain = url.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "");
-          const isOwn = autoScanBizDomain && domain.includes(autoScanBizDomain) ? 1 : 0;
-          db.insert(citations).values({
+          return {
             businessId,
             searchRecordId: record.id,
             url,
             domain,
-            isOwnDomain: isOwn,
+            isOwnDomain: autoScanBizDomain && domain.includes(autoScanBizDomain) ? 1 : 0,
             platform: result.platform,
             query: result.query,
             date: dateStr,
-          }).run();
-        }
+          };
+        });
+        if (autoScanCitationBatch.length > 0) db.insert(citations).values(autoScanCitationBatch).run();
 
         // Track API cost — use real token-based cost from result, fall back to flat rate
         const providerKey = keyInputs.find(k => {
@@ -3893,12 +3962,13 @@ Extract real information from the content. If a field isn't clear from the websi
         completedAt: new Date().toISOString(),
       });
 
-      // ── Competitor scanning (same as auto-scan) ──────────────────────────
+      // ── Competitor scanning (parallelized) ───────────────────────────────
       const comps = await storage.getCompetitors(businessId);
       const compSubset = comps.slice(0, 5);
       const compQueries = queries.slice(0, 8);
+      const autoCompBizDomain = business.website?.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "") || "";
 
-      for (const comp of compSubset) {
+      async function scanOneCompetitorManual(comp: { id: number; name: string }) {
         console.log(`[Scan] Scanning competitor "${comp.name}" for "${business.name}"`);
         try {
           for await (const result of runScan(comp.name, compQueries, keyInputs, [], { industry: business.industry ?? null, location: business.location ?? null, website: null, services: null })) {
@@ -3919,33 +3989,39 @@ Extract real information from the content. If a field isn't clear from the websi
             });
             db.run(sql`UPDATE search_records SET sentiment_score = ${(result as any).sentimentScore ?? 50}, sentiment_topic = ${(result as any).sentimentTopic ?? 'general'} WHERE id = ${compRecord.id}`);
 
-            // Extract citations — prefer structured citedUrls, fall back to regex
             const autoCompCitedUrls: string[] = (result as any).citedUrls ?? [];
             if (autoCompCitedUrls.length === 0 && result.responseText) {
               const urlRegex = /https?:\/\/[^\s\)\]"'<>,]+/g;
               autoCompCitedUrls.push(...(result.responseText.match(urlRegex) || []));
             }
             const autoCompUniqueUrls = [...new Set(autoCompCitedUrls)].filter(u => !isBlockedCitationDomain(u));
-            const autoCompBizDomain = business.website?.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "") || "";
-            for (const url of autoCompUniqueUrls.slice(0, 20)) {
+            const autoCompCitationBatch = autoCompUniqueUrls.slice(0, 20).map(url => {
               const domain = url.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "");
-              const isOwn = autoCompBizDomain && domain.includes(autoCompBizDomain) ? 1 : 0;
-              db.insert(citations).values({
+              return {
                 businessId,
                 searchRecordId: compRecord.id,
                 url,
                 domain,
-                isOwnDomain: isOwn,
+                isOwnDomain: autoCompBizDomain && domain.includes(autoCompBizDomain) ? 1 : 0,
                 platform: result.platform,
                 query: result.query,
                 date: dateStr,
-              }).run();
-            }
+              };
+            });
+            if (autoCompCitationBatch.length > 0) db.insert(citations).values(autoCompCitationBatch).run();
           }
         } catch (compErr: any) {
           console.error(`[Scan] Error scanning competitor "${comp.name}":`, compErr.message);
         }
       }
+
+      const COMP_CONCURRENCY = 2;
+      for (let i = 0; i < compSubset.length; i += COMP_CONCURRENCY) {
+        await Promise.all(compSubset.slice(i, i + COMP_CONCURRENCY).map(scanOneCompetitorManual));
+      }
+
+      // Flush buffered platform health samples for this scan
+      try { manualHealthRecorder.flush(); } catch (_e) { /* ignore */ }
 
       // Generate alerts, prompts, content gaps, and GEO actions based on scan results
       await generateScanAlerts(businessId);
@@ -4134,10 +4210,12 @@ Extract real information from the content. If a field isn't clear from the websi
   // === PLATFORM HEALTH ===
   app.get("/api/platform-health", async (_req, res) => {
     const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString().split("T")[0];
+    // sample_count is summed (not counted) because rows can now represent
+    // multiple aggregated samples from a single scan.
     const stats = db.select({
       provider: platformHealth.provider,
-      successCount: sql<number>`sum(case when status = 'success' then 1 else 0 end)`,
-      errorCount: sql<number>`sum(case when status = 'error' then 1 else 0 end)`,
+      successCount: sql<number>`sum(case when status = 'success' then coalesce(sample_count, 1) else 0 end)`,
+      errorCount: sql<number>`sum(case when status = 'error' then coalesce(sample_count, 1) else 0 end)`,
       avgResponseTime: sql<number>`avg(response_time_ms)`,
     })
       .from(platformHealth)
