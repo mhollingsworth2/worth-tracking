@@ -192,13 +192,15 @@ export class DatabaseStorage implements IStorage {
   async createSearchRecord(record: InsertSearchRecord): Promise<SearchRecord> {
     // Upsert: re-running a scan the same day overwrites the prior record
     // instead of inserting a duplicate row. Prevents double-counted stats.
-    // Unique key: (business_id, platform_id, query, date, COALESCE(competitor_id,-1)).
+    // Unique key: (business_id, platform_id, query, date, COALESCE(competitor_id,-1),
+    // COALESCE(source_type,'grounded')) — so grounded + knowledge-only scans on
+    // the same day don't clobber each other.
     try {
       return db.insert(searchRecords).values(record).returning().get();
     } catch (err: any) {
       const msg = String(err?.message ?? "");
       if (!msg.includes("UNIQUE") && !msg.includes("unique")) throw err;
-      // Duplicate — update the existing row and return it.
+      const sourceType = record.sourceType ?? "grounded";
       const existing = db.select().from(searchRecords).where(and(
         eq(searchRecords.businessId, record.businessId),
         eq(searchRecords.platformId, record.platformId),
@@ -207,6 +209,7 @@ export class DatabaseStorage implements IStorage {
         record.competitorId != null
           ? eq(searchRecords.competitorId, record.competitorId)
           : sql`competitor_id IS NULL`,
+        sql`COALESCE(source_type, 'grounded') = ${sourceType}`,
       )).get();
       if (!existing) throw err;
       db.update(searchRecords).set(record).where(eq(searchRecords.id, existing.id)).run();

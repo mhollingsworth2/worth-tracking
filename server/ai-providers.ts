@@ -749,21 +749,22 @@ export function setHealthCallback(cb: typeof healthCallback) {
   healthCallback = cb;
 }
 
-async function queryOpenAI(apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }): Promise<AIQueryResult> {
+async function queryOpenAI(apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }, useWebSearch: boolean = true): Promise<AIQueryResult> {
   const startTime = Date.now();
+  let providerCallSucceeded = false;
   try {
-    // Use OpenAI Responses API with web search tool for real-world results
+    // With useWebSearch=true: matches what real ChatGPT UI users see.
+    // With useWebSearch=false: pure training-data response — used for the
+    // grounded-vs-ungrounded delta to show which mentions are memorized.
+    const body: any = { model: "gpt-4o-mini", input: query };
+    if (useWebSearch) body.tools = [{ type: "web_search_preview" }];
     const res = await fetchWithRetry("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        tools: [{ type: "web_search_preview" }],
-        input: query,
-      }),
+      body: JSON.stringify(body),
     });
 
     if (!res.ok) {
@@ -806,6 +807,12 @@ async function queryOpenAI(apiKey: string, query: string, businessName: string, 
       citedUrls.push(...(responseText.match(urlRegex) || []));
     }
 
+    // Record provider health BEFORE running analyzeWithAI. The analysis call
+    // is shared infrastructure (uses whichever provider is available); its
+    // failures should not be blamed on the primary provider's uptime.
+    healthCallback?.("openai", "success", Date.now() - startTime);
+    providerCallSucceeded = true;
+
     const analysis = await analyzeWithAI(businessName, query, responseText, businessContext);
 
     // Compute actual cost from real token counts
@@ -813,35 +820,41 @@ async function queryOpenAI(apiKey: string, query: string, businessName: string, 
     const inputTokens: number = usage.input_tokens ?? usage.prompt_tokens ?? 0;
     const outputTokens: number = usage.output_tokens ?? usage.completion_tokens ?? 0;
     const pricing = TOKEN_PRICING["openai"];
-    const actualCost = (inputTokens * pricing.input) + (outputTokens * pricing.output) + pricing.toolCost;
+    const actualCost = (inputTokens * pricing.input) + (outputTokens * pricing.output) + (useWebSearch ? pricing.toolCost : 0);
 
-    healthCallback?.("openai", "success", Date.now() - startTime);
-    return { platform: "ChatGPT", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null, citedUrls: [...new Set(citedUrls)], actualCost };
+    return { platform: "ChatGPT", query, responseText, ...analysis, sourceType: useWebSearch ? "grounded" : "knowledge", crossValidated: null, citedUrls: [...new Set(citedUrls)], actualCost };
   } catch (err: any) {
-    healthCallback?.("openai", "error", Date.now() - startTime, err.message);
+    // Only mark provider health as error if the provider call itself failed.
+    // Analysis-layer failures are not the provider's fault.
+    if (!providerCallSucceeded) healthCallback?.("openai", "error", Date.now() - startTime, err.message);
     throw err;
   }
 }
 
-async function queryAnthropic(apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }): Promise<AIQueryResult> {
+async function queryAnthropic(apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }, useWebSearch: boolean = true): Promise<AIQueryResult> {
   const startTime = Date.now();
+  let providerCallSucceeded = false;
   try {
-    // Use Claude's web search tool — matches what real users see on claude.ai
-    // No system prompt — real users don't have one
+    // useWebSearch=true: matches claude.ai UI behavior.
+    // useWebSearch=false: training-data-only response for the delta.
+    const body: any = {
+      model: "claude-sonnet-4-6",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: query }],
+    };
+    const headers: Record<string, string> = {
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+      "Content-Type": "application/json",
+    };
+    if (useWebSearch) {
+      body.tools = [{ type: "web_search_20250305", name: "web_search", max_uses: 5 }];
+      headers["anthropic-beta"] = "web-search-2025-03-05";
+    }
     const res = await fetchWithRetry("https://api.anthropic.com/v1/messages", {
       method: "POST",
-      headers: {
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-        "anthropic-beta": "web-search-2025-03-05",
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-6",
-        max_tokens: 1024,
-        tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 5 }],
-        messages: [{ role: "user", content: query }],
-      }),
+      headers,
+      body: JSON.stringify(body),
     });
 
     if (!res.ok) {
@@ -878,24 +891,27 @@ async function queryAnthropic(apiKey: string, query: string, businessName: strin
       citedUrls.push(...(responseText.match(urlRegex) || []));
     }
 
+    healthCallback?.("anthropic", "success", Date.now() - startTime);
+    providerCallSucceeded = true;
+
     const analysis = await analyzeWithAI(businessName, query, responseText, businessContext);
 
     const usage = data.usage ?? {};
     const inputTokens: number = usage.input_tokens ?? 0;
     const outputTokens: number = usage.output_tokens ?? 0;
     const pricing = TOKEN_PRICING["anthropic"];
-    const actualCost = (inputTokens * pricing.input) + (outputTokens * pricing.output) + pricing.toolCost;
+    const actualCost = (inputTokens * pricing.input) + (outputTokens * pricing.output) + (useWebSearch ? pricing.toolCost : 0);
 
-    healthCallback?.("anthropic", "success", Date.now() - startTime);
-    return { platform: "Claude", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null, citedUrls: [...new Set(citedUrls)], actualCost };
+    return { platform: "Claude", query, responseText, ...analysis, sourceType: useWebSearch ? "grounded" : "knowledge", crossValidated: null, citedUrls: [...new Set(citedUrls)], actualCost };
   } catch (err: any) {
-    healthCallback?.("anthropic", "error", Date.now() - startTime, err.message);
+    if (!providerCallSucceeded) healthCallback?.("anthropic", "error", Date.now() - startTime, err.message);
     throw err;
   }
 }
 
-async function queryGemini(apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }): Promise<AIQueryResult> {
+async function queryGemini(apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }, useWebSearch: boolean = true): Promise<AIQueryResult> {
   const startTime = Date.now();
+  let providerCallSucceeded = false;
   try {
     // Try models in order — Google deprecates models frequently for new API keys
     const GEMINI_MODELS = [
@@ -909,13 +925,12 @@ async function queryGemini(apiKey: string, query: string, businessName: string, 
     let res: Response | null = null;
     let lastError = "";
     for (const model of GEMINI_MODELS) {
+      const body: any = { contents: [{ parts: [{ text: query }] }] };
+      if (useWebSearch) body.tools = [{ google_search: {} }];
       const attempt = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: query }] }],
-          tools: [{ google_search: {} }],
-        }),
+        body: JSON.stringify(body),
         signal: AbortSignal.timeout(API_TIMEOUT_MS),
       });
       if (attempt.status === 404) {
@@ -956,24 +971,27 @@ async function queryGemini(apiKey: string, query: string, businessName: string, 
       citedUrls.push(...(responseText.match(urlRegex) || []));
     }
 
+    healthCallback?.("google", "success", Date.now() - startTime);
+    providerCallSucceeded = true;
+
     const analysis = await analyzeWithAI(businessName, query, responseText, businessContext);
 
     const usageMeta = data.usageMetadata ?? {};
     const inputTokens: number = usageMeta.promptTokenCount ?? 0;
     const outputTokens: number = usageMeta.candidatesTokenCount ?? 0;
     const pricing = TOKEN_PRICING["google"];
-    const actualCost = (inputTokens * pricing.input) + (outputTokens * pricing.output) + pricing.toolCost;
+    const actualCost = (inputTokens * pricing.input) + (outputTokens * pricing.output) + (useWebSearch ? pricing.toolCost : 0);
 
-    healthCallback?.("google", "success", Date.now() - startTime);
-    return { platform: "Google Gemini", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null, citedUrls: [...new Set(citedUrls)], actualCost };
+    return { platform: "Google Gemini", query, responseText, ...analysis, sourceType: useWebSearch ? "grounded" : "knowledge", crossValidated: null, citedUrls: [...new Set(citedUrls)], actualCost };
   } catch (err: any) {
-    healthCallback?.("google", "error", Date.now() - startTime, err.message);
+    if (!providerCallSucceeded) healthCallback?.("google", "error", Date.now() - startTime, err.message);
     throw err;
   }
 }
 
 async function queryPerplexity(apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }): Promise<AIQueryResult> {
   const startTime = Date.now();
+  let providerCallSucceeded = false;
   try {
     // Perplexity Sonar — web search is built-in, matches real Perplexity UI
     // No system prompt — real users don't have one
@@ -1011,6 +1029,9 @@ async function queryPerplexity(apiKey: string, query: string, businessName: stri
       citedUrls.push(...(responseText.match(urlRegex) || []));
     }
 
+    healthCallback?.("perplexity", "success", Date.now() - startTime);
+    providerCallSucceeded = true;
+
     const analysis = await analyzeWithAI(businessName, query, responseText, businessContext);
 
     const usage = data.usage ?? {};
@@ -1019,15 +1040,14 @@ async function queryPerplexity(apiKey: string, query: string, businessName: stri
     const pricing = TOKEN_PRICING["perplexity"];
     const actualCost = (inputTokens * pricing.input) + (outputTokens * pricing.output) + pricing.toolCost;
 
-    healthCallback?.("perplexity", "success", Date.now() - startTime);
     return { platform: "Perplexity", query, responseText, ...analysis, sourceType: "grounded" as const, crossValidated: null, citedUrls: [...new Set(citedUrls)], actualCost };
   } catch (err: any) {
-    healthCallback?.("perplexity", "error", Date.now() - startTime, err.message);
+    if (!providerCallSucceeded) healthCallback?.("perplexity", "error", Date.now() - startTime, err.message);
     throw err;
   }
 }
 
-const PROVIDER_FN: Record<string, (apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }) => Promise<AIQueryResult>> = {
+const PROVIDER_FN: Record<string, (apiKey: string, query: string, businessName: string, extraTerms?: string[], businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }, useWebSearch?: boolean) => Promise<AIQueryResult>> = {
   openai: queryOpenAI,
   anthropic: queryAnthropic,
   google: queryGemini,
@@ -1136,12 +1156,16 @@ async function runOneQuery(
   keys: { provider: string; apiKey: string }[],
   extraTerms: string[] | undefined,
   businessContext: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null } | undefined,
+  useWebSearch: boolean = true,
 ): Promise<AIQueryResult[]> {
   const platformPromises = keys.map(async (key) => {
     const fn = PROVIDER_FN[key.provider];
     if (!fn) return null;
+    // Perplexity's API is always grounded — skip it in ungrounded mode since
+    // there's no equivalent "knowledge only" model anymore.
+    if (!useWebSearch && key.provider === "perplexity") return null;
     try {
-      const result = await fn(key.apiKey, query, businessName, extraTerms, businessContext);
+      const result = await fn(key.apiKey, query, businessName, extraTerms, businessContext, useWebSearch);
       if (isGenericResponse(result.responseText)) {
         console.log(`[Scan] Generic response detected from ${result.platform} for "${query}"`);
         result.confidence = "low";
@@ -1172,7 +1196,8 @@ export async function* runScan(
   queries: string[],
   keys: { provider: string; apiKey: string }[],
   extraTerms?: string[],
-  businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null }
+  businessContext?: { location?: string | null; website?: string | null; services?: string | null; industry?: string | null },
+  useWebSearch: boolean = true,
 ): AsyncGenerator<AIQueryResult> {
   const CONCURRENT_QUERIES = 2;
 
@@ -1180,7 +1205,7 @@ export async function* runScan(
   for (let i = 0; i < queries.length; i += CONCURRENT_QUERIES) {
     const batch = queries.slice(i, i + CONCURRENT_QUERIES);
     const batchResults = await Promise.allSettled(
-      batch.map(q => runOneQuery(q, businessName, keys, extraTerms, businessContext))
+      batch.map(q => runOneQuery(q, businessName, keys, extraTerms, businessContext, useWebSearch))
     );
 
     for (const outcome of batchResults) {

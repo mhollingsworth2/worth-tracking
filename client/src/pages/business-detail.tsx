@@ -630,6 +630,10 @@ export default function BusinessDetail() {
               <Search className="w-3.5 h-3.5 mr-1.5" />
               Real Searches
             </TabsTrigger>
+            <TabsTrigger value="grounding-delta" data-testid="tab-grounding-delta">
+              <Radar className="w-3.5 h-3.5 mr-1.5" />
+              Grounding Delta
+            </TabsTrigger>
             <TabsTrigger value="geo-roadmap" data-testid="tab-geo-roadmap">
               <Crosshair className="w-3.5 h-3.5 mr-1.5" />
               GEO Roadmap
@@ -1230,6 +1234,10 @@ export default function BusinessDetail() {
 
           <TabsContent value="geo-roadmap" className="space-y-6 mt-4">
             <GeoRoadmapSection businessId={id} />
+          </TabsContent>
+
+          <TabsContent value="grounding-delta" className="space-y-6 mt-4">
+            <GroundingDeltaSection businessId={id} />
           </TabsContent>
 
           {/* ========== PROMPTS TAB ========== */}
@@ -2682,6 +2690,139 @@ function SentimentSection({ businessId }: { businessId: number }) {
 }
 
 /* ============ GEO ROADMAP SECTION ============ */
+function GroundingDeltaSection({ businessId }: { businessId: number }) {
+  const { data, isLoading } = useQuery<{
+    memorized: string[];
+    discoverable: string[];
+    hallucinated: string[];
+    invisible: string[];
+    pending: string[];
+    lastUngroundedScanDate: string | null;
+    hasUngroundedData: boolean;
+  }>({
+    queryKey: [`/api/businesses/${businessId}/grounding-delta`],
+  });
+
+  if (isLoading) {
+    return <div className="flex items-center justify-center py-12"><Loader2 className="w-6 h-6 animate-spin" /></div>;
+  }
+
+  if (!data?.hasUngroundedData) {
+    return (
+      <Card>
+        <CardContent className="p-8 text-center">
+          <Radar className="w-10 h-10 mx-auto mb-3 text-muted-foreground" />
+          <p className="font-medium">Grounding delta not yet available</p>
+          <p className="text-sm text-muted-foreground mt-2 max-w-md mx-auto">
+            We run a knowledge-only (no live web search) pass on your first scan and then weekly.
+            Once it completes, you'll see where you're memorized by the models vs. only found via
+            live search.
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  const lastScan = data.lastUngroundedScanDate
+    ? new Date(data.lastUngroundedScanDate).toLocaleDateString()
+    : "—";
+
+  type CategoryKey = "memorized" | "discoverable" | "hallucinated" | "invisible";
+  const categories: { key: CategoryKey; label: string; color: string; description: string }[] = [
+    {
+      key: "memorized",
+      label: "Memorized",
+      color: "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800",
+      description: "Mentioned both with and without live web search — strong brand recall in the model's training data.",
+    },
+    {
+      key: "discoverable",
+      label: "Discoverable only via live search",
+      color: "bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300 border-blue-200 dark:border-blue-800",
+      description: "Only mentioned when the model uses live web search. Invisible in API calls that don't enable grounding — this is your API vs. consumer UI gap.",
+    },
+    {
+      key: "hallucinated",
+      label: "Possibly hallucinated",
+      color: "bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300 border-amber-200 dark:border-amber-800",
+      description: "Mentioned in knowledge-only mode but not with live search. The model may be confusing you with another business — investigate.",
+    },
+    {
+      key: "invisible",
+      label: "Invisible",
+      color: "bg-rose-100 text-rose-800 dark:bg-rose-900/30 dark:text-rose-300 border-rose-200 dark:border-rose-800",
+      description: "Not mentioned in either mode. These are the highest-priority queries for content/PR work.",
+    },
+  ];
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <CardHeader>
+          <div className="flex items-center justify-between">
+            <div>
+              <CardTitle className="text-sm font-medium flex items-center gap-2">
+                <Radar className="w-4 h-4 text-primary" />
+                Grounded vs. Knowledge-Only Delta
+              </CardTitle>
+              <CardDescription className="text-xs mt-1">
+                Shows where you appear when the model has live web search vs. training data only.
+                Last knowledge-only scan: {lastScan}
+              </CardDescription>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            {categories.map((c) => (
+              <div key={c.key as string} className={`rounded-lg border p-3 ${c.color}`}>
+                <div className="text-2xl font-bold">{data[c.key].length}</div>
+                <div className="text-xs font-medium mt-1">{c.label}</div>
+              </div>
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+
+      {categories.map((c) => {
+        const queries = data[c.key];
+        if (queries.length === 0) return null;
+        return (
+          <Card key={c.key as string}>
+            <CardHeader>
+              <CardTitle className="text-sm font-medium flex items-center gap-2">
+                <Badge className={c.color} variant="outline">{c.label}</Badge>
+                <span className="text-muted-foreground font-normal">({queries.length})</span>
+              </CardTitle>
+              <CardDescription className="text-xs">{c.description}</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <ul className="space-y-1.5">
+                {queries.map((q, i) => (
+                  <li key={i} className="text-sm font-mono bg-muted/40 rounded px-2 py-1">{q}</li>
+                ))}
+              </ul>
+            </CardContent>
+          </Card>
+        );
+      })}
+
+      {data.pending.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-xs font-medium text-muted-foreground">
+              Awaiting next scan ({data.pending.length})
+            </CardTitle>
+            <CardDescription className="text-xs">
+              These queries have results in only one mode so far — we'll categorize them after the next pass.
+            </CardDescription>
+          </CardHeader>
+        </Card>
+      )}
+    </div>
+  );
+}
+
 function GeoRoadmapSection({ businessId }: { businessId: number }) {
   const { toast } = useToast();
   const { data: actions, isLoading } = useQuery<any[]>({

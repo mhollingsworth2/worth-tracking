@@ -1017,6 +1017,55 @@ async function autoScanBusiness(businessId: number) {
       }
     }
 
+    // ── Ungrounded (knowledge-only) delta pass ──────────────────────────────
+    // Run on the first scan, then at most once per 7 days. This captures what
+    // the model "knows" without live web search, so we can compare against the
+    // grounded results and categorize queries as memorized / discoverable /
+    // hallucinated / invisible.
+    try {
+      const lastUngrounded = (biz as any).lastUngroundedScanDate ?? null;
+      const now = Date.now();
+      const weekMs = 7 * 24 * 60 * 60 * 1000;
+      const shouldRunUngrounded = !lastUngrounded || (now - new Date(lastUngrounded).getTime()) > weekMs;
+      if (shouldRunUngrounded) {
+        console.log(`[Auto-Scan] Running ungrounded delta pass for "${biz.name}"`);
+        const ungroundedDate = new Date().toISOString().split("T")[0];
+        for await (const result of runScan(biz.name, queries, keyInputs, extraTerms, { location: biz.location ?? null, website: biz.website ?? null, services: (biz as any).services ?? null, industry: biz.industry ?? null }, false)) {
+          const platformId = platformMap[result.platform] ?? 1;
+          await storage.createSearchRecord({
+            businessId,
+            platformId,
+            query: result.query,
+            mentioned: result.mentioned ? 1 : 0,
+            position: result.position,
+            sentiment: result.sentiment,
+            confidence: result.confidence,
+            sourceType: result.sourceType, // "knowledge"
+            crossValidated: result.crossValidated === null ? null : result.crossValidated ? 1 : 0,
+            date: ungroundedDate,
+          });
+          // Track cost
+          const providerKey = keyInputs.find(k => {
+            const pMap: Record<string, string> = { openai: "ChatGPT", anthropic: "Claude", google: "Google Gemini", perplexity: "Perplexity" };
+            return pMap[k.provider] === result.platform;
+          });
+          if (providerKey) {
+            const cost = (result as any).actualCost ?? (PROVIDER_COST_PER_CALL[providerKey.provider] ?? 0.005);
+            db.insert(apiUsage).values({
+              provider: providerKey.provider,
+              estimatedCost: cost.toFixed(6),
+              date: ungroundedDate,
+              timestamp: new Date().toISOString(),
+            }).run();
+          }
+        }
+        db.run(sql`UPDATE businesses SET last_ungrounded_scan_date = ${new Date().toISOString()} WHERE id = ${businessId}`);
+        console.log(`[Auto-Scan] Ungrounded delta pass complete for "${biz.name}"`);
+      }
+    } catch (err: any) {
+      console.error(`[Auto-Scan] Ungrounded delta pass failed for ${businessId}:`, err.message);
+    }
+
     // Generate alerts, prompts, and content gaps based on scan results
     await generateScanAlerts(businessId);
     await generateOptimizedPrompts(businessId);
@@ -1139,6 +1188,7 @@ export async function registerRoutes(
   try { db.run(sql`ALTER TABLE businesses ADD COLUMN unique_selling_points TEXT`); } catch (_e) { /* exists */ }
   try { db.run(sql`ALTER TABLE businesses ADD COLUMN known_competitors TEXT`); } catch (_e) { /* exists */ }
   try { db.run(sql`ALTER TABLE businesses ADD COLUMN custom_queries TEXT`); } catch (_e) { /* exists */ }
+  try { db.run(sql`ALTER TABLE businesses ADD COLUMN last_ungrounded_scan_date TEXT`); } catch (_e) { /* exists */ }
 
   db.run(sql`CREATE TABLE IF NOT EXISTS platforms (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1165,7 +1215,7 @@ export async function registerRoutes(
   try { db.run(sql`ALTER TABLE search_records ADD COLUMN competitor_id INTEGER`); } catch (_e) { /* exists */ }
 
   // De-dup prior duplicate rows BEFORE creating the unique index. Keep the row
-  // with the lowest id per (business_id, platform_id, query, date, competitor_id)
+  // with the lowest id per (business, platform, query, date, competitor, source_type)
   // tuple. Running unscanned businesses that were double-scanned the same day
   // would otherwise block the index creation.
   try {
@@ -1173,16 +1223,20 @@ export async function registerRoutes(
       DELETE FROM search_records
       WHERE id NOT IN (
         SELECT MIN(id) FROM search_records
-        GROUP BY business_id, platform_id, query, date, COALESCE(competitor_id, -1)
+        GROUP BY business_id, platform_id, query, date, COALESCE(competitor_id, -1), COALESCE(source_type, 'grounded')
       )
     `);
   } catch (err: any) {
     console.error("[Migration] search_records de-dup failed:", err.message);
   }
-  // Prevent future duplicates: one record per (business, platform, query, date, competitor) tuple.
+  // Drop older variant of the index (without source_type) if present.
+  try { db.run(sql`DROP INDEX IF EXISTS idx_search_records_unique`); } catch (_e) { /* ignore */ }
+  // Prevent future duplicates: one record per (business, platform, query, date, competitor, source_type) tuple.
+  // source_type is included so grounded + knowledge-only scans on the same day
+  // can coexist without the upsert path clobbering one with the other.
   try {
-    db.run(sql`CREATE UNIQUE INDEX IF NOT EXISTS idx_search_records_unique
-      ON search_records (business_id, platform_id, query, date, COALESCE(competitor_id, -1))`);
+    db.run(sql`CREATE UNIQUE INDEX IF NOT EXISTS idx_search_records_unique_v2
+      ON search_records (business_id, platform_id, query, date, COALESCE(competitor_id, -1), COALESCE(source_type, 'grounded'))`);
   } catch (err: any) {
     console.error("[Migration] search_records unique index creation failed:", err.message);
   }
@@ -1379,6 +1433,14 @@ export async function registerRoutes(
     date TEXT NOT NULL,
     timestamp TEXT NOT NULL
   )`);
+
+  // One-time migration: historical rows where the "error" came from the
+  // secondary analyzeWithAI call were incorrectly attributed to the primary
+  // provider. These always contain the word "analysis" in the message.
+  // Purge them so Platform Health stops understating provider uptime.
+  try {
+    db.run(sql`DELETE FROM platform_health WHERE status = 'error' AND error_message LIKE '%analysis%'`);
+  } catch (_e) { /* ignore */ }
 
   db.run(sql`CREATE TABLE IF NOT EXISTS citations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2038,7 +2100,10 @@ export async function registerRoutes(
     const platformMap = Object.fromEntries(allPlatforms.map((p) => [p.id, p]));
     const comps = await storage.getCompetitors(businessId);
 
-    // Fetch all competitor search records for this business
+    // Fetch all competitor search records for this business.
+    // Exclude knowledge-only (ungrounded) records — competitors are never run
+    // in ungrounded mode, so including them on the business side would make
+    // the comparison apples-to-oranges.
     const compRows = db.select({
       competitorId: sql<number>`competitor_id`,
       query: searchRecords.query,
@@ -2048,7 +2113,7 @@ export async function registerRoutes(
       avgPosition: sql<number>`avg(case when mentioned = 1 then position end)`,
     })
       .from(searchRecords)
-      .where(sql`business_id = ${businessId} AND competitor_id IS NOT NULL`)
+      .where(sql`business_id = ${businessId} AND competitor_id IS NOT NULL AND (source_type IS NULL OR source_type != 'knowledge')`)
       .groupBy(sql`competitor_id, query, platform_id`)
       .all();
 
@@ -2065,7 +2130,7 @@ export async function registerRoutes(
         mentions: sql<number>`sum(case when mentioned = 1 then 1 else 0 end)`,
       })
         .from(searchRecords)
-        .where(sql`business_id = ${businessId} AND competitor_id IS NULL AND query IN (${sql.raw(queryList)})`)
+        .where(sql`business_id = ${businessId} AND competitor_id IS NULL AND query IN (${sql.raw(queryList)}) AND (source_type IS NULL OR source_type != 'knowledge')`)
         .get();
       myMentionRate = myRow && myRow.total > 0 ? Math.round((myRow.mentions / myRow.total) * 100) : 0;
     }
@@ -2145,6 +2210,67 @@ export async function registerRoutes(
     }));
 
     res.json({ myMentionRate, competitors: result });
+  });
+
+  // === GROUNDING DELTA ===
+  // Compares grounded (live-web) vs knowledge-only results per query to show
+  // the "API vs consumer UI" gap:
+  //  - memorized:    mentioned in BOTH grounded and ungrounded responses
+  //  - discoverable: mentioned ONLY when live web search is active
+  //  - hallucinated: mentioned ONLY in knowledge mode (suspect — model may be
+  //                  guessing or confusing you with someone else)
+  //  - invisible:    not mentioned in either
+  app.get("/api/businesses/:id/grounding-delta", async (req, res) => {
+    const businessId = parseInt(req.params.id);
+    const business = await storage.getBusiness(businessId);
+    if (!business) return res.status(404).json({ error: "Business not found" });
+
+    const rows = db.select({
+      query: searchRecords.query,
+      sourceType: searchRecords.sourceType,
+      mentioned: sql<number>`sum(case when mentioned = 1 then 1 else 0 end)`,
+      total: sql<number>`count(*)`,
+    })
+      .from(searchRecords)
+      .where(sql`business_id = ${businessId} AND competitor_id IS NULL`)
+      .groupBy(sql`query, source_type`)
+      .all();
+
+    type QueryState = { query: string; grounded: boolean | null; ungrounded: boolean | null };
+    const byQuery = new Map<string, QueryState>();
+    for (const r of rows) {
+      const entry = byQuery.get(r.query) ?? { query: r.query, grounded: null, ungrounded: null };
+      const mentioned = r.mentioned > 0;
+      if (r.sourceType === "knowledge") entry.ungrounded = mentioned;
+      else entry.grounded = mentioned; // treat null/grounded/training as grounded
+      byQuery.set(r.query, entry);
+    }
+
+    const memorized: string[] = [];
+    const discoverable: string[] = [];
+    const hallucinated: string[] = [];
+    const invisible: string[] = [];
+    const pending: string[] = []; // has only one mode so far
+
+    for (const e of byQuery.values()) {
+      if (e.grounded === null || e.ungrounded === null) { pending.push(e.query); continue; }
+      if (e.grounded && e.ungrounded) memorized.push(e.query);
+      else if (e.grounded && !e.ungrounded) discoverable.push(e.query);
+      else if (!e.grounded && e.ungrounded) hallucinated.push(e.query);
+      else invisible.push(e.query);
+    }
+
+    const lastUngrounded = (business as any).lastUngroundedScanDate ?? null;
+
+    res.json({
+      memorized,
+      discoverable,
+      hallucinated,
+      invisible,
+      pending,
+      lastUngroundedScanDate: lastUngrounded,
+      hasUngroundedData: byQuery.size > 0 && Array.from(byQuery.values()).some(e => e.ungrounded !== null),
+    });
   });
 
   // === COMPETITIVE PROMPT INTELLIGENCE ===
