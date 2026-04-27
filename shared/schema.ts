@@ -19,6 +19,8 @@ export const businesses = sqliteTable("businesses", {
   competitors: text("known_competitors"), // comma-separated competitor names
   customQueries: text("custom_queries"), // newline-separated custom search queries to track
   lastUngroundedScanDate: text("last_ungrounded_scan_date"), // ISO timestamp of last knowledge-only pass
+  lastCompetitorDetection: text("last_competitor_detection"), // ISO timestamp of last competitor re-detection
+  schemaAuditJson: text("schema_audit_json"), // JSON: { score, foundTypes, missingTypes, lastAuditAt }
 });
 
 export const insertBusinessSchema = createInsertSchema(businesses).omit({ id: true });
@@ -180,6 +182,8 @@ export const citations = sqliteTable("citations", {
   platform: text("platform").notNull(),
   query: text("query").notNull(),
   date: text("date").notNull(),
+  authorityTier: text("authority_tier"), // "authority" | "reputable" | "standard" | "low"
+  authorityScore: integer("authority_score"), // 0-100 numeric score for sorting
 });
 
 export type Citation = typeof citations.$inferSelect;

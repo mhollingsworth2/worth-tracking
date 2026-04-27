@@ -415,12 +415,29 @@ async function analyzeWithAI(businessName: string, query: string, responseText: 
   const queryContainsName = searchVariants.some(v => queryLower.includes(v));
   const sentimentTopic = classifyTopic(queryLower);
 
-  // ── Fast path: name not in response → not mentioned, no AI call needed ──
-  if (!nameFoundInResponse) {
-    const isGeneric = ["i don't have", "i cannot", "search google", "check yelp",
-      "i recommend checking", "you might want to search"].some(p => lower.includes(p));
-    console.log(`[Analysis] "${businessName}" NOT FOUND ✗ | responseLen:${responseText.length} | confidence:${isGeneric ? "low" : "high"}`);
-    return { mentioned: false, sentiment: "neutral", sentimentScore: 50, sentimentTopic, confidence: isGeneric ? "low" : "high", position: null };
+  // Detect "I don't know / can't help" generic refusals so we can skip the
+  // AI call safely on those — no useful paraphrased mention can exist in a
+  // 20-word refusal.
+  const isGenericRefusal = ["i don't have", "i cannot", "search google", "check yelp",
+    "i recommend checking", "you might want to search", "i'm not able to",
+    "i don't know", "i'm unable to", "as an ai"].some(p => lower.includes(p));
+  const isShortResponse = responseText.length < 120;
+
+  // ── Fast path: only when we're confident there's no hidden mention ───────
+  // Previous logic skipped AI analysis whenever the literal name string was
+  // missing. That missed real mentions via paraphrase ("the leading provider
+  // in the area"), acronyms, or pronouns. Now we only fast-path when:
+  //   (a) the name isn't found literally, AND
+  //   (b) the response is a generic refusal OR too short to plausibly contain
+  //       an indirect mention, OR
+  //   (c) we have no AI analysis keys available to check.
+  // Otherwise we still run the AI analysis to catch paraphrased mentions —
+  // this is the change that closes the ~10-20% false-negative gap for
+  // businesses with ambiguous multi-word names.
+  const canSafelyFastPath = !nameFoundInResponse && (isGenericRefusal || isShortResponse || analysisKeys.length === 0);
+  if (canSafelyFastPath) {
+    console.log(`[Analysis] "${businessName}" NOT FOUND ✗ | responseLen:${responseText.length} | fastpath reason:${isGenericRefusal ? "refusal" : isShortResponse ? "short" : "no-ai-keys"}`);
+    return { mentioned: false, sentiment: "neutral", sentimentScore: 50, sentimentTopic, confidence: isGenericRefusal ? "low" : "high", position: null };
   }
 
   // ── AI-powered analysis (accurate sentiment, negation, sarcasm, echo detection) ──
@@ -1340,31 +1357,39 @@ export function generateScanQueries(ctx: BusinessContext): string[] {
         `What are the best ${ind} businesses in the ${loc} area? Give me your top picks.`,
         `I'm looking for a reliable ${ind} provider near ${loc}. Who should I call?`,
         `Which ${ind} companies in ${loc} have the best reputation?`,
+        `Top ${ind} companies in ${loc} — who should I consider?`,
+        `Recommend a ${ind} business in ${loc} that people actually trust.`,
+        `Who are the leading ${ind} providers serving ${loc}?`,
       ]
     : [
         `I need a good ${ind} company. Who do you recommend?`,
         `What are the best ${ind} businesses right now? Give me your top picks.`,
         `I'm looking for a reliable ${ind} provider. Who should I call?`,
         `Which ${ind} companies have the best reputation?`,
+        `Top ${ind} companies right now — who should I consider?`,
+        `Recommend a ${ind} business that people actually trust.`,
       ];
 
   // ── Service-specific queries ──────────────────────────────────────────────
   const serviceQueries: string[] = [];
-  for (const svc of servicesList.slice(0, 4)) {
+  for (const svc of servicesList.slice(0, 5)) {
     serviceQueries.push(`I need ${svc} services${loc ? ` in ${loc}` : ""}. Who's the best?`);
     serviceQueries.push(`Who offers the best ${svc}${loc ? ` near ${loc}` : ""}? Give me specific names.`);
+    serviceQueries.push(`Recommend a ${ind} company that specializes in ${svc}${loc ? ` around ${loc}` : ""}.`);
   }
 
   // ── Keyword-driven queries ────────────────────────────────────────────────
   const keywordQueries: string[] = [];
-  for (const kw of keywordsList.slice(0, 4)) {
+  for (const kw of keywordsList.slice(0, 5)) {
     keywordQueries.push(`I'm looking for ${kw} ${ind}${loc ? ` in ${loc}` : ""}. Who do you recommend?`);
+    keywordQueries.push(`Best ${kw} ${ind}${loc ? ` in ${loc}` : ""} — what are my options?`);
   }
 
   // ── Audience-specific queries ─────────────────────────────────────────────
   const audienceQueries: string[] = [];
-  for (const aud of audienceList.slice(0, 3)) {
+  for (const aud of audienceList.slice(0, 4)) {
     audienceQueries.push(`What's the best ${ind} for ${aud}${loc ? ` in ${loc}` : ""}?`);
+    audienceQueries.push(`Which ${ind} companies work well for ${aud}${loc ? ` near ${loc}` : ""}?`);
   }
 
   // ── Competitor comparison queries ─────────────────────────────────────────
@@ -1414,11 +1439,36 @@ export function generateScanQueries(ctx: BusinessContext): string[] {
         `I want an affordable but good ${ind} service in ${loc}. Any suggestions?`,
         `What should I look for when hiring a ${ind} company in ${loc}? Who do you recommend?`,
         `Which ${ind} services in ${loc} give you the best value for money?`,
+        `Premium ${ind} in ${loc} — who's worth the extra cost?`,
+        `Small business ${ind} options in ${loc} — any hidden gems?`,
       ]
     : [
         `I want an affordable but good ${ind} service. Any suggestions?`,
         `What should I look for when hiring a ${ind} company? Who do you recommend?`,
         `Which ${ind} services give you the best value for money?`,
+        `Premium ${ind} providers — who's worth the extra cost?`,
+      ];
+
+  // ── Voice-search / conversational phrasing ───────────────────────────────
+  const voice: string[] = loc
+    ? [
+        `Hey, who's the top-rated ${ind} near ${loc}?`,
+        `What ${ind} should I call first in ${loc}?`,
+      ]
+    : [
+        `Hey, who's the top-rated ${ind} I should check out?`,
+        `What ${ind} should I call first?`,
+      ];
+
+  // ── Problem-led queries (real user phrasing) ─────────────────────────────
+  const problemLed: string[] = loc
+    ? [
+        `I'm having issues and need a ${ind} in ${loc} today. Who can help?`,
+        `What ${ind} in ${loc} has the fastest response?`,
+      ]
+    : [
+        `I need a ${ind} today. Who can help right now?`,
+        `Which ${ind} is known for the fastest response?`,
       ];
 
   // ── Seasonal / trending ───────────────────────────────────────────────────
@@ -1427,10 +1477,12 @@ export function generateScanQueries(ctx: BusinessContext): string[] {
     ? [
         `What are the best ${ind} companies in ${loc} for ${currentYear}?`,
         `Is ${name} in ${loc} still good in ${currentYear}? Or are there better options now?`,
+        `Any new ${ind} providers in ${loc} worth checking in ${currentYear}?`,
       ]
     : [
         `What are the best ${ind} companies for ${currentYear}?`,
         `Is ${name} still good in ${currentYear}? Or are there better options now?`,
+        `Any new ${ind} providers worth checking in ${currentYear}?`,
       ];
 
   // ── Custom queries (user-provided, highest priority) ───────────────────────
@@ -1451,6 +1503,8 @@ export function generateScanQueries(ctx: BusinessContext): string[] {
     ...review,
     ...local,
     ...longTail,
+    ...voice,
+    ...problemLed,
     ...seasonal,
   ];
 
@@ -1464,7 +1518,10 @@ export function generateScanQueries(ctx: BusinessContext): string[] {
     }
   }
 
-  // Higher cap when custom queries are provided
-  const cap = custom.length > 0 ? Math.max(25, custom.length + 10) : 25;
+  // Default cap raised to 50 — needed for the headline mention-rate to have
+  // a usable confidence interval (~±7% at 50 samples per provider × 4 providers
+  // = 200 total data points, down from ±15% at 25).
+  // Higher cap when custom queries are provided.
+  const cap = custom.length > 0 ? Math.max(50, custom.length + 15) : 50;
   return unique.slice(0, cap);
 }

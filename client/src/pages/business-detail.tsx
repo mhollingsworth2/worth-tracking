@@ -623,7 +623,19 @@ export default function BusinessDetail() {
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
           <KPICard label="Total Searches" value={stats?.totalSearches ?? 0} icon={Search} loading={statsLoading} tooltip="How many times AI platforms were queried with searches relevant to your business." subtitle={`Your business was tested across ${stats?.totalSearches ?? 0} AI queries`} />
           <KPICard label="AI Mentions" value={stats?.totalMentions ?? 0} icon={Eye} loading={statsLoading} tooltip="How many of those searches resulted in the AI actually mentioning your business by name." subtitle={`Your business was recommended ${stats?.totalMentions ?? 0} times across all AI platforms`} />
-          <KPICard label="AI Visibility Score" value={`${stats?.mentionRate ?? 0}%`} icon={TrendingUp} loading={statsLoading} subtitle={`This means ${Math.round((stats?.mentionRate ?? 0) / 10)} out of every 10 AI users see your business`} tooltip="The percentage of AI search queries where your business is mentioned. Higher is better — top businesses typically score 60%+." trafficLightRate={stats?.mentionRate ?? 0} />
+          <KPICard
+            label="AI Visibility Score"
+            value={`${stats?.mentionRate ?? 0}%`}
+            icon={TrendingUp}
+            loading={statsLoading}
+            subtitle={
+              stats?.mentionRateMargin != null && stats?.totalSearches > 0
+                ? `95% CI: ${stats.mentionRateLower}\u2013${stats.mentionRateUpper}% (\u00b1${stats.mentionRateMargin}% at n=${stats.totalSearches})`
+                : `This means ${Math.round((stats?.mentionRate ?? 0) / 10)} out of every 10 AI users see your business`
+            }
+            tooltip="The percentage of AI search queries where your business is mentioned. The 95% CI shows the true-value range given sample size. Smaller range = more reliable number. Top businesses typically score 60%+."
+            trafficLightRate={stats?.mentionRate ?? 0}
+          />
           <KPICard label="Avg Position" value={stats?.avgPosition ?? "N/A"} icon={Hash} loading={statsLoading} subtitle={stats?.avgPosition ? `When mentioned, you typically appear #${stats.avgPosition} in the response` : "Not yet mentioned"} tooltip="When AI mentions your business, this is where you typically appear in the response. #1 means you're mentioned first." />
         </div>
 
@@ -1439,6 +1451,7 @@ export default function BusinessDetail() {
           <TabsContent value="settings" className="space-y-6 mt-4">
             <ScanScheduleSection businessId={id} />
             <PlatformHealthCard />
+            <SchemaAuditCard businessId={id} website={business.website ?? null} />
             <AIContextSettings businessId={id} business={business} />
             {/* Embed Click Tracker */}
             <Card>
@@ -2332,13 +2345,36 @@ function ContentGapsSection({ gaps }: { gaps: ContentGap[] }) {
 }
 
 /* ============ CITATIONS SECTION ============ */
+// Authority-tier badge styling. Mirrors the heuristic in server/citation-authority.ts:
+// authority = known top-tier pubs / .gov / .edu, reputable = trade/dirs/.org,
+// standard = unknown commercial, low = free hosts / spam TLDs.
+const AUTHORITY_TIER_STYLES: Record<string, { label: string; className: string }> = {
+  authority: { label: "Authority", className: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300 border-emerald-200 dark:border-emerald-900" },
+  reputable: { label: "Reputable", className: "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300 border-blue-200 dark:border-blue-900" },
+  standard:  { label: "Standard",  className: "bg-muted text-muted-foreground" },
+  low:       { label: "Low",       className: "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300 border-amber-200 dark:border-amber-900" },
+  unrated:   { label: "Unrated",   className: "bg-muted text-muted-foreground" },
+};
+
+function AuthorityBadge({ tier }: { tier: string | null | undefined }) {
+  const key = (tier ?? "unrated") as keyof typeof AUTHORITY_TIER_STYLES;
+  const cfg = AUTHORITY_TIER_STYLES[key] ?? AUTHORITY_TIER_STYLES.unrated;
+  return (
+    <Badge variant="outline" className={`text-[10px] h-4 px-1.5 ${cfg.className}`}>
+      {cfg.label}
+    </Badge>
+  );
+}
+
 function CitationsSection({ businessId }: { businessId: number }) {
   const { data, isLoading } = useQuery<{
     totalCitations: number;
     ownCitations: number;
     ownCitationRate: number;
-    topDomains: { domain: string; count: number; isOwn: boolean; platforms: string[] }[];
-    recentCitations: { url: string; domain: string; platform: string; query: string; date: string; isOwnDomain: number }[];
+    avgAuthorityScore: number | null;
+    authorityBreakdown: { authority: number; reputable: number; standard: number; low: number; unrated: number };
+    topDomains: { domain: string; count: number; isOwn: boolean; platforms: string[]; authorityTier: string | null; authorityScore: number | null }[];
+    recentCitations: { url: string; domain: string; platform: string; query: string; date: string; isOwnDomain: number; authorityTier?: string | null; authority_tier?: string | null }[];
   }>({
     queryKey: [`/api/businesses/${businessId}/citations`],
     queryFn: async () => { const res = await fetch(`/api/businesses/${businessId}/citations`); return res.json(); },
@@ -2361,7 +2397,7 @@ function CitationsSection({ businessId }: { businessId: number }) {
   return (
     <>
       {/* KPI row */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
         <Card>
           <CardContent className="p-4">
             <p className="text-xs text-muted-foreground font-medium">Total Citations</p>
@@ -2385,6 +2421,38 @@ function CitationsSection({ businessId }: { businessId: number }) {
             <p className="text-xs text-muted-foreground mt-1">Percentage of all citations pointing to your site</p>
           </CardContent>
         </Card>
+        <Card>
+          <CardContent className="p-4">
+            <div className="flex items-center gap-1">
+              <p className="text-xs text-muted-foreground font-medium">Avg. Citation Authority</p>
+              <InfoTip text="Average domain-authority score (0–100) across every citation. Authority = NYT/WSJ/.gov tier. Reputable = trade press, directories, .org. Low = free hosts (wordpress.com, .xyz). Higher = AI is grounding answers in trusted sources." />
+            </div>
+            <p
+              className={`text-2xl font-bold ${
+                data.avgAuthorityScore == null ? "text-muted-foreground" :
+                data.avgAuthorityScore >= 75 ? "text-emerald-600" :
+                data.avgAuthorityScore >= 50 ? "text-blue-600" :
+                data.avgAuthorityScore >= 30 ? "text-amber-600" : "text-red-600"
+              }`}
+              data-testid="text-avg-authority"
+            >
+              {data.avgAuthorityScore ?? "–"}
+            </p>
+            {data.authorityBreakdown && (
+              <div className="flex gap-1 mt-1 flex-wrap">
+                {(["authority", "reputable", "standard", "low"] as const).map(t => {
+                  const n = data.authorityBreakdown[t] ?? 0;
+                  if (n === 0) return null;
+                  return (
+                    <Badge key={t} variant="outline" className={`text-[10px] h-4 px-1 ${AUTHORITY_TIER_STYLES[t].className}`}>
+                      {AUTHORITY_TIER_STYLES[t].label}: {n}
+                    </Badge>
+                  );
+                })}
+              </div>
+            )}
+          </CardContent>
+        </Card>
       </div>
 
       {/* Top domains */}
@@ -2404,11 +2472,12 @@ function CitationsSection({ businessId }: { businessId: number }) {
                 <div key={d.domain} className="flex items-center gap-3">
                   <span className="text-xs text-muted-foreground w-5 text-right">{i + 1}</span>
                   <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 flex-wrap">
                       <span className={`text-sm font-mono truncate ${d.isOwn ? "text-emerald-600 font-semibold" : ""}`}>
                         {d.domain}
                       </span>
                       {d.isOwn && <Badge variant="default" className="text-[10px] h-4 px-1.5">Your site</Badge>}
+                      <AuthorityBadge tier={d.authorityTier} />
                     </div>
                     <div className="flex gap-1 mt-0.5">
                       {d.platforms.map(p => (
@@ -2439,19 +2508,23 @@ function CitationsSection({ businessId }: { businessId: number }) {
         </CardHeader>
         <CardContent>
           <div className="space-y-2 max-h-80 overflow-y-auto">
-            {data.recentCitations.map((c, i) => (
-              <div key={i} className="flex items-start gap-3 text-xs py-2 border-b last:border-0">
-                <div className="flex-1 min-w-0">
-                  <a href={c.url} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline truncate block font-mono">
-                    {c.url.replace(/^https?:\/\//, "").substring(0, 80)}
-                    <ExternalLink className="w-2.5 h-2.5 inline ml-1" />
-                  </a>
-                  <p className="text-muted-foreground mt-0.5 truncate">Query: {c.query}</p>
+            {data.recentCitations.map((c, i) => {
+              const tier = c.authorityTier ?? c.authority_tier ?? null;
+              return (
+                <div key={i} className="flex items-start gap-3 text-xs py-2 border-b last:border-0">
+                  <div className="flex-1 min-w-0">
+                    <a href={c.url} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline truncate block font-mono">
+                      {c.url.replace(/^https?:\/\//, "").substring(0, 80)}
+                      <ExternalLink className="w-2.5 h-2.5 inline ml-1" />
+                    </a>
+                    <p className="text-muted-foreground mt-0.5 truncate">Query: {c.query}</p>
+                  </div>
+                  <AuthorityBadge tier={tier} />
+                  <Badge variant="outline" className="text-[10px] shrink-0">{c.platform}</Badge>
+                  <span className="text-muted-foreground shrink-0">{c.date}</span>
                 </div>
-                <Badge variant="outline" className="text-[10px] shrink-0">{c.platform}</Badge>
-                <span className="text-muted-foreground shrink-0">{c.date}</span>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </CardContent>
       </Card>
@@ -3051,6 +3124,129 @@ function PlatformHealthCard() {
                 <span className="text-[10px] text-muted-foreground w-16 text-right">{h.successCount}✓ {h.errorCount}✗</span>
               </div>
             ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function SchemaAuditCard({ businessId, website }: { businessId: number; website: string | null }) {
+  const { toast } = useToast();
+  const { data: audit, isLoading, refetch, isFetching } = useQuery<{
+    score: number;
+    foundTypes: string[];
+    missingRecommended: string[];
+    jsonLdCount: number;
+    microdataHints: number;
+    error?: string;
+    lastAuditAt?: string;
+  }>({
+    queryKey: ["/api/businesses", businessId, "schema-audit"],
+    queryFn: async () => {
+      const res = await fetch(`/api/businesses/${businessId}/schema-audit`);
+      return res.json();
+    },
+    enabled: !!website,
+  });
+
+  const handleRefresh = async () => {
+    try {
+      const res = await fetch(`/api/businesses/${businessId}/schema-audit?refresh=1`);
+      const data = await res.json();
+      queryClient.setQueryData(["/api/businesses", businessId, "schema-audit"], data);
+      toast({ title: "Schema audit refreshed" });
+    } catch (err: any) {
+      toast({ title: "Audit failed", description: err?.message, variant: "destructive" });
+    }
+  };
+
+  if (!website) {
+    return (
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-sm font-medium flex items-center gap-2">
+            <Code2 className="w-4 h-4 text-primary" />
+            Schema Markup Audit
+          </CardTitle>
+          <CardDescription className="text-xs">Structured data on your website — required for strong AI SEO</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <p className="text-sm text-muted-foreground py-2">Add a website URL in the business settings above to enable the schema audit.</p>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  const scoreColor =
+    !audit ? "text-muted-foreground" :
+    audit.score >= 70 ? "text-emerald-600" :
+    audit.score >= 40 ? "text-amber-600" :
+    "text-destructive";
+
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        <CardTitle className="text-sm font-medium flex items-center gap-2">
+          <Code2 className="w-4 h-4 text-primary" />
+          Schema Markup Audit
+          <InfoTip text="Structured data (JSON-LD) on your website helps AI platforms understand who you are, what you sell, and how to cite you. Sites with LocalBusiness + FAQPage + AggregateRating typically get mentioned 2-3x more often." />
+        </CardTitle>
+        <CardDescription className="text-xs flex items-center justify-between">
+          <span>Last checked: {audit?.lastAuditAt ? new Date(audit.lastAuditAt).toLocaleString() : "—"}</span>
+          <Button variant="ghost" size="sm" onClick={handleRefresh} disabled={isFetching} className="h-6 text-xs">
+            {isFetching ? <Loader2 className="w-3 h-3 mr-1 animate-spin" /> : <RotateCcw className="w-3 h-3 mr-1" />}
+            Re-run audit
+          </Button>
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {isLoading ? <Skeleton className="h-24 w-full" /> : audit?.error ? (
+          <p className="text-sm text-destructive py-2">Audit error: {audit.error}</p>
+        ) : (
+          <div className="space-y-4">
+            <div className="flex items-center gap-4">
+              <div>
+                <div className={`text-3xl font-bold ${scoreColor}`}>{audit?.score ?? 0}</div>
+                <div className="text-xs text-muted-foreground">/ 100</div>
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="text-xs text-muted-foreground">
+                  {audit?.jsonLdCount ?? 0} JSON-LD block{audit?.jsonLdCount === 1 ? "" : "s"} · {audit?.microdataHints ?? 0} microdata hint{audit?.microdataHints === 1 ? "" : "s"} · {audit?.foundTypes?.length ?? 0} schema type{audit?.foundTypes?.length === 1 ? "" : "s"} detected
+                </div>
+                <div className="h-2 rounded-full bg-muted overflow-hidden mt-1">
+                  <div
+                    className={`h-full rounded-full transition-all ${audit && audit.score >= 70 ? "bg-emerald-500" : audit && audit.score >= 40 ? "bg-amber-500" : "bg-destructive"}`}
+                    style={{ width: `${audit?.score ?? 0}%` }}
+                  />
+                </div>
+              </div>
+            </div>
+
+            {audit?.foundTypes && audit.foundTypes.length > 0 && (
+              <div>
+                <p className="text-xs font-semibold text-muted-foreground mb-1.5 uppercase tracking-wide">Detected</p>
+                <div className="flex flex-wrap gap-1.5">
+                  {audit.foundTypes.map((t) => (
+                    <Badge key={t} variant="secondary" className="text-xs bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400">{t}</Badge>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {audit?.missingRecommended && audit.missingRecommended.length > 0 && (
+              <div>
+                <p className="text-xs font-semibold text-muted-foreground mb-1.5 uppercase tracking-wide">Missing (Recommended)</p>
+                <div className="flex flex-wrap gap-1.5">
+                  {audit.missingRecommended.map((t) => (
+                    <Badge key={t} variant="outline" className="text-xs border-amber-300 text-amber-700 dark:border-amber-700 dark:text-amber-400">{t}</Badge>
+                  ))}
+                </div>
+                <p className="text-xs text-muted-foreground mt-2">
+                  See the GEO Roadmap tab for specific implementation actions per missing type.
+                </p>
+              </div>
+            )}
           </div>
         )}
       </CardContent>

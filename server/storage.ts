@@ -32,6 +32,23 @@ sqlite.pragma("journal_mode = WAL");
 
 export const db = drizzle(sqlite);
 
+// ── Statistics helpers ──────────────────────────────────────────────────────
+// Wilson score interval for a binomial proportion at 95% confidence.
+// Gives a reasonable CI even at small sample sizes where normal-approximation
+// breaks down (important since our scans typically have 50-200 samples).
+// z = 1.96 corresponds to 95% confidence.
+export function wilsonCI(successes: number, trials: number, z: number = 1.96): { lower: number; upper: number } {
+  if (trials <= 0) return { lower: 0, upper: 0 };
+  const p = successes / trials;
+  const denom = 1 + (z * z) / trials;
+  const center = (p + (z * z) / (2 * trials)) / denom;
+  const margin = (z * Math.sqrt((p * (1 - p)) / trials + (z * z) / (4 * trials * trials))) / denom;
+  return {
+    lower: Math.max(0, center - margin),
+    upper: Math.min(1, center + margin),
+  };
+}
+
 export interface IStorage {
   // Businesses
   getBusinesses(): Promise<Business[]>;
@@ -239,10 +256,18 @@ export class DatabaseStorage implements IStorage {
       .where(ownFilter)
       .get();
 
+    const n = totalSearches?.count ?? 0;
+    const k = totalMentions?.count ?? 0;
+    const rate = n > 0 ? k / n : 0;
+    const ci = wilsonCI(k, n); // 95% Wilson score interval
+
     return {
-      totalSearches: totalSearches?.count ?? 0,
-      totalMentions: totalMentions?.count ?? 0,
-      mentionRate: totalSearches?.count ? Math.round(((totalMentions?.count ?? 0) / totalSearches.count) * 100) : 0,
+      totalSearches: n,
+      totalMentions: k,
+      mentionRate: n > 0 ? Math.round(rate * 100) : 0,
+      mentionRateLower: Math.round(ci.lower * 100),
+      mentionRateUpper: Math.round(ci.upper * 100),
+      mentionRateMargin: Math.round(((ci.upper - ci.lower) / 2) * 100),
       avgPosition: avgPosition?.avg ? Math.round(avgPosition.avg * 10) / 10 : null,
       platformCount: platformCount?.count ?? 0,
     };

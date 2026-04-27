@@ -16,6 +16,8 @@ import { requireAuth, requireAdmin, createSession, deleteSession, getSession } f
 import bcrypt from "bcryptjs";
 import { validateSearchRecord, validateReferral, validateAiSnapshot } from "./data-validation";
 import { ensureArchiveTables, runArchival } from "./data-archival";
+import { scoreDomainAuthority } from "./citation-authority";
+import { auditSchemaMarkup } from "./schema-audit";
 
 // Domains that are AI/search infrastructure — never real external citations.
 // Filter these before storing to the citations table so they don't pollute
@@ -79,17 +81,32 @@ function createBufferedHealthRecorder(dateStr: string) {
 function seedPlatforms() {
   const existing = db.select().from(platforms).all();
   if (existing.length === 0) {
+    // Note: Microsoft Copilot has no public chat API (Azure OpenAI is just
+    // GPT-4 under a different URL, not Copilot's grounded responses) and
+    // Meta AI has no public API at all. We only seed platforms we can
+    // actually scan. If/when those APIs become available, add them back
+    // along with the provider implementation in ai-providers.ts.
     const defaultPlatforms = [
       { name: "ChatGPT", icon: "bot", color: "#10a37f" },
       { name: "Perplexity", icon: "search", color: "#20808d" },
       { name: "Google Gemini", icon: "sparkles", color: "#4285f4" },
       { name: "Claude", icon: "brain", color: "#d97706" },
-      { name: "Copilot", icon: "cpu", color: "#0078d4" },
-      { name: "Meta AI", icon: "globe", color: "#0668e1" },
     ];
     for (const p of defaultPlatforms) {
       db.insert(platforms).values(p).run();
     }
+  } else {
+    // One-time cleanup for installs that seeded Copilot/Meta AI before we
+    // removed them. Only delete rows that have never been referenced by a
+    // search record — which should be all of them since those providers
+    // were never actually implemented.
+    try {
+      db.run(sql`
+        DELETE FROM platforms
+        WHERE name IN ('Copilot', 'Meta AI')
+        AND id NOT IN (SELECT DISTINCT platform_id FROM search_records WHERE platform_id IS NOT NULL)
+      `);
+    } catch (_e) { /* ignore */ }
   }
 }
 
@@ -374,10 +391,28 @@ async function generateGeoActions(businessId: number) {
   // ── Fetch website HTML once — used for schema check AND existing-page detection ──
   const bizDomain = biz.website?.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "") || "";
   let existingPageKeywords = new Set<string>();
-  let hasSchema = false;
+  let schemaFoundTypes: string[] = [];
+  let schemaMissingTypes: string[] = [];
   let hasFAQ = false;
 
+  // Load the cached schema audit (run on each scan). Fall back to live fetch
+  // if missing so a freshly-created business still gets actions.
   if (biz.website) {
+    try {
+      const cached = (biz as any).schemaAuditJson ?? (biz as any).schema_audit_json ?? null;
+      let audit: any = null;
+      if (cached) { try { audit = JSON.parse(cached); } catch { /* re-fetch */ } }
+      if (!audit || !audit.lastAuditAt) {
+        audit = await auditSchemaMarkup(biz.website);
+        try { db.run(sql`UPDATE businesses SET schema_audit_json = ${JSON.stringify(audit)} WHERE id = ${businessId}`); } catch { /* ignore */ }
+      }
+      schemaFoundTypes = audit.foundTypes ?? [];
+      schemaMissingTypes = audit.missingRecommended ?? [];
+      hasFAQ = schemaFoundTypes.includes("FAQPage");
+    } catch { /* unreachable — treat as missing */ }
+
+    // Separately, scrape internal hrefs for page-existence hints (used for
+    // content-gap actions below). Best-effort; audit already handled schema.
     try {
       let fullUrl = biz.website.trim();
       if (!fullUrl.startsWith("http")) fullUrl = "https://" + fullUrl;
@@ -387,23 +422,23 @@ async function generateGeoActions(businessId: number) {
       });
       if (r.ok) {
         const html = await r.text();
-        hasSchema = html.includes("application/ld+json");
-        hasFAQ = html.includes("FAQPage") || html.includes("faqpage") ||
-                 /<a[^>]+href="[^"]*\/faq/i.test(html);
-
-        // Extract all internal hrefs to detect pages that already exist
+        if (!hasFAQ) {
+          hasFAQ = html.includes("FAQPage") || html.includes("faqpage") ||
+                   /<a[^>]+href="[^"]*\/faq/i.test(html);
+        }
         const hrefRegex = /href="([^"#?]+)"/g;
         let m: RegExpExecArray | null;
         while ((m = hrefRegex.exec(html)) !== null) {
           const href = m[1].toLowerCase();
           if (href.startsWith("/") || href.includes(bizDomain)) {
-            // Break the path into words and store them as existing-page keywords
             href.split(/[\/\-_\s]+/).filter(w => w.length > 3).forEach(w => existingPageKeywords.add(w));
           }
         }
       }
-    } catch { /* skip — website unreachable */ }
+    } catch { /* skip */ }
   }
+
+  const hasSchema = schemaFoundTypes.length > 0;
 
   // ── Content gap actions — detect if page likely already exists ──
   for (const gap of gaps) {
@@ -432,16 +467,42 @@ async function generateGeoActions(businessId: number) {
     }
   }
 
-  // ── Schema markup ──
+  // ── Schema markup — per-type actions from the audit ──
+  // Prefer the specific missing types over a single generic "add schema" blurb
+  // so the business sees a concrete TODO list rather than a vague nudge.
+  const schemaDescriptions: Record<string, string> = {
+    LocalBusiness: "Add LocalBusiness JSON-LD with name, address, phone, hours, and geo coordinates. This is the foundational schema AI platforms use to ground your business as a real entity.",
+    Organization: "Add Organization JSON-LD on your homepage so AI can disambiguate your business from others with similar names.",
+    FAQPage: "Mark up your FAQ page with FAQPage schema — each Question/Answer pair gets surfaced directly by LLMs answering user queries.",
+    Review: "Add Review schema with author, rating, and reviewBody so AI can cite specific customer reviews.",
+    AggregateRating: "Add AggregateRating schema summarizing your review scores. AI platforms use this to rank trust at a glance.",
+    Service: "Mark up each service you offer with Service schema. Helps AI enumerate exactly what you sell when users ask.",
+    BreadcrumbList: "Add BreadcrumbList schema so AI can understand your site hierarchy and pick the right page to cite.",
+    WebSite: "Add WebSite schema with SearchAction — canonicalizes your site identity and enables sitelinks in answers.",
+  };
+
   if (!hasSchema) {
     actions.push({
       actionType: "owned_media",
-      title: "Add JSON-LD schema markup to your website",
-      description: "AI platforms strongly prefer websites with structured data. Add LocalBusiness, FAQPage, and AggregateRating schema to help AI understand and cite your business.",
+      title: "Add JSON-LD schema markup — no structured data detected",
+      description: "Your homepage has no JSON-LD schema. AI platforms strongly prefer sites with structured data — start with LocalBusiness (or Organization), then add FAQPage and AggregateRating. Without any schema, AI has to guess who you are.",
       category: "Schema",
       opportunityScore: "high",
       relatedQuery: null,
     });
+  } else if (schemaMissingTypes.length > 0) {
+    // Emit one action per missing recommended type (ordered by impact)
+    for (const t of schemaMissingTypes) {
+      const desc = schemaDescriptions[t] ?? `Add ${t} schema to improve AI comprehension.`;
+      actions.push({
+        actionType: "owned_media",
+        title: `Add ${t} schema markup`,
+        description: desc,
+        category: "Schema",
+        opportunityScore: (t === "LocalBusiness" || t === "Organization" || t === "FAQPage") ? "high" : "medium",
+        relatedQuery: null,
+      });
+    }
   }
 
   // ── FAQ page ──
@@ -798,32 +859,43 @@ async function autoScanBusiness(businessId: number) {
       return;
     }
 
-    // Auto-detect competitors if none exist in the competitors table
+    // Auto-detect competitors if none exist, OR re-detect if the last
+    // detection was >7 days ago. Re-detection merges (doesn't replace) so
+    // manually-added or manually-removed competitors are preserved.
     const existingComps = await storage.getCompetitors(businessId);
-    if (existingComps.length === 0) {
+    const lastDetect = (biz as any).lastCompetitorDetection ?? (biz as any).last_competitor_detection ?? null;
+    const detectStale = !lastDetect || (Date.now() - new Date(lastDetect).getTime() > 7 * 24 * 60 * 60 * 1000);
+    if (existingComps.length === 0 || detectStale) {
       try {
         const keyInputs = activeKeys.map((k) => ({ provider: k.provider, apiKey: k.apiKey }));
-        // Check known_competitors field first
         const knownCsv = (biz as any).known_competitors ?? "";
         let compNames: string[] = [];
-        if (knownCsv) {
+        // Only seed from known_competitors field on the very first detection
+        if (existingComps.length === 0 && knownCsv) {
           compNames = knownCsv.split(",").map((s: string) => s.trim()).filter((s: string) => s.length > 1);
         }
         if (compNames.length === 0) {
           compNames = await detectCompetitors(biz.name, biz.industry, biz.location ?? null, keyInputs);
         }
         if (compNames.length > 0) {
-          const csv = compNames.join(", ");
-          console.log(`[Auto-Scan] Detected competitors for "${biz.name}": ${csv}`);
-          db.run(sql`UPDATE businesses SET known_competitors = ${csv} WHERE id = ${businessId}`);
-          // Insert into competitors table so they appear in the tab and get scanned
-          for (const name of compNames) {
-            try {
-              await storage.createCompetitor({ businessId, name, industry: biz.industry });
-            } catch (_e) { /* duplicate or error, skip */ }
+          const existingLower = new Set(existingComps.map((c) => c.name.toLowerCase()));
+          const newCompNames = compNames.filter((n) => !existingLower.has(n.toLowerCase()));
+          if (newCompNames.length > 0) {
+            console.log(`[Auto-Scan] ${existingComps.length === 0 ? "Detected" : "Re-detection added"} competitors for "${biz.name}": ${newCompNames.join(", ")}`);
+            for (const name of newCompNames) {
+              try {
+                await storage.createCompetitor({ businessId, name, industry: biz.industry });
+              } catch (_e) { /* duplicate or error, skip */ }
+            }
+          } else if (existingComps.length > 0) {
+            console.log(`[Auto-Scan] Re-detection for "${biz.name}": no new competitors (${compNames.length} detected, all already tracked)`);
           }
-          biz = (await storage.getBusiness(businessId))!;
+          // Update known_competitors CSV to include the union
+          const allNames = Array.from(new Set([...existingComps.map((c) => c.name), ...compNames]));
+          db.run(sql`UPDATE businesses SET known_competitors = ${allNames.join(", ")} WHERE id = ${businessId}`);
         }
+        db.run(sql`UPDATE businesses SET last_competitor_detection = ${new Date().toISOString()} WHERE id = ${businessId}`);
+        biz = (await storage.getBusiness(businessId))!;
       } catch (err: any) {
         console.error(`[Auto-Scan] Competitor detection failed for "${biz.name}":`, err.message);
       }
@@ -850,6 +922,29 @@ async function autoScanBusiness(businessId: number) {
     const scanDateStr = new Date().toISOString().split("T")[0];
     const healthRecorder = createBufferedHealthRecorder(scanDateStr);
     setHealthCallback(healthRecorder.record);
+
+    // Schema-markup audit: runs once per 7 days if the business has a website
+    // configured. Stored as JSON on the businesses row so the settings tab
+    // can surface missing structured-data types without re-fetching.
+    try {
+      const prior = (biz as any).schemaAuditJson ?? (biz as any).schema_audit_json ?? null;
+      let staleAudit = true;
+      if (prior) {
+        try {
+          const parsed = JSON.parse(prior);
+          if (parsed?.lastAuditAt) {
+            staleAudit = Date.now() - new Date(parsed.lastAuditAt).getTime() > 7 * 24 * 60 * 60 * 1000;
+          }
+        } catch { /* malformed — re-run */ }
+      }
+      if (biz.website && staleAudit) {
+        const audit = await auditSchemaMarkup(biz.website);
+        db.run(sql`UPDATE businesses SET schema_audit_json = ${JSON.stringify(audit)} WHERE id = ${businessId}`);
+        console.log(`[Auto-Scan] Schema audit for "${biz.name}": score=${audit.score}, missing=${audit.missingRecommended.length} types`);
+      }
+    } catch (err: any) {
+      console.warn(`[Auto-Scan] Schema audit failed for "${biz.name}":`, err.message);
+    }
 
     for await (const result of runScan(biz.name, queries, keyInputs, extraTerms, { location: biz.location ?? null, website: biz.website ?? null, services: (biz as any).services ?? null, industry: biz.industry ?? null })) {
       completed++;
@@ -890,6 +985,8 @@ async function autoScanBusiness(businessId: number) {
           platform: result.platform,
           query: result.query,
           date: dateStr,
+          authorityTier: scoreDomainAuthority(domain).tier,
+          authorityScore: scoreDomainAuthority(domain).score,
         };
       });
       if (citationBatch.length > 0) db.insert(citations).values(citationBatch).run();
@@ -979,7 +1076,7 @@ async function autoScanBusiness(businessId: number) {
     // ── Competitor scanning (parallelized with concurrency limit) ────────────
     const comps = await storage.getCompetitors(businessId);
     const compSubset = comps.slice(0, 5); // limit to 5 competitors
-    const compQueries = queries.slice(0, 8); // use first 8 representative queries
+    const compQueries = queries.slice(0, 15); // use first 15 representative queries (raised from 8 for tighter comparison CI)
     const compBizDomain = biz.website?.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "") || "";
 
     async function scanOneCompetitor(comp: { id: number; name: string }) {
@@ -1021,6 +1118,8 @@ async function autoScanBusiness(businessId: number) {
               platform: result.platform,
               query: result.query,
               date: dateStr,
+              authorityTier: scoreDomainAuthority(domain).tier,
+              authorityScore: scoreDomainAuthority(domain).score,
             };
           });
           if (compCitationBatch.length > 0) db.insert(citations).values(compCitationBatch).run();
@@ -1240,6 +1339,8 @@ export async function registerRoutes(
   try { db.run(sql`ALTER TABLE businesses ADD COLUMN known_competitors TEXT`); } catch (_e) { /* exists */ }
   try { db.run(sql`ALTER TABLE businesses ADD COLUMN custom_queries TEXT`); } catch (_e) { /* exists */ }
   try { db.run(sql`ALTER TABLE businesses ADD COLUMN last_ungrounded_scan_date TEXT`); } catch (_e) { /* exists */ }
+  try { db.run(sql`ALTER TABLE businesses ADD COLUMN last_competitor_detection TEXT`); } catch (_e) { /* exists */ }
+  try { db.run(sql`ALTER TABLE businesses ADD COLUMN schema_audit_json TEXT`); } catch (_e) { /* exists */ }
 
   db.run(sql`CREATE TABLE IF NOT EXISTS platforms (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1495,6 +1596,8 @@ export async function registerRoutes(
   // sample_count lets one row represent N aggregated samples — reduces
   // platform_health row count by ~80x per scan. Existing rows default to 1.
   try { db.run(sql`ALTER TABLE platform_health ADD COLUMN sample_count INTEGER NOT NULL DEFAULT 1`); } catch (_e) { /* exists */ }
+  try { db.run(sql`ALTER TABLE citations ADD COLUMN authority_tier TEXT`); } catch (_e) { /* exists */ }
+  try { db.run(sql`ALTER TABLE citations ADD COLUMN authority_score INTEGER`); } catch (_e) { /* exists */ }
 
   // One-time migration: historical rows where the "error" came from the
   // secondary analyzeWithAI call were incorrectly attributed to the primary
@@ -1513,12 +1616,32 @@ export async function registerRoutes(
     is_own_domain INTEGER NOT NULL DEFAULT 0,
     platform TEXT NOT NULL,
     query TEXT NOT NULL,
+    authority_tier TEXT,
+    authority_score INTEGER,
     date TEXT NOT NULL
   )`);
 
   // Indexes for the Citations + Top-Domains reports.
   try { db.run(sql`CREATE INDEX IF NOT EXISTS idx_citations_biz_date ON citations (business_id, date)`); } catch (_e) { /* ignore */ }
   try { db.run(sql`CREATE INDEX IF NOT EXISTS idx_citations_biz_domain ON citations (business_id, domain)`); } catch (_e) { /* ignore */ }
+
+  // One-time backfill: existing citation rows pre-date authority scoring.
+  // Score them all in one pass so historical citations get a tier badge instead
+  // of "unrated" in the UI. Idempotent — only touches rows where authority_score IS NULL.
+  try {
+    const unscored = db.all<{ id: number; domain: string }>(
+      sql`SELECT id, domain FROM citations WHERE authority_score IS NULL`
+    );
+    if (Array.isArray(unscored) && unscored.length > 0) {
+      for (const row of unscored) {
+        const r = scoreDomainAuthority(row.domain ?? "");
+        db.run(sql`UPDATE citations SET authority_tier = ${r.tier}, authority_score = ${r.score} WHERE id = ${row.id}`);
+      }
+      console.log(`[citations] backfilled authority scores for ${unscored.length} rows`);
+    }
+  } catch (e) {
+    console.warn("[citations] authority backfill skipped:", (e as any)?.message ?? e);
+  }
   // Index for the health-dashboard 7-day window query.
   try { db.run(sql`CREATE INDEX IF NOT EXISTS idx_platform_health_provider_date ON platform_health (provider, date)`); } catch (_e) { /* ignore */ }
   // Index for daily-budget running total.
@@ -1963,6 +2086,38 @@ export async function registerRoutes(
     const id = parseInt(req.params.id);
     const stats = await storage.getSearchStats(id);
     res.json(stats);
+  });
+
+  // === SCHEMA MARKUP AUDIT ===
+  // Returns the last cached audit of the business's website. Pass
+  // ?refresh=1 to force a fresh fetch (used by the "Re-run audit" button
+  // in the UI). Otherwise returns whatever was stored on the last nightly
+  // scan (≤7 days old).
+  app.get("/api/businesses/:id/schema-audit", requireAuth, async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const biz = await storage.getBusiness(id);
+      if (!biz) return res.status(404).json({ error: "Business not found" });
+      if (!biz.website) return res.json({ error: "No website configured", score: 0, foundTypes: [], missingRecommended: [] });
+
+      const refresh = req.query.refresh === "1";
+      const prior = (biz as any).schemaAuditJson ?? (biz as any).schema_audit_json ?? null;
+      if (!refresh && prior) {
+        try {
+          const parsed = JSON.parse(prior);
+          if (parsed?.lastAuditAt) {
+            const ageMs = Date.now() - new Date(parsed.lastAuditAt).getTime();
+            if (ageMs < 7 * 24 * 60 * 60 * 1000) return res.json(parsed);
+          }
+        } catch { /* cache malformed — fall through to fresh */ }
+      }
+
+      const audit = await auditSchemaMarkup(biz.website);
+      db.run(sql`UPDATE businesses SET schema_audit_json = ${JSON.stringify(audit)} WHERE id = ${id}`);
+      res.json(audit);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
   app.get("/api/businesses/:id/trend", async (req, res) => {
@@ -2737,15 +2892,23 @@ Include 3-6 sections in the outline, each with 2-4 bullet points. Include 5-10 k
       .where(sql`business_id = ${businessId}`)
       .all();
 
-    // Group by domain
-    const domainMap = new Map<string, { domain: string; count: number; isOwn: boolean; platforms: Set<string> }>();
+    // Group by domain, tracking the best-seen authority tier/score for each
+    const domainMap = new Map<string, { domain: string; count: number; isOwn: boolean; platforms: Set<string>; authorityTier: string | null; authorityScore: number | null }>();
     for (const c of allCitations) {
+      const tier = (c as any).authorityTier ?? (c as any).authority_tier ?? null;
+      const score = (c as any).authorityScore ?? (c as any).authority_score ?? null;
       if (!domainMap.has(c.domain)) {
-        domainMap.set(c.domain, { domain: c.domain, count: 0, isOwn: !!c.isOwnDomain, platforms: new Set() });
+        domainMap.set(c.domain, { domain: c.domain, count: 0, isOwn: !!c.isOwnDomain, platforms: new Set(), authorityTier: tier, authorityScore: score });
       }
       const d = domainMap.get(c.domain)!;
       d.count++;
       if (c.platform) d.platforms.add(c.platform);
+      // Keep the highest authority score seen (shouldn't differ per domain,
+      // but defensive in case of older rows with null values).
+      if (score != null && (d.authorityScore == null || score > d.authorityScore)) {
+        d.authorityScore = score;
+        d.authorityTier = tier;
+      }
     }
 
     const domains = [...domainMap.values()]
@@ -2756,10 +2919,25 @@ Include 3-6 sections in the outline, each with 2-4 bullet points. Include 5-10 k
     const ownCitations = allCitations.filter(c => c.isOwnDomain).length;
     const ownRate = totalCitations > 0 ? Math.round((ownCitations / totalCitations) * 100) : 0;
 
+    // Authority-tier breakdown across all citations
+    const tierCounts: Record<string, number> = { authority: 0, reputable: 0, standard: 0, low: 0, unrated: 0 };
+    let weightedScoreSum = 0;
+    let rated = 0;
+    for (const c of allCitations) {
+      const tier = (c as any).authorityTier ?? (c as any).authority_tier ?? null;
+      const score = (c as any).authorityScore ?? (c as any).authority_score ?? null;
+      if (tier && tierCounts[tier] != null) tierCounts[tier]++;
+      else tierCounts.unrated++;
+      if (typeof score === "number") { weightedScoreSum += score; rated++; }
+    }
+    const avgAuthority = rated > 0 ? Math.round(weightedScoreSum / rated) : null;
+
     res.json({
       totalCitations,
       ownCitations,
       ownCitationRate: ownRate,
+      avgAuthorityScore: avgAuthority,
+      authorityBreakdown: tierCounts,
       topDomains: domains.slice(0, 20),
       recentCitations: allCitations.slice(-20).reverse(),
     });
@@ -3880,6 +4058,8 @@ Extract real information from the content. If a field isn't clear from the websi
             platform: result.platform,
             query: result.query,
             date: dateStr,
+            authorityTier: scoreDomainAuthority(domain).tier,
+            authorityScore: scoreDomainAuthority(domain).score,
           };
         });
         if (autoScanCitationBatch.length > 0) db.insert(citations).values(autoScanCitationBatch).run();
@@ -3965,7 +4145,7 @@ Extract real information from the content. If a field isn't clear from the websi
       // ── Competitor scanning (parallelized) ───────────────────────────────
       const comps = await storage.getCompetitors(businessId);
       const compSubset = comps.slice(0, 5);
-      const compQueries = queries.slice(0, 8);
+      const compQueries = queries.slice(0, 15);
       const autoCompBizDomain = business.website?.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "") || "";
 
       async function scanOneCompetitorManual(comp: { id: number; name: string }) {
@@ -4006,6 +4186,8 @@ Extract real information from the content. If a field isn't clear from the websi
                 platform: result.platform,
                 query: result.query,
                 date: dateStr,
+                authorityTier: scoreDomainAuthority(domain).tier,
+                authorityScore: scoreDomainAuthority(domain).score,
               };
             });
             if (autoCompCitationBatch.length > 0) db.insert(citations).values(autoCompCitationBatch).run();
